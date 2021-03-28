@@ -1,5 +1,5 @@
-title: Here
-description: Build Dream
+title: Love & Share
+description: biubiupiu....🙃
 email: guann1n9@gmail.com
 
 author: guan ning
@@ -15,8 +15,11 @@ author: guan ning
 
 # # Theme Settings
 
+
+permalink: /:categories/:title/
+
 # # Your site's logo. Will be shown on the left top of your page.
-logo: /img/icon.png
+#logo: /img/icon.png
 # # If the images of our blog are stored in an external cloud. You can use the jekyll-img-prefix plugin and set your images' base URL here.
 # img_prefix: https://your-img-cdn.com
 # # The RSS link of your blog.
