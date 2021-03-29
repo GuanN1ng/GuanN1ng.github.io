@@ -16,22 +16,12 @@ social:
 # # Theme Settings
 
 # Theme Settings
-logo: /img/icon.png
 theme: 'jekyll-theme-persephone'
 
 
 # Jekyll Settings
 markdown: kramdown
 timezone: Asia/Hangzhou
-excerpt_separator: <!--more-->
-defaults:
-  -
-    scope:
-      path: ""
-      type: "posts"
-    values:
-      layout: "post"
-      toc: true
 plugins:
   #- jekyll-feed
   - jekyll-sitemap
