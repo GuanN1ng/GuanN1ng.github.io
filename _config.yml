@@ -3,21 +3,3 @@ description: biubiupiu....🙃
 email: guann1n9@gmail.com
 
 author: guan ning
-
-
-
-permalink: /posts/:year/:month/:day/:title.html
-
-
-# 菜单
-menu:
-  - title: 首页
-    url: /
-  - title: 归类
-    url: /pages/categories.html
-  - title: 搜索
-    url: /pages/search.html
-  - title: 留言
-    url: /pages/chat.html
-  - title: 关于
-    url: /pages/about.html
