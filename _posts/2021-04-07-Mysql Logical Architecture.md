@@ -1,0 +1,78 @@
+---
+layout: post
+title:  "MySQL逻辑架构"
+date:   2021-04-07 21:07:58
+categories: MySQL
+---
+
+### Server层
+
+#### 连接器
+
+连接器负责跟客户端建立连接、获取权限、维持和管理连接。命令格式：
+```
+mysql -h $host -P $port   -u root -p
+```
+建立TCP连接，若用户名密码校验失败，此时报错"Access denied for user",并断开连接；若校验通过，连接器会获取对应的用户的权限(`select * from mysql.user where User = #{user}`),
+并缓存此时的用户权限，若用户权限发生改变，需新建的连接才会生效。
+每个客户端连接都会在服务进程中拥有一个线程，此连接的查询只会在这个单独的线程中执行(`MySql线程池`)。
+
+##### 连接状态
+使用 show processlist命令查看当前所有连接及其状态。Command为Sleep表示连接处于空闲状态，空闲时间超过`wait_timeout`后，连接将自动断开，默认为8h.
+```
+mysql> show processlist;
++-----+-------+-----------------+----------+---------+------+----------+------------------+
+| Id  | User  | Host            | db       | Command | Time | State    | Info             |
++-----+-------+-----------------+----------+---------+------+----------+------------------+
+|   3 | root  | localhost:64901 | test     | Sleep   |  231 |          | NULL             |
+|   4 | root  | localhost:64902 | test     | Sleep   |  238 |          | NULL             |
+|  94 | root  | localhost       | test     | Query   |    0 | starting | show processlist |
+| 136 | query | localhost       | test     | Sleep   |   82 |          | NULL             |
++-----+-------+-----------------+----------+---------+------+----------+------------------+
+
+```
+mysql中执行过程中临时使用的内存是管理在连接对象中的，这些资源在连接断开时才会释放，若长连接过多，可能导致MySQL服务OOM，解决方案：
+* 定时断开长连接；
+* 5.7或更新的版本可在每次执行消耗较大的操作后，执行mysql_reset_connection初始化连接，释放内存，此过程不需要重连及验证；
+
+#### 查询缓存（MySQL8.0已移除查询缓存的功能）
+
+当查询命中缓存时，MySQL将立即返回结果，跳过解析、优化、执行阶段。
+##### 命令
+query_cache_type
+* OFF 关闭
+* ON  启动
+* DEMAND  只有在查询语句中明确写明SQL_CACHE的语句才会放入查询缓存`select SQL_CACHE * from t where id =1`。
+query_cache_size  查询缓存可使用的总内存空间
+query_cache_min_res_unit  查询缓存分配内存时的最小单位，`合理设置，减少缓存碎片`
+
+##### 缓存命中
+缓存已key-value的形式存放在一个引用表中，hash值中包含查询sql、查询的库、、客户端协议版本等信息。所以查询任何的不同比如空格、注释都会造成缓存的命中失败；当SQL语句中
+存在任何不确定的数据如NOW()、用户变量、存储过程等时，MySQL不会缓存该结果。
+当一个表发生更新时，该表上的所有查询缓存都会被清空。
+
+##### 使用
+
+打开查询缓存对读写操作都会带来额外的消耗：
+* 查询操作开始前需先检查是否命中缓存；若查询可被缓存，需将结果写入缓存；
+* 写操作时，需将该表上的缓存全部置为失效；
+
+#### 分析器
+语法分析，验证SQL是否满足MySQL语法，若不满足，就会收到“You have an error in your SQL syntax”的错误提醒。
+
+#### 优化器
+优化SQL执行方案，包括重写查询、多表关联时决定表的读取顺序，以及选择合适的索引等。
+* hint,用户可使用特殊的关键字提示优化器，影响优化器的决策,；
+    * 使用索引 USE INDEX，但USE INDEX只是告诉优化器可以选择该索引，实际上优化器还是会根据自己的判断进行选择，强制可使用是`FORCE INDEX`
+      SELECT * FROM TABLE1 USE INDEX (FIELD1);
+    * 强制查询缓冲 SQL_CACHE
+      SELECT SQL_CALHE * FROM TABLE1;
+      ... 
+* explain 请求优化器解析优化过程的各个因素；
+
+#### 执行器
+操作存储引擎的API,执行语句。
+
+### 存储引擎层
+负责MySQL中的数据存储及提取，执行器通过API与存储引擎通信，这些API屏蔽了不同存储引擎间的差异。API包含`开始一个事务`、`查询第一行记录`等操作。
+
