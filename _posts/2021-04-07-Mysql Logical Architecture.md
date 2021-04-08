@@ -4,8 +4,13 @@ title:  "MySQL逻辑架构"
 date:   2021-04-07 21:07:58
 categories: MySQL
 ---
+### 逻辑架构图
+
 
 ### Server层
+
+Server层包括连接器、查询缓存、分析器、优化器、执行器等，涵盖MySQL的大多数核心服务 功能，以及所有的内置函数（如日期、时间、数学和加密函数等），
+所有跨存储引擎的功能都在 这一层实现，比如存储过程、触发器、视图等。
 
 #### 连接器
 
@@ -15,7 +20,7 @@ mysql -h $host -P $port   -u root -p
 ```
 建立TCP连接，若用户名密码校验失败，此时报错"Access denied for user",并断开连接；若校验通过，连接器会获取对应的用户的权限(`select * from mysql.user where User = #{user}`),
 并缓存此时的用户权限，若用户权限发生改变，需新建的连接才会生效。
-每个客户端连接都会在服务进程中拥有一个线程，此连接的查询只会在这个单独的线程中执行(`MySql线程池`)。
+每个客户端连接都会在服务进程中拥有一个线程，此连接的查询只会在这个单独的线程中执行(优化`MySql线程池`)。
 
 ##### 连接状态
 使用 show processlist命令查看当前所有连接及其状态。Command为Sleep表示连接处于空闲状态，空闲时间超过`wait_timeout`后，连接将自动断开，默认为8h.
@@ -74,5 +79,35 @@ query_cache_min_res_unit  查询缓存分配内存时的最小单位，`合理�
 操作存储引擎的API,执行语句。
 
 ### 存储引擎层
-负责MySQL中的数据存储及提取，执行器通过API与存储引擎通信，这些API屏蔽了不同存储引擎间的差异。API包含`开始一个事务`、`查询第一行记录`等操作。
+负责MySQL中的数据存储及提取，其架构模式是插件式的，支持InnoDB、MyISAM、 Memory等多个存储引擎。执行器通过API与存储引擎通信，
+这些API屏蔽了不同存储引擎间的差异。API包含`开始一个事务`、`查询第一行记录`等操作。
+
+
+### Unknown column ‘k’ in ‘where clause
+
+环境准备
+CREATE TABLE a(
+    a1 VARCHAR(10)
+);
+INSERT INTO a VALUES('aaa');
+ 
+CREATE TABLE b(
+    b1 VARCHAR(10)
+);
+INSERT INTO b VALUES('bbb');
+创建一个新的用户 
+create user query identified by 'query';
+只给b表的查询权限
+GRANT SELECT ON b TO query@'db';
+
+执行下面的语句
+* 1、SELECT b1 FROM b; 
+* 2、SELECT b2 FROM b; //ERROR 1054 (42S22): Unknown column 'b2' in 'field list'
+* 3、SELECT a1 FROM a; //ERROR 1142 (42000): SELECT command denied to user 'query'@'localhost' for table 'a'
+* 4、SELECT a2 FROM a; //ERROR 1142 (42000): SELECT command denied to user 'query'@'localhost' for table 'a'
+
+##### 结论：
+执行器在执行前会判断是否对表有对应的权限，若`Unknown column`发生在分析器时，则语句3、4报错应该不同，语句4应该为`Unknown column`，所以`Unknown column`
+异常发生在执行器阶段。
+
 
