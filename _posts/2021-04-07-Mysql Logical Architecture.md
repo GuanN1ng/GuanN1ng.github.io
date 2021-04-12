@@ -101,11 +101,12 @@ create user query identified by 'query';
 GRANT SELECT ON b TO query@'db';
 
 执行下面的语句
+```
 * 1、SELECT b1 FROM b; 
 * 2、SELECT b2 FROM b; //ERROR 1054 (42S22): Unknown column 'b2' in 'field list'
 * 3、SELECT a1 FROM a; //ERROR 1142 (42000): SELECT command denied to user 'query'@'localhost' for table 'a'
 * 4、SELECT a2 FROM a; //ERROR 1142 (42000): SELECT command denied to user 'query'@'localhost' for table 'a'
-
+```
 ##### 结论：
 执行器在执行前会判断是否对表有对应的权限，若`Unknown column`发生在分析器时，则语句3、4报错应该不同，语句4应该为`Unknown column`，所以`Unknown column`
 异常发生在执行器阶段。
