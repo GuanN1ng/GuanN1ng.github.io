@@ -100,7 +100,7 @@ mysql> show status like 'innodb_row_lock%';
 ```
 
 
-##### 行锁的实现
+##### 行锁算法
 
 * Record Lock
 
