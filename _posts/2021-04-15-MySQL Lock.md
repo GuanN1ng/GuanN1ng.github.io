@@ -111,7 +111,6 @@ mysql> show status like 'innodb_row_lock%';
 
 * Next-Key Lock
 
-
 ##### 死锁检测
 
 当并发系统中不同线程出现循环资源依赖，涉及的线程都在等待别的线程释放资源时，就会导致这几个线程都进入无限等待的状态，称为死锁。
@@ -119,6 +118,10 @@ mysql> show status like 'innodb_row_lock%';
 Innodb引擎提供了两种策略处理死锁出现的情况：
 
 * 直接进入等待，直到超时`innodb_lock_wait_timeout`。
+
+```
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
 
 * innodb_deadlock_detect为on时，发起死锁检测，发现死锁后，主动回滚死锁链条中的某一个事务，让其他事 务得以继续执行。
 
