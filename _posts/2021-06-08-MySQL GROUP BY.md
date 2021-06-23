@@ -21,7 +21,7 @@ declare i int; set i=1; while(i<=1000)do insert into t2 values(i, i%10, i); set 
 end
 ```
 
-####执行流程
+#### 执行流程
 
 ```
 mysql> explain select  a ,count(*) c from t2 group by a;
@@ -45,9 +45,9 @@ SQL的执行流程为：
 * 遍历完成后，对**字段a做排序**，得到结果期。
 
     
-####优化方法
+#### 优化方法
 
-#####排序
+##### 排序
 
 当对结果集不需要排序时，可使用**order by null**，去除排序的步骤，如下，已经没有Using filesort关键字了。
 
@@ -62,7 +62,7 @@ mysql> explain select  a ,count(*) c from t2 group by a order by null;
 
 
 
-#####索引
+##### 索引
 
 group by的语义是统计不同值出现的次数，**因为group by的字段是无序的**，在创建临时表时，都需要构造一个带**唯一索引的表**，如果可以保证扫描过程
 中出现的数据是有序的，那么计算group by时，只需依次顺序扫描累加，遇到不同的值，则将其哪一个值及其累加值放入结果集中，直至结束，这样既不再需要临时表，
@@ -90,7 +90,7 @@ MySQL5.7后的版本支持了**generated column机制**，可以实现列数据�
 alter table t2 add column m int generated always as(b%10**原始字段及操作**),add index(m);
 ```
 
-#####直接排序
+##### 直接排序
 
 对于不适合创建索引的场景，如果需要统计的数据量不大，尽量只使用内存表，可通过适当调大**tmp_table_size**，避免使用到磁盘临时表；如果数据量确实很大，
 可以使用**SQL_BIG_RESULT**这个hint，提示优化器直接使用排序算法，此时MySQL会**使用sort_buffer来完成排序**，当sort_buffer内存不够用时，

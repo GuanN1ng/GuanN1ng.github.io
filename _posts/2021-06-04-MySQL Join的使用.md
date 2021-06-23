@@ -18,7 +18,7 @@ KEY `a` ( `a` )
 
 
 
-####Index Nested-Loop Join
+#### Index Nested-Loop Join
 
 Index Nested-Loop Join是指可以使用被驱动表的索引的查询。SQL语句`select * from t1 straight_join  t2 on  t1.a = t2.a`的执行流程为：
 
@@ -41,7 +41,7 @@ mysql> explain select * from t1 straight_join  t2 on  t1.a = t2.a;
 的join查询时间复杂度为N*logM。
 
 
-####Block Nested Loop
+#### Block Nested Loop
 
 
 当SQL语句为`select * from t1 straight_join  t2 on  t1.a = t2.b`，此时被驱动表上没有可用的索引，执行流程为：
@@ -69,7 +69,7 @@ mysql> explain select * from t1 straight_join  t2 on  t1.a = t2.b;
 +----+-------------+-------+------------+------+---------------+------+---------+------+------+----------+----------------------------------------------------+
 ```
 
-####小表做驱动表
+#### 小表做驱动表
 
 * 采用Index Nested-Loop Join算法时，驱动表越小，效率越高；
 
@@ -83,7 +83,7 @@ mysql> explain select * from t1 straight_join  t2 on  t1.a = t2.b;
 即使t2的行数远大于t1,因为字段b上无索引，此时表t2只需读取前50行，即join_buffer中只需放入t2的前50行，只要t1的行数大于50行，就应该选取t2作为驱动表。   
 
 
-####join优化
+#### join优化
 
 * Index Nested-Loop Join
 
