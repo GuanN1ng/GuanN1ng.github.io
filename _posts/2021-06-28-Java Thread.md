@@ -64,8 +64,8 @@ Java线程状态，java.lang.Thread.State枚举中定义了关于线程生命周
     
 #### ThreadLocal    
 
-ThreadLocal类在多线程环境下为线程提供**本地变量(thread-local)存储的功能，且保证各线程间互不干扰**。ThreadLocal有一个内部静态类**ThreadLocalMap**，
-该内部类是**实现线程隔离机制的关键**，ThreadLocalMap的存储结构Entry定义如下：
+ThreadLocal类在多线程环境下为线程提供**保存线程私有信息的机制，且保证各线程间互不干扰**。thread-local在整个线程生命周期内有效，**使线程可以在关联的不同业务模块之间传递信息**，比
+如事务ID、Cookie等上下文相关信息。ThreadLocal有一个内部静态类**ThreadLocalMap**，该内部类是**实现线程隔离机制的关键**，ThreadLocalMap的存储结构Entry定义如下：
 ```
 static class Entry extends WeakReference<ThreadLocal<?>> {
     /** The value associated with this ThreadLocal. */
@@ -114,7 +114,7 @@ for (Entry e = tab[i];
 ```
 
 当key==null执行删除是为了**优化ThreadLocalMap的内存泄漏问题**，因为**Entry的key是弱引用，但value是强引用，GC时，
-则会出现key被回收，当线程长时间存活且频繁操作ThreadLocalMap时，则会发生内存泄漏问题**，所以JDK源码中，为了避免用户忘记显示的调用remove()方法
+则会出现key被回收，value未被回收，当线程长时间存活(线程池)且频繁操作ThreadLocalMap时，则会发生内存泄漏问题**，所以JDK源码中，为了避免用户忘记显示的调用remove()方法
 去除不再使用的变量，在getEntry()、set()方法中，添加删除空值的逻辑。
 
 
