@@ -118,7 +118,7 @@ for (Entry e = tab[i];
 去除不再使用的变量，在getEntry()、set()方法中，添加删除空值的逻辑。
 
 
-**ThreadLocalMap的实例对象有线程持有**，Thread类中有两个**ThreadLocal.ThreadLocalMap**类型的成员变量，**用于存储线程的本地变量值**。
+**ThreadLocalMap的实例对象由线程持有**，Thread类中有两个**ThreadLocal.ThreadLocalMap**类型的成员变量，**用于存储线程的本地变量值**。
 ```
 ThreadLocal.ThreadLocalMap threadLocals = null;
 ThreadLocal.ThreadLocalMap inheritableThreadLocals = null;  //从父线程中继承的变量  
