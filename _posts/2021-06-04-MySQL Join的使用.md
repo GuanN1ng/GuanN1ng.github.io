@@ -22,7 +22,7 @@ KEY `a` ( `a` )
 
 Index Nested-Loop Join是指可以使用被驱动表的索引的查询。SQL语句`select * from t1 straight_join  t2 on  t1.a = t2.a`的执行流程为：
 
-* 从驱动表T中读入一行数据R；
+* 从驱动表t1中读入一行数据R；
 * 从数据行R中取出a字段到t2表查找；
 * 取出表t2中满足条件的行，和R组成一行，作为结果集的一部分；
 * 重复步骤1~3，直到表t1的末尾结束。
