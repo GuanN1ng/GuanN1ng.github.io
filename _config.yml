@@ -94,7 +94,7 @@ rss:
 # Canonical, set a canonical link tag in your jekyll, you could use it for your SEO of blog.
 # See: https://support.google.com/webmasters/answer/139066
 # Tips: Before you open this tag, remember set up your URL in _config.yml ( ex. url: http://yourdomain.com )
-canonical: true
+canonical: false
 
 # Change headers hierarchy on site-subtitle (will be main site description) and on all post/pages titles for better SEO-optimization.
 seo: false
@@ -254,7 +254,7 @@ sidebar:
   #  - always  expand for all pages automatically
   #  - hide    expand only when click on the sidebar toggle icon.
   #  - remove  Totally remove sidebar including sidebar toggle.
-  display: post
+  display: remove
   #display: always
   #display: hide
   #display: remove
@@ -418,14 +418,6 @@ changyan:
 # You can get your uid from https://livere.com/insight/myCode (General web site)
 #livere_uid: your uid
 
-# Support for gitalk comments system.
-gitalk:
-  enable: false
-  clientID: # 54730ddf7b9420460c03
-  clientSecret: # c05684701b25ff1c19ea0c01ce4d80c125e0707d
-  repo: # colingpt.github.io
-  owner: # colingpt
-  admin: # colingpt
 
 # Baidu Share
 # Available value:
@@ -470,14 +462,6 @@ duoshuo_info:
   #admin_nickname: Author
 
 
-# Facebook SDK Support.
-# https://github.com/iissnan/hexo-theme-next/pull/410
-facebook_sdk:
-  enable: false
-  app_id:       #<app_id>
-  fb_admin:     #<user_id>
-  like_button:  #true
-  webmaster:    #true
 
 # Facebook comments plugin
 # This plugin depends on Facebook SDK.
