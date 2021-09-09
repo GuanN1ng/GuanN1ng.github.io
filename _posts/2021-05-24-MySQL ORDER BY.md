@@ -2,7 +2,8 @@
 layout: post
 title:  "Lists,Stacks,Queues"
 date:   2021-06-09 13:57:09
-categories: Data Structures
+categories: 
+- MySQL
 ---
 
 ```

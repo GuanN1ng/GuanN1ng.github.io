@@ -2,7 +2,8 @@
 layout: post
 title:  "Lists,Stacks,Queues"
 date:   2021-06-02 20:52:40
-categories: Data Structures
+categories: 
+- MySQL
 ---
 
 环境准备：有表t1、t2，建表语句如下，表t1、t2结构相同。

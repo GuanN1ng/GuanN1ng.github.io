@@ -2,7 +2,8 @@
 layout: post
 title:  "MySQL GROUP BY"
 date:   2021-06-08 16:55:36
-categories: MySQL
+categories: 
+- MySQL
 ---
 
 环境准备：

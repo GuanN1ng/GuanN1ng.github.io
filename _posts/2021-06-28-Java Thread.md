@@ -2,7 +2,8 @@
 layout: post
 title:  "Java Thread"
 date:   2021-06-28 14:15:40
-categories: JDK
+categories: 
+- JDK
 ---
 
 线程(Thread)是**CPU调度和分派的基本单位**，包含在进程之中，是进程中的实际运作单位，**同一进程中的多条线程将共享该进程中的全部系统资源，
