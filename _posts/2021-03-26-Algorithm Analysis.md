@@ -1,8 +1,8 @@
 ---
-layout: post
-title:  "Algorithm Analysis"
+title:  Algorithm Analysis
 date:   2021-03-26 16:52:58
-categories: Data Structures
+categories: 
+- Data Structures
 ---
 
 算法分析，最重要的是确定一个算法将需要多少时间或空间等资源量的问题，而问题实例的规模n是决定计算成本的主要因素。
