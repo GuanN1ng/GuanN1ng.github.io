@@ -5,6 +5,34 @@ date:   2021-09-05 17:14:02
 categories: Kafka
 ---
 
+生产者负责按照消息中的主题分区将消息发送到对应的Kafka节点，在发送前消息会经过拦截器、序列化器、分区器等一系列的处理，最终通过网络IO发送到Kafka节点中去。KafkaProducer的整体架构如下：
+
+![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
+
+
+#### send方法
+
+
+
+
+
+#### 生产者拦截器
+
+
+
+#### 消息序列化
+
+
+
+#### 分区器
+
+
+
+
+####
+
+
+
 线程安全 ： accumulator synchronized实现
 
 
