@@ -207,7 +207,7 @@ font:
 # Value is the target link (E.g. GitHub: https://github.com/iissnan)
 social:
   GitHub: https://github.com/GuanN1ng
-
+  Email: guann1n9@gmail.com
 
 # Social Links Icons
 # Icon Mapping:
@@ -222,8 +222,8 @@ social_icons:
 
 
 # Sidebar Avatar
-in directory: /assets/images/header.jpeg
-#avatar:
+#in directory:
+avatar: /assets/images/header.jpeg
 
 
 # Table Of Contents in the Sidebar
