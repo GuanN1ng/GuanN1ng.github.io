@@ -9,6 +9,9 @@ categories: Kafka
 
 ![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
 
+kafkaProducer由两个线程协调运行，分别为主线程及Sender线程，主线程负责创建消息，并完成序列化、分区选择等处理，并写入RecordAccumulator中。Sender线程负责从
+RecordAccumulator中获取消息,并将按TopicPartition归类的消息按照分区Leader节点再次分组，发送到Kafka。发送前，还会将请求保存到InFightRequests中，等待获取发送响应
+做进一步处理。
 
 #### send方法
 

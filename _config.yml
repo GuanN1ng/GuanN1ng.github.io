@@ -205,8 +205,8 @@ font:
 # Social Links
 # Key is the link label showing to end users.
 # Value is the target link (E.g. GitHub: https://github.com/iissnan)
-#social:
-  #LinkLabel: Link
+social:
+  GitHub: https://github.com/GuanN1ng
 
 
 # Social Links Icons
@@ -222,7 +222,7 @@ social_icons:
 
 
 # Sidebar Avatar
-# in directory: /assets/images/avatar.gif
+in directory: /assets/images/header.jpeg
 #avatar:
 
 
