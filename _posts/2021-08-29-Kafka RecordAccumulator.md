@@ -10,6 +10,9 @@ RecordAccumulator主要用来缓存消息以便Sender线程可以批量的发送
 
 * BufferPool：通过池化思想管理RecordAccumulator缓冲区，可用内存大小由参数buffer.memory设置，默认32MB。
 
+二者关系如下，写入ProducerBatch内的消息是通过BufferPool管理的ByteBuffer存储的：
+
+![RecordAccumulator](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/recordAccumulator.png)
 
 ### batches
 
@@ -57,7 +60,6 @@ public final class ProducerBatch {
 ### BufferPool
 
 ProducerBatch底层是通过ByteBuffer实现消息的存储的，消息发送成功后需要释放对应的ByteBuffer，频繁的创建和释放ByteBuffer是比较耗费性能的，Kafka引入BufferPool实现ByteBuffer的复用。
-
 
 #### 主要属性
 
