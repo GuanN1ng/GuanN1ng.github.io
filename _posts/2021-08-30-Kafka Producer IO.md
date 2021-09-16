@@ -5,12 +5,12 @@ categories: Kafka
 ---
 
 主线程将需发送的消息写入AccumulatorRecord中后，后续将消息发送至Kafka Broker的工作主要涉及到2个Kafka组件：**Sender线程及NetworkClient网络客户端**。
-Sender线程负责将AccumulatorRecord转化为网络请求的ClientRequest对象以及等幂、事务等业务处理，而NetworkClient负责具体的发送实现。
+Sender线程负责将AccumulatorRecord转化为网络请求的ClientRequest对象，而NetworkClient负责具体的发送实现。
 
 
 ### Sender初始化
 
-Sender线程负责从RecordAccumulator中拉取消息，并通过网络IO发送至Kafka Broker中。Sender在创建Kafka Producer时完成初始化并启动：
+Sender在创建Kafka Producer时完成初始化并启动：
 
 KafkaProducer#KafkaProducer
 
@@ -84,8 +84,7 @@ while (iter.hasNext()) {
 }
 ```
 
-* 3、从RecordAccumulator中拉取消息，按照BrokerId分类，并判断是否保证发送顺序，**max.in.flight.requests.per.connection参数为1，表示需要保证分区发送顺序，则调用
-accumulator.mutePartition(batch.topicPartition),对当前分区加锁**。
+* 3、从RecordAccumulator中拉取消息，按照BrokerId分类，并判断是否保证发送顺序，**max.in.flight.requests.per.connection参数为1，表示需要保证分区发送顺序，则调用accumulator.mutePartition(),对当前分区加锁**。
 
 ```
 Map<Integer, List<ProducerBatch>> batches = accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
@@ -162,7 +161,7 @@ inFlightRequests.add(inFlightRequest);
 selector.send(new NetworkSend(clientRequest.destination(), send));
 ```
 
-* 将请求保存到InFlightRequests中，InFlightRequests中保存着准备发送或等待响应的请求，以便后续进行重试。
+* 将请求保存到InFlightRequests中，InFlightRequests中保存着准备发送或等待响应的请求(**leastLoadedNode为InFlightRequests.size最小的节点**)。
 * 调用Selector#send，将数据写入对应KafkaChannel的NetworkSend(Buffer)中，并监听TransportLayer(SocketChannel)对应的写事件。
 
 #### NetworkClient#poll
@@ -227,5 +226,3 @@ if (guaranteeMessageOrder)
     this.accumulator.unmutePartition(batch.topicPartition);
 
 ```
-
-需重试的ProducerBatch的添加到队列头部，以尽快完成重试。
