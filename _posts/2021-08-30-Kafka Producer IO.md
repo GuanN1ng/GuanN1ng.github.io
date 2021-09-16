@@ -1,5 +1,5 @@
 ---
-title:  Kafka 消息发送
+title:  Kafka Producer IO
 date:   2021-08-30 21:33:42
 categories: Kafka
 ---
