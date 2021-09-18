@@ -4,7 +4,7 @@ date:   2021-08-30 21:33:42
 categories: Kafka
 ---
 
-主线程将需发送的消息写入AccumulatorRecord中后，后续将消息发送至Kafka Broker的工作主要涉及到2个Kafka组件：**Sender线程及NetworkClient网络客户端**。
+主线程将待发送的消息写入AccumulatorRecord中后，后续将消息发送至Kafka Broker的工作主要由2个Kafka组件完成：**Sender线程及NetworkClient网络客户端**。
 Sender线程负责将AccumulatorRecord转化为网络请求的ClientRequest对象，而NetworkClient负责具体的发送实现。
 
 
@@ -52,13 +52,13 @@ void runOnce() {
 
 #### sendProducerData
 
-对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是与哪个Broker建立连接，不关心系消息属于哪个分区，Sender线程
+对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是与哪个Broker建立连接，不关心消息属于哪个分区，Sender线程
 需要将<TopicPartition,Deque<ProducerBatch>>的数据结构转变为<NodeId,List<ProducerBatch>>的形式，NodeId即为Kafka Broker的id,最终封装成为ClientRequest对象。
 
 * 1、检查当前有消息待发送的节点，并更新元数据
 
 ```
-Cluster cluster = metadata.fetch(); //获取本地元数据
+Cluster cluster = metadata.fetch(); 
 ReadyCheckResult result = this.accumulator.ready(cluster, now); //获取待发送节点数据
 if (!result.unknownLeaderTopics.isEmpty()) {
     //有未知leader分区的Topic,再次请求获取元数据

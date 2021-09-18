@@ -49,8 +49,8 @@ try {
 
 * 异步
 
-只调用send(record)方法获取Future对象即可实现异步，但这需要引入复杂的业务处理，Kafka重载了send方法，添加了Callback类型参数。Callback接口只有一个方法onCompletion(),
-方法的两个参数只会有一个有值，但**发送成功时，Exception为null,失败时RecordMetadata为null**。
+只调用send(record)方法获取Future对象也可实现异步，但这需要引入复杂的业务处理，Kafka重载了send方法，添加了Callback类型参数。Callback接口只有一个方法onCompletion(),
+方法的两个参数只会有一个有值，当**发送成功时，Exception为null,失败时RecordMetadata为null**。
 
 ```
 new Callback(){
@@ -70,7 +70,7 @@ new Callback(){
 消息发送异常可分为两类：**可重试异常、不可重试异常**。当发生不可重试异常时，send方法会直接抛出异常；可重试异常时，如果**retries参数不为0，kafkaProducer在规定的重试次数内会自动重试**，
 不会抛出异常，超出次数还未成功时，则会抛出异常，由外层逻辑处理。
 
-可重试异常：TimeoutException、OffsetOutOfRangeException、InvalidMetadataException、UnknownTopicOrPartitionException
+可重试异常：TimeoutException、InvalidMetadataException、UnknownTopicOrPartitionException
 
 不可重试异常：InvalidTopicException、RecordTooLargeException、UnknownServerException
 

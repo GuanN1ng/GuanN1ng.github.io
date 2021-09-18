@@ -6,7 +6,7 @@ categories: Kafka
 
 RecordAccumulator主要用来缓存消息以便Sender线程可以批量的发送消息，进而减少网络传输的资源消耗以提升性能。RecordAccumulator中涉及消息缓存的主要有2个参数：
 
-* CopyOnWriteMap<TopicPartition, Deque<ProducerBatch>> batches：分区信息与消息队列的映射关系
+* CopyOnWriteMap<TopicPartition, Deque<ProducerBatch>> batches：分区信息与待发送消息队列的映射关系
 
 * BufferPool：通过池化思想管理RecordAccumulator缓冲区，可用内存大小由参数buffer.memory设置，默认32MB。
 

@@ -15,7 +15,7 @@ Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消
 
 **Kafka通过引入幂等和事务特性实现exactly once**。
 
-## 幂等性
+## 幂等
 
 Kafka引入**幂等性来解决消息重复问题**，开启幂等特性后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。此处的幂等是有条件的：
 
@@ -309,3 +309,8 @@ if (firstInFlightSequence != RecordBatch.NO_SEQUENCE && first.hasSequence()
 * Sender线程发送时，在遍历queue中的batch时，会检查这个batch是否是重试的batch，如果是的话，只有这个batch是最旧的那个需要重试的batch，才允许发送，否则本次发送跳过这个Topic-Partition数据的发送等待下次发送。
 
 
+
+## 事务
+
+Kafka通过引入幂等实现了单会话单TopicPartition的Exactly-Once语义，但因为PID机制无法提供跨多个TopicPartition和跨会话场景下的Exactly-Once保证,Kafka引入事务来弥补这个缺陷，
+**事务可以保证对多个分区写入操作的原子性**。
