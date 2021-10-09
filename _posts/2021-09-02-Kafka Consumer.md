@@ -53,7 +53,8 @@ ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消�
 
 #### 分配主题分区
 
-消费者组内订阅同一topic的消费者即可通过配置**分区分配策略进行主题分区自动分配**，也可以使用**assign API完成手动订阅某些主题的特定分区**:
+消费者组内订阅同一topic的消费者即可通过配置**分区分配策略进行主题分区自动分配**，也可以使用**assign API完成手动订阅某些主题的特定分区**。但使用**assign方法订阅主题分区的
+消费者不具备自动再均衡的功能**，无法实现消费负载均衡及故障自动转移。
 
 ##### assign
 
@@ -77,6 +78,7 @@ public final class TopicPartition implements Serializable {
 }
 
 ```
+
 
 
 
