@@ -1,5 +1,5 @@
 ---
-title:  Kafka Producer IO
+title:  Kafka Producer消息发送模型
 date:   2021-08-30 21:33:42
 categories: Kafka
 ---

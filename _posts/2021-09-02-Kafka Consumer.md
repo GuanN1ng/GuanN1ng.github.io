@@ -1,19 +1,100 @@
 ---
-layout: post
-title:  "Kafka Consumer"
+title:  Kafka Consumer
 date:   2021-09-02 10:42:23
 categories: Kafka
 ---
 
-概念
+Kafka中的Topic是一个逻辑概念，它还可以细分为多个分区(Partition)，一个分区只属于单个主题，消息存储是基于分区进行存储的，每个分区可被视作一个可追加的日志文件，
+Producer会在分区日志的尾部追加数据，而Consumer负责订阅Topic，并从主题所属的分区日志的特定的位置(offset)读取并消费数据。
 
-消费者   消费者组   可扩展性
+### 消费者组
 
-消费者组是一个逻辑概念，将该组内的消费者归为一类，每个消费者只隶属于一个消费者组，消费者组内订阅同一topic的消费者按照一定的分区分配策略进行消费
-，一个分区只能被同一消费者组内的一个消费者消费，消费者组之间不受影响
+Kafka引入consumer group的概念来表示一组消费者实例的集合，每个消费者只属于一个消费者组，消费者组内订阅同一topic的消费者按照一定的分区分配策略进行消费，一个TopicPartition只能被同一消费者组
+内的一个消费者消费，消费者组之间不受影响。
+
+![consumer group](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/consumer%20group.png)
+
+消费者与消费组这种模型可以让整体的消费能力具备横向伸缩性，我们可以增加（或减少）消费者的个数来提高（或降低）整体的消费能力。对于分区数固定的Topic，一味的增加消费者组内的
+消费者数量并不会让消费能力一直得到提升，因为一个TopicPartition只能被同一消费者组内的一个消费者消费，当出现消费者数量大于分区的情况时，就会有消费者分配不到TopicPartition而无法
+消费任何消息。
+
+![消费者数量多于主题分区数](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/too%20many%20consumer.png)
+
+以上分配逻辑基于Kafka提供的默认分区分配策略**RangeAssignor**进行分析，根据不同Topic的Producer生产速率及TopicPartition数量，应合理的调整消费者组内订阅该Topic的消费者实例数量，来解决消息堆积或资源浪费的问题。
+
+消息中间件的消息投递模式可分为两类：点对点(P2P)模式和发布订阅(Pub/Sub)模式。得益于消费者与消费者组的模型，Kafka同时支持两种消息投递模式：
+
+* 所有的Consumer实例都属于同一个consumer group，则所有的消息都会被均衡的投递给每一个Consumer，即每条消息只会被一个consumer处理，此时为P2P模式；
+* 所有的Consumer实例都属于不同的consumer group，则所有的消息都会被广播给每一个消费者，即每条消息会被所有的Consumer处理，此时为发布订阅模式。
 
 
-KafkaConsumer
+### Consumer Client
+
+
+
+#### 订阅主题
+
+消费者进行数据消费时，首先需要完成相关主题的订阅，一个消费者可以订阅一个或多个主题，使用subscribe()方法完成主题订阅，以下为Consumer类内subscribe()方法的重载列表。
+
+```
+void subscribe(Collection<String> topics);
+
+void subscribe(Collection<String> topics, ConsumerRebalanceListener callback);
+
+void subscribe(Pattern pattern, ConsumerRebalanceListener callback);
+
+void subscribe(Pattern pattern);
+```
+
+subscribe API可分为两类：使用topic集合的方式订阅以及通过正则表达式的方式订阅。但subscribe方法的**多次调用并非增加主题，而是以最后一次调用subscribe方法时提供的主题列表为准**。
+
+ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消费者的主题分区发生变化时触发回调该Listener，后续分析消费者再均衡时再详解。
+
+
+#### 分配主题分区
+
+消费者组内订阅同一topic的消费者即可通过配置**分区分配策略进行主题分区自动分配**，也可以使用**assign API完成手动订阅某些主题的特定分区**:
+
+##### assign
+
+通过调用KafkaConsumer#assign(Collection)方法实现手动指定主题分区进行消费：
+
+```
+void assign(Collection<TopicPartition> partitions);
+```
+
+该方法内参数为Collection<TopicPartition>，其中TopicPartition为指定的主题分区，该类只有两个属性：topic和partition，分别代表主题及对应的分区编号：
+
+```
+public final class TopicPartition implements Serializable {
+    private final int partition;
+    private final String topic;
+
+    public TopicPartition(String topic, int partition) {
+        this.partition = partition;
+        this.topic = topic;
+    }
+}
+
+```
+
+
+
+
+##### ConsumerPartitionAssignor
+
+
+#### 消息获取
+
+
+
+
+
+
+
+
+
+
 
 
 订阅主题，手动指定消费分区或按照分区分配策略分配分区
