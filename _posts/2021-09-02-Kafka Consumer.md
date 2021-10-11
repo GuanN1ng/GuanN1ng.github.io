@@ -31,7 +31,6 @@ Kafka引入consumer group的概念来表示一组消费者实例的集合，每�
 ### Consumer Client
 
 
-
 #### 订阅主题
 
 消费者进行数据消费时，首先需要完成相关主题的订阅，一个消费者可以订阅一个或多个主题，使用subscribe()方法完成主题订阅，以下为Consumer类内subscribe()方法的重载列表。
@@ -58,13 +57,30 @@ ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消�
 
 ##### assign
 
-通过调用KafkaConsumer#assign(Collection)方法实现手动指定主题分区进行消费：
+主题分区信息可通过KafkaConsumer#partitionsFor(topic)方法进行查询获取。然后通过调用KafkaConsumer#assign(Collection)方法实现手动指定主题分区进行消费：
 
 ```
+List<PartitionInfo> partitionsFor(String topic);
+
 void assign(Collection<TopicPartition> partitions);
 ```
 
-该方法内参数为Collection<TopicPartition>，其中TopicPartition为指定的主题分区，该类只有两个属性：topic和partition，分别代表主题及对应的分区编号：
+PartitionInfo类中包含了主题的元数据信息：
+
+```
+public class PartitionInfo {
+    private final String topic; //主题
+    private final int partition; //主题分区编号
+    private final Node leader; // 当前leader副本所在节点
+    private final Node[] replicas; //分区副本的AR集合
+    private final Node[] inSyncReplicas; // 分区副本的ISR集合
+    private final Node[] offlineReplicas; //分区副本的OSR集合
+    
+    //...
+}
+```
+
+assign方法内参数为Collection<TopicPartition>，其中TopicPartition为指定的主题分区，该类只有两个属性：topic和partition，分别代表主题及对应的分区编号：
 
 ```
 public final class TopicPartition implements Serializable {
@@ -79,12 +95,72 @@ public final class TopicPartition implements Serializable {
 
 ```
 
-
-
-
-
 ##### ConsumerPartitionAssignor
 
+采用subscribe方法订阅主题的消费者会根据配置的分区分配策略完成消费分区分配，Kafka还为用户提供了RangeAssignor、RoundRobinAssignor、StickyAssignor等实现。
+用户也可实现AbstractPartitionAssignor接口创建自定义的分区分配策略。
+
+* RangeAssignor
+
+RangeAssignor是Kafka的默认分区分配策略，原理是使用主题分数区除以消费者数获取跨度，所有消费者按照字典序排列，然后按照跨度进行平均分配，若存在余数，字典序靠前的消费者
+会被多分配一个分区。
+
+![RangeAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/RangeAssignor.png)
+
+可以看出，当策略为RangeAssignor时，由于主题分区数多数情况下并非消费者数的整数倍，随着消费者订阅的Topic增加，**容易出现部分消费者过载**。
+
+
+* RoundRobinAssignor
+
+RoundRobinAssignor分配策略的原理是将消费组内所有消费者及消费者订阅的所有主题的分区按照字典序排序，然后通过轮询方式逐个将分区分配给每个消费者。
+
+![RoundRobinAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/RoundRobinAssignor.png)
+
+如上图，轮询分配的策略**在同一个消费者组内的所有消费者都订阅相同Topic时，分配时均匀的。当同一个消费者组内的消费都订阅不同Topic时，则可能导致分配不均匀**，上图所示的第二个例子中，
+完全可以将Topic-B_1的主题分区分给consumer-1处理。减轻consumer-2的压力。
+
+* StickyAssignor
+
+StickyAssignor的设计有两个目标：
+
+(1) 分区的分配要尽可能均匀：
+
+![StickyAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/StickyAssignor.png)
+
+(2) 分区的分配尽可能的与上次分配的结果保持相同：
+
+![StickyAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/StickyAssignor-2.png)
+
+
+当以上两者发生冲突时，第一个目标优于第二个目标。StickyAssignor分配策略比另外两者分配策略而言显得更加优异，既能最大程度的保证分配均匀，也能够减少不必要的分区移动。
+
+
+* 自定义策略
+
+用户也可根据自己的业务场景实现自定义的分配策略，只需实现AbstractPartitionAssignor中的assign方法即可:
+
+```
+/**
+ * org.apache.kafka.clients.consumer.internals.AbstractPartitionAssignor
+ * @param partitionsPerTopic  <主题-分区编号>集合
+ * @param subscriptions  <消费者id-订阅信息>集合
+ * @return
+ */
+public abstract Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                         Map<String, Subscription> subscriptions);                                                        Map<String, Subscription> subscriptions);
+```
+
+Subscription是ConsumerPartitionAssignor的内部类，用来表示消费者的订阅信息：
+
+```
+final class Subscription {
+    private final List<String> topics;  //消费者订阅的主题
+    // 用户自定义信息，可自行补充，用于计算分配，单需要实现顶层接口ConsumerPartitionAssignor
+    private final ByteBuffer userData;  
+    private final List<TopicPartition> ownedPartitions; // 当前消费者已被分配的分区
+    private Optional<String> groupInstanceId; //组id
+}
+```
 
 #### 消息获取
 
@@ -99,27 +175,6 @@ public final class TopicPartition implements Serializable {
 
 
 
-订阅主题，手动指定消费分区或按照分区分配策略分配分区
-
-public void subscribe(Collection<String> topics, ConsumerRebalanceListener listener)
-
-
- public void assign(Collection<TopicPartition> partitions) 
- 
- 
-```
-public interface ConsumerRebalanceListener {
-
-    void onPartitionsRevoked(Collection<TopicPartition> partitions);
-
-    void onPartitionsAssigned(Collection<TopicPartition> partitions);
-
-    default void onPartitionsLost(Collection<TopicPartition> partitions) {
-        onPartitionsRevoked(partitions);
-    }
-}
-
-```
 
 
 消费消息  poll()方法
@@ -172,16 +227,6 @@ auto.offset.reset  latest  //   earliest     none 抛出异常
 调用poll或assign分配分区，    2  指定偏移量   3 继续消费
 poll()/assign()->seek()->poll()
 
-
-消费者负载均衡及再均衡  高可用性及伸缩性
-
-分区分配策略  实现ConsumerPartitionAssignor接口
-
-kafka提供的实现   
-rangAssignor    多组topic，分配不均匀，  负载不均衡，导致部分消费者过载
-roundRobinAssignor  将topic分区字典排序，轮询方式逐个分配，组内消费者订阅不同的消息，也会导致分配不均匀
-
-******** StickyAssignor 1 分区分配尽量均匀 2 再分配时，分配结果与上次分配尽量相同，同一个分区尽量分给之前负责的消费者
 
   
 reBalance 原理
