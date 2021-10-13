@@ -76,7 +76,7 @@ new Callback(){
 
 ### 生产者拦截器
 
-使用生产者连接器可以完成2部分工作，**发送前消息处理以及发送结果回调前处理**，实例为ProducerInterceptor接口的实现类，接口内共有3个方法：
+使用生产者拦截器可以完成2部分工作，**发送前消息处理以及发送结果回调前处理**，实例为ProducerInterceptor接口的实现类，接口内共有3个方法：
 ```
 public interface ProducerInterceptor<K, V> extends Configurable {
     ProducerRecord<K, V> onSend(ProducerRecord<K, V> record);
@@ -97,7 +97,7 @@ public interface ProducerInterceptor<K, V> extends Configurable {
 ### 序列化
 
 生产者需将消息序列化后才可以通过网络IO发送到Kafka节点，同样消费者也需要将消息反序列化后再进行业务处理，且生产者和消费者需要使用对应的序列化器和反序列化器。序列化器是
-org.apache.kafka.common.serialization.Serializer的实现类，反序列化器是org.apache.kafka.common.serialization.Deserializer的实现类，Kafka提供了几组默认的实现类
+org.apache.kafka.common.serialization.Serializer的实现类，反序列化器是org.apache.kafka.common.serialization.Deserializer的实现类，Kafka提供了以下几组实现类
 供用户使用：
 
 * StringSerializer、StringDeserializer
@@ -106,7 +106,7 @@ org.apache.kafka.common.serialization.Serializer的实现类，反序列化器�
 * ListSerializer、ListDeserializer
 * ...
 
-用户也可以实现以上两个接口创建自定义的序列化器和反序列化器；
+用户也可以实现以上两个接口创建自定义的序列化器和反序列化器。
 
 ### 分区器
 
