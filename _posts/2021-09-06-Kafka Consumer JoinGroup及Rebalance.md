@@ -6,7 +6,20 @@ categories: Kafka
 ---
 
 KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，还包括消费位移、消费者协调器、组协调器、消费者选举、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理。
-本篇主要关注consumer与协调器之间的逻辑，如JoinGroup及Rebalance的流程。
+本篇主要关注ConsumerCoordinator与GroupCoordinator之间的逻辑，如JoinGroup及Rebalance的流程。
+
+
+### GroupCoordinator
+
+[ConsumerClient概述]()中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，默认情况下该主题有50个partition，每个partition
+3个副本，Consumer通过groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
+
+```
+Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount
+```
+
+获得对应的分区后，再寻找此分区的Leader副本所在的Broker节点，该Broker节点即为这个ConsumerGroup所对应的GroupCoordinator节点。GroupCoordinator是KafkaBroker上的一个服务，
+每个Broker实例在运行时都会启动一个这样的服务。
 
 ### KafkaConsumer#poll
 
