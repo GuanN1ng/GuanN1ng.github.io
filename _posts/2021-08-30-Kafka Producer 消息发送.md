@@ -4,8 +4,13 @@ date:   2021-08-30 21:33:42
 categories: Kafka
 ---
 
-主线程将待发送的消息写入AccumulatorRecord中后，后续将消息发送至Kafka Broker的工作主要由2个Kafka组件完成：**Sender线程及NetworkClient网络客户端**。
-Sender线程负责将AccumulatorRecord转化为网络请求的ClientRequest对象，而NetworkClient负责具体的发送实现。
+Kafka进行消息发送的入口是KafkaProducer#send()方法，该方法核心内容为：
+
+* 调用waitOnMetadata，更新TopicPartition元数据信息。
+
+* 调用RecordAccumulator#append方法，将消息写入缓存。
+
+后续将消息发送至Kafka Broker的工作主要由2个Kafka组件完成：**Sender线程及NetworkClient网络客户端**。Sender线程负责拉取AccumulatorRecord中的消息转化为网络请求的ClientRequest对象，而NetworkClient负责具体的发送实现。
 
 
 ### Sender初始化
@@ -35,6 +40,29 @@ private void configureThread(final String name, boolean daemon) {
 }
 ```
 
+### Wakeup
+
+执行KafkaProducer#send()方法时，也会完成对Sender#wakeup()方法的代用，代码如下，最终会调用java.nio.channels.Selector的wakeup方法，**唤醒被阻塞在select方法中的
+线程**，尽快将请求发送出去。
+
+```
+#org.apache.kafka.clients.producer.internals.Sender#wakeup
+public void wakeup() {
+    this.client.wakeup();
+}
+
+#org.apache.kafka.clients.NetworkClient#wakeup
+public void wakeup() {
+    this.selector.wakeup();
+}
+
+#org.apache.kafka.common.network.Selector#wakeup
+public void wakeup() {
+    this.nioSelector.wakeup();
+}
+
+```
+
 ### Run方法
 
 run方法中通过调用while循环调用runOnce方法实现消息发送(runOnce方法中还包含了事务处理，后续更新)：
@@ -55,11 +83,12 @@ void runOnce() {
 对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是与哪个Broker建立连接，不关心消息属于哪个分区，Sender线程
 需要将<TopicPartition,Deque<ProducerBatch>>的数据结构转变为<NodeId,List<ProducerBatch>>的形式，NodeId即为Kafka Broker的id,最终封装成为ClientRequest对象。
 
-* 1、检查当前有消息待发送的节点，并更新元数据
+* 1、通过RecordAccumulator#ready方法获取已就绪的分区节点。遍历`ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches`获取大小达到batch.size大小或时间达到linger.ms的分区及其
+对应的分区leader节点(会跳过加锁的分区，保证有序)。
 
 ```
 Cluster cluster = metadata.fetch(); 
-ReadyCheckResult result = this.accumulator.ready(cluster, now); //获取待发送节点数据
+ReadyCheckResult result = accumulator.ready(cluster, now); //获取待发送节点数据
 if (!result.unknownLeaderTopics.isEmpty()) {
     //有未知leader分区的Topic,再次请求获取元数据
     for (String topic : result.unknownLeaderTopics)
@@ -118,7 +147,7 @@ for (org.apache.kafka.clients.producer.internals.ProducerBatch expiredBatch : ex
 sensors.updateProduceRequestMetrics(batches);
 ```
 
-* 5、注册结果回调处理函数，并完成ClientRequest的构造
+* 5、注册结果回调处理函数，并完成ClientRequest的构造，调用NetworkClient#send()方法发送消息。
 
 ```
 RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
@@ -136,8 +165,8 @@ NetworkClient对Kafka对网络层的封装实现，底层采用Java NIO类库实
 
 
 * NetworkSend 数据发送Buffer
-* NetworkReceive 接收数据Buffer
-* TransportLayer  SocketChannel的封装
+* NetworkReceive 接收数据Buffer，通过MemoryPool进行池化管理，超过memoryPool时，暂停读取channel。
+* TransportLayer  对SocketChannel的封装
 * Kafka Selector持有Java NIO中Selector类型的成员变量，以及所有的KafkaChannel
 
 ```
@@ -154,7 +183,7 @@ public List<ClientResponse> poll(long timeout, long now)
 
 #### NetworkClient#send
 
-send方法主要是完成网络IO前的最后一步：
+send方法完成NetworkSend对象的构建并调用Selector.send()发送该对象。
 
 ```
 inFlightRequests.add(inFlightRequest);
@@ -162,20 +191,23 @@ selector.send(new NetworkSend(clientRequest.destination(), send));
 ```
 
 * 将请求保存到InFlightRequests中，InFlightRequests中保存着准备发送或等待响应的请求(**leastLoadedNode为InFlightRequests.size最小的节点**)。
-* 调用Selector#send，将数据写入对应KafkaChannel的NetworkSend(Buffer)中，并监听TransportLayer(SocketChannel)对应的写事件。
+* 调用Selector#send，将数据写入对应KafkaChannel的NetworkSend(Buffer)中，并注册TransportLayer(SocketChannel)对应的写事件。
 
 #### NetworkClient#poll
 
 poll中，调用Selector#poll方法，并完成Selector中所有Channel的事件。
 
 ```
+//更新元数据信息
+long metadataTimeout = metadataUpdater.maybeUpdate(now);
+//调用 Selector.poll()进行socket相关的IO操作
 try {
     this.selector.poll(Utils.min(timeout, metadataTimeout, defaultRequestTimeoutMs));
 } catch (IOException e) {
     log.error("Unexpected error during I/O", e);
 }
 
-// process completed actions
+// 处理完成后的操作
 long updatedNow = this.time.milliseconds();
 List<ClientResponse> responses = new ArrayList<>();
 handleCompletedSends(responses, updatedNow);
@@ -188,10 +220,7 @@ handleTimedOutRequests(responses, updatedNow);
 completeResponses(responses);
 ```
 
-
-* completeResponses
-
-此方法内调用Sender线程设置的回调函数RequestCompletionHandler->Sender#completeBatch()，消息重试、ProducerBatch清理及事务处理。
+completeResponses方法内调用Sender线程设置的回调函数RequestCompletionHandler->Sender#completeBatch()，完成消息重试、ProducerBatch清理及事务处理。
 
 ```
 if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() &&
@@ -224,5 +253,133 @@ if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone(
 // Unmute the completed partition.
 if (guaranteeMessageOrder)
     this.accumulator.unmutePartition(batch.topicPartition);
+
+```
+
+
+#### Selector#poll
+
+poll方法封装了JAVA NIO的业务操作。
+
+```
+public void poll(long timeout) throws IOException {
+    if (timeout < 0)
+        throw new IllegalArgumentException("timeout should be >= 0");
+
+    boolean madeReadProgressLastCall = madeReadProgressLastPoll;
+    //清除上次poll的缓存
+    clear();
+
+    boolean dataInBuffers = !keysWithBufferedRead.isEmpty();
+    //连接事件不为空或Channel有数据在缓冲区中但却无法读取(比如因为内存不足),timeout为0 ，select立即返回
+    if (!immediatelyConnectedKeys.isEmpty() || (madeReadProgressLastCall && dataInBuffers))
+        timeout = 0;
+    
+    //若之前内存池内存耗尽, 而现在又可用了, 将一些因为内存压力而暂时取消读事件的 Channel 重新注册读事件
+    if (!memoryPool.isOutOfMemory() && outOfMemory) {
+        for (KafkaChannel channel : channels.values()) {
+            if (channel.isInMutableState() && !explicitlyMutedChannels.contains(channel)) {
+                channel.maybeUnmute();
+            }
+        }
+        outOfMemory = false;
+    }
+
+   
+    long startSelect = time.nanoseconds();
+    int numReadyKeys = select(timeout);
+    long endSelect = time.nanoseconds();
+    this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
+
+    if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
+        //java nio获取就绪事件
+        Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
+
+        if (dataInBuffers) {
+            keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice
+            Set<SelectionKey> toPoll = keysWithBufferedRead;
+            keysWithBufferedRead = new HashSet<>(); //poll() calls will repopulate if needed
+            //处理有数据缓存的channel
+            pollSelectionKeys(toPoll, false, endSelect);
+        }
+
+        // 处理底层有数据的channel
+        pollSelectionKeys(readyKeys, false, endSelect);
+        // Clear all selected keys so that they are included in the ready count for the next select
+        readyKeys.clear();
+        //处理待连接的channel
+        pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
+        immediatelyConnectedKeys.clear();
+    } else {
+        madeReadProgressLastPoll = true; //no work is also "progress"
+    }
+
+    long endIo = time.nanoseconds();
+    this.sensors.ioTime.record(endIo - endSelect, time.milliseconds());
+
+    // Close channels that were delayed and are now ready to be closed
+    completeDelayedChannelClose(endIo);
+
+    // 在关闭过期连接后, 将完成接收的 Channels 加入 completedReceives.
+    maybeCloseOldestConnection(endSelect);
+}
+
+```
+pollSelectionKey方法内对相应的SelectionKey事件进行处理。同JAVA NIO。
+
+```
+void pollSelectionKeys(Set<SelectionKey> selectionKeys, boolean isImmediatelyConnected, long currentTimeNanos) {
+    for (SelectionKey key : determineHandlingOrder(selectionKeys)) {
+        KafkaChannel channel = channel(key);
+        long channelStartTimeNanos = recordTimePerConnection ? time.nanoseconds() : 0;
+        boolean sendFailed = false;
+        String nodeId = channel.id();
+
+        if (idleExpiryManager != null)
+            idleExpiryManager.update(nodeId, currentTimeNanos);
+
+        try {
+           //处理已经完成握手的连接
+            if (isImmediatelyConnected || key.isConnectable()) {
+                if (channel.finishConnect()) {
+                    this.connected.add(nodeId);
+                    this.sensors.connectionCreated.record();
+                    SocketChannel socketChannel = (SocketChannel) key.channel();  
+                } else {
+                    continue;
+                }
+            }
+            //....省略部分代码
+            
+            //读事件处理
+            if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
+                    && !explicitlyMutedChannels.contains(channel)) {
+                attemptRead(channel);
+            }
+
+            if (channel.hasBytesBuffered() && !explicitlyMutedChannels.contains(channel)) {
+                keysWithBufferedRead.add(key);
+            } 
+            ...            
+            //写事件处理
+            long nowNanos = channelStartTimeNanos != 0 ? channelStartTimeNanos : currentTimeNanos;
+            try {
+                attemptWrite(key, channel, nowNanos);
+            } catch (Exception e) {
+                sendFailed = true;
+                throw e;
+            }
+
+            /* cancel any defunct sockets */
+            if (!key.isValid())
+                close(channel, CloseMode.GRACEFUL);
+
+        } 
+        ...
+        } finally {
+            maybeRecordTimePerConnection(channel, channelStartTimeNanos);
+        }
+    }
+}
 
 ```
