@@ -1,5 +1,5 @@
 ---
-title:  Kafka Consumer Client概述
+title:  Kafka Consumer概述
 date:   2021-09-02 10:42:23
 categories: Kafka
 ---

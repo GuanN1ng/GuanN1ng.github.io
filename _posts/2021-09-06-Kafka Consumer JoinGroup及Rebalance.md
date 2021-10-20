@@ -6,12 +6,12 @@ categories: Kafka
 ---
 
 KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，还包括消费位移、消费者协调器、组协调器、消费者选举、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理。
-本篇主要关注ConsumerCoordinator与GroupCoordinator之间的逻辑，如JoinGroup及Rebalance的流程。
+本篇主要关注ConsumerCoordinator与GroupCoordinator之间的逻辑，如JoinGroup及Rebalance的实现。
 
 
-### GroupCoordinator
+## GroupCoordinator
 
-[ConsumerClient概述]()中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，默认情况下该主题有50个partition，每个partition
+[KafkaConsumer概述]()中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，默认情况下该主题有50个partition，每个partition
 3个副本，Consumer通过groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
 
 ```
@@ -21,17 +21,16 @@ Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount
 获得对应的分区后，再寻找此分区的Leader副本所在的Broker节点，该Broker节点即为这个ConsumerGroup所对应的GroupCoordinator节点。GroupCoordinator是KafkaBroker上的一个服务，
 每个Broker实例在运行时都会启动一个这样的服务。
 
-### KafkaConsumer#poll
+## KafkaConsumer#poll
 
 poll方法内主要可分为以下几步：
 
 * 通过记录当前线程id抢占锁，确保KafkaConsumer实例不会被多线程并发访问，保证线程安全。
-
 * 调用`updateAssignmentMetadataIfNeeded()`方法完成消费者拉取消息前的元数据获取。
-
 * 调用pollForFetches(timer)拉取消息。
-
 * 将经过ConsumerInterceptors处理过后的消息返回给消费者或拉取超时返回空集合。最后释放锁。
+
+其中第二步的方法主要内容为Consumer的JoinGroup及Rebalance。接下来我们以updateAssignmentMetadataIfNeeded方法为入口来分析KafkaConsumer如何实现JoinGroup及Rebalance。
 
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
@@ -77,7 +76,7 @@ private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetad
 }
 ```
 
-### ConsumerCoordinator#poll
+## ConsumerCoordinator#poll
 
 KafkaConsumer的poll方法内调用updateAssignmentMetadataIfNeeded完成消息拉取前的元数据获取，updateAssignmentMetadataIfNeeded方法非常简单，主要是两个方法的调用：
 
@@ -141,15 +140,15 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
 
 * 1、消费位移自动提交及提交完成的回调处理，方法invokeCompletedOffsetCommitCallbacks()及maybeAutoCommitOffsetsAsync()。
 
-* 2、心跳任务，通过pollHeartbeat()唤醒心跳线程，发送心跳并记录pollTimer。HeartbeatThread#run()方法会根据maxPollIntervalMs判断是否需要发送LeaveGroupRequest（主动触发rebalance）。
+* 2、心跳任务，通过pollHeartbeat()唤醒心跳线程，发送心跳并记录pollTimer。
 
 * 3、消费者入组及再平衡，我们通过以下几个阶段来进行分析：
 
 
-#### 1、FIND_COORDINATOR
+### 1、FIND_COORDINATOR
 
-ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size最小)发送FindCoordinatorRequest，查找GroupCoordinator所在的Broker，并建立连接。
-方法的调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendGroupCoordinatorRequest()
+ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size最小)发送FindCoordinatorRequest，查找GroupCoordinator所在的Broker，
+并在请求回调方法中建立连接。方法的调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendGroupCoordinatorRequest()
 
 ```
 protected synchronized boolean ensureCoordinatorReady(final Timer timer) {
@@ -195,16 +194,262 @@ private org.apache.kafka.clients.consumer.internals.RequestFuture<Void> sendFind
 
 ```
 
+### 2、JOIN_GROUP
+
+成功找到GroupCoordinator后，Consumer进入JoinGroup阶段，此阶段的Consumer会向GroupCoordinator发送JoinGroupRequest请求，GroupCoordinator会确认ConsumerGroup的Leader及分区分配策略，并响应给
+消费者。入口方法为`AbstractCoordinator#ensureActiveGroup()`，实现如下：
+
+```
+boolean ensureActiveGroup(final Timer timer) {
+    //确保groupCoordinator连接正常
+    if (!ensureCoordinatorReady(timer)) { return false; }
+    //启动HeartBeatThread(只是启动线程，满足其他条件后才会发送心跳)
+    startHeartbeatThreadIfNeeded(); 
+    return joinGroupIfNeeded(timer); // 发送joingroup请求
+}
+```
+
+#### 2.1、SendJoinGroupRequest
+
+继续看joinGroupIfNeeded()方法，通过代码可知发送JoinGroupRequest请求是在initiateJoinGroup()方法中实现的。
+
+```
+boolean joinGroupIfNeeded(final Timer timer) {
+    while (rejoinNeededOrPending()) {
+        if (!ensureCoordinatorReady(timer)) {
+            return false;
+        }
+        if (needsJoinPrepare) {
+            //首次为true
+            needsJoinPrepare = false;
+            //触发ConsumerRebalanceListener，如果自动提交为true，尝试提交
+            onJoinPrepare(generation.generationId, generation.memberId);
+        }
+        //发送JoinGroupRequest请求
+        final RequestFuture<ByteBuffer> future = initiateJoinGroup();
+        client.poll(future, timer);
+        if (!future.isDone()) {
+            //超时
+            return false;
+        }
+        if (future.succeeded()) {
+            Generation generationSnapshot;
+            MemberState stateSnapshot;
+            
+            synchronized (AbstractCoordinator.this) {
+                generationSnapshot = this.generation;
+                stateSnapshot = this.state;
+            }
+
+            if (!generationSnapshot.equals(Generation.NO_GENERATION) && stateSnapshot == MemberState.STABLE) {
+                // Duplicate the buffer in case `onJoinComplete` does not complete and needs to be retried.
+                ByteBuffer memberAssignment = future.value().duplicate();
+                //此时JoinGroup及SyncGroup已经成功。更新订阅的TopicPartition及对应的metadata
+                //执行回调 PartitionAssignor#onAssignment, ConsumerRebalanceListener#onPartitionsAssigned
+                onJoinComplete(generationSnapshot.generationId, generationSnapshot.memberId, generationSnapshot.protocolName, memberAssignment);
+                resetJoinGroupFuture();
+                needsJoinPrepare = true;
+            } else {
+                final String reason = String.format("rebalance failed since the generation/state was " + "modified by heartbeat thread to %s/%s before the rebalance callback triggered",generationSnapshot, stateSnapshot);
+                resetStateAndRejoin(reason); //重试
+                resetJoinGroupFuture(); 
+            }
+        } else {
+            final RuntimeException exception = future.exception();
+            resetJoinGroupFuture();
+            if (可重试异常)
+                continue;
+            else if (!future.isRetriable())
+                throw exception;
+            //重试的backoff
+            resetStateAndRejoin(String.format("rebalance failed with retriable error %s", exception));
+            timer.sleep(rebalanceConfig.retryBackoffMs);
+        }
+    }
+    return true;
+}
+```
+initiateJoinGroup()方法中又调用了sendJoinGroupRequest()方法完成JoinGroupRequest请求的发送，这里的代码比较简单，其中参数rebalanceTimeoutMs的值为max.poll.interval.ms，
+而joinGroupTimeoutMs为max.poll.interval.ms加5s。protocolType为"consumer"，generation.memberId初始值为`""`空字符串。
+
+```
+private synchronized RequestFuture<ByteBuffer> initiateJoinGroup() {
+    if (joinFuture == null) {
+        state = MemberState.PREPARING_REBALANCE;
+        if (lastRebalanceStartMs == -1L)
+            lastRebalanceStartMs = time.milliseconds();
+        joinFuture = sendJoinGroupRequest();
+        joinFuture.addListener(new RequestFutureListener<ByteBuffer>() {
+            @Override
+            public void onSuccess(ByteBuffer value) {
+                // do nothing since all the handler logic are in SyncGroupResponseHandler already
+            }
+            @Override
+            public void onFailure(RuntimeException e) {
+                synchronized (AbstractCoordinator.this) {
+                    sensors.failedRebalanceSensor.record();
+                }
+            }
+        });
+    }
+    return joinFuture;
+}
+
+RequestFuture<ByteBuffer> sendJoinGroupRequest() {
+    if (coordinatorUnknown())
+        return org.apache.kafka.clients.consumer.internals.RequestFuture.coordinatorNotAvailable();
+    log.info("(Re-)joining group");
+    JoinGroupRequest.Builder requestBuilder = new JoinGroupRequest.Builder(
+            new JoinGroupRequestData()
+                    .setGroupId(rebalanceConfig.groupId)
+                    .setSessionTimeoutMs(this.rebalanceConfig.sessionTimeoutMs)
+                    .setMemberId(generation.memberId)
+                    .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))
+                    .setProtocolType(protocolType())
+                    .setProtocols(metadata())
+                    .setRebalanceTimeoutMs(this.rebalanceConfig.rebalanceTimeoutMs)
+    );
+
+    log.debug("Sending JoinGroup ({}) to coordinator {}", requestBuilder, this.coordinator);
+
+    int joinGroupTimeoutMs = Math.max(client.defaultRequestTimeoutMs(),Math.max(rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE,rebalanceConfig.rebalanceTimeoutMs) );
+    return client.send(coordinator, requestBuilder, joinGroupTimeoutMs).compose(new JoinGroupResponseHandler(generation));
+}
+
+```
+
+#### 2.2、HandleJoinGroupRequest
+
+JoinGroupRequest由对应的GroupCoordinator所在的broker处理，入口方法为handleJoinGroupRequest，这部分代码为scala，以下删减了部分源码，方法内主要做了2件事：定义了响应回调以及
+调用handleJoinGroup方法。
+
+```
+
+  def handleJoinGroupRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    val joinGroupRequest = request.body[JoinGroupRequest]
+    
+    def sendResponseCallback(joinResult: JoinGroupResult): Unit = {...}
+    ...
+      groupCoordinator.handleJoinGroup(
+        joinGroupRequest.data.groupId,
+        joinGroupRequest.data.memberId,
+        groupInstanceId,
+        requireKnownMemberId,
+        request.header.clientId,
+        request.context.clientAddress.toString,
+        joinGroupRequest.data.rebalanceTimeoutMs,
+        joinGroupRequest.data.sessionTimeoutMs,
+        joinGroupRequest.data.protocolType,
+        protocols,
+        sendResponseCallback,
+        requestLocal)
+    }
+  }
+```
+
+handleJoinGroup方法的实现如下，GroupCoordinator通过`groupMetadataCache = new Pool[String, GroupMetadata]`缓存所有groupId与GroupMetadata的对应关系，
+若groupId对应的GroupMetadata为空，就新建一个放入缓存。后续根据memberId判断是执行doNewMemberJoinGroup()或doCurrentMemberJoinGroup()。
+
+```
+def handleJoinGroup(...): Unit = {
+    validateGroupStatus(groupId, ApiKeys.JOIN_GROUP).foreach { error =>
+      responseCallback(JoinGroupResult(memberId, error))
+      return
+    }
+    // sessionTimeoutMs默认为即6s-5min之间，可通过Broker端的参数`group.min.session.timeout.ms`和`group.min.session.timeout.ms`配置
+    if (sessionTimeoutMs < groupConfig.groupMinSessionTimeoutMs ||
+      sessionTimeoutMs > groupConfig.groupMaxSessionTimeoutMs) {
+      responseCallback(JoinGroupResult(memberId, Errors.INVALID_SESSION_TIMEOUT))
+    } else {
+      val isUnknownMember = memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID
+      //第一个组消费者请求时，memberId=""，group不存在，此时会创建一个新的GroupMetadata
+      groupManager.getOrMaybeCreateGroup(groupId, isUnknownMember) match {
+        case None =>
+           // memberId不为空，groupMetadate为空，请求错误
+          responseCallback(JoinGroupResult(memberId, Errors.UNKNOWN_MEMBER_ID))
+        case Some(group) =>
+          group.inLock {
+            //判断当前组是否可以加入，容量状态等因素
+            if (!acceptJoiningMember(group, memberId)) {
+              //移除
+              group.remove(memberId)
+              responseCallback(JoinGroupResult(JoinGroupRequest.UNKNOWN_MEMBER_ID, Errors.GROUP_MAX_SIZE_REACHED))
+            } else if (isUnknownMember) {
+                //新的消费者入组
+                doNewMemberJoinGroup(...)
+            } else {
+              //重新加入
+              doCurrentMemberJoinGroup(...)
+            }
+            if (group.is(PreparingRebalance)) {
+              rebalancePurgatory.checkAndComplete(GroupJoinKey(group.groupId))
+            }
+          }
+      }
+    }
+  }
+```
+
+doNewMemberJoinGroup或doCurrentMemberJoinGroup均调用addMemberAndRebalance方法完成新消费者的加入。此时GroupCoordinator会为memberId为空的消费者自动生成
+id，方法如下：
+
+```
+clientId + GroupMetadata.MemberIdDelimiter + UUID.randomUUID().toString
+```
+下面来继续介绍addMemberAndRebalance方法，主要是两个方法的调用：
+
+* add方法，完成消费者入组
+* maybePrepareRebalance方法，判断是否开始rebalance
+
+```
+private def addMemberAndRebalance(...): Unit = {
+    //为新的消费者创建元数据
+    val member = new MemberMetadata(memberId, groupInstanceId, clientId, clientHost,
+      rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols)
+    ...
+    group.add(member, callback)
+    ...
+
+    maybePrepareRebalance(group, s"Adding new member $memberId with group instance id $groupInstanceId")
+}
+```
+
+##### 选举消费者组的Leader
+
+GroupCoordinator中消费者的信息是以HashMap的形式存储的，其中key为消费者的memberId，而value是消费者相关的元数据信息，add方法只是将新消费者加入members这个Map中。
+这里主要关注leaderId的赋值，如果消费组内还没有leader，那么第一个加入消费组的消费者即为消费组的leader。
+
+```
+def add(member: MemberMetadata, callback: JoinCallback = null): Unit = {
+    ...
+    if (leaderId.isEmpty)
+      leaderId = Some(member.memberId)
+    members.put(member.memberId, member)
+    ...
+}
+```
+
+补充：如果后续leaderId对应的消息者发生离组，新的leaderId为members Map中的第一个键值对的key。
+
+```
+def remove(memberId: String): Unit = {
+    ...
+    if (isLeader(memberId))
+      leaderId = members.keys.headOption
+    ...
+}
+```
 
 
-#### 2、JOIN_GROUP
+#### 2.3、JoinGroupResponseHandler
 
 
 
-
-
-#### 3、SYNC_GROUP
+### 3、SYNC_GROUP
 
 
 
-#### 4、HEARTBEAT
+### 4、HEARTBEAT
+
+
+HeartbeatThread#run()方法会根据maxPollIntervalMs判断是否需要发送LeaveGroupRequest（主动触发rebalance）。
