@@ -5,8 +5,8 @@ date:   2021-09-06 14:41:42
 categories: Kafka
 ---
 
-KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，还包括消费位移、消费者协调器、组协调器、消费者选举、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理。
-本篇主要关注ConsumerCoordinator与GroupCoordinator之间的逻辑，如JoinGroup及Rebalance的实现。
+KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，拉取消息前还需完成JoinGroup、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理。这些逻辑均在
+ConsumerCoordinator与GroupCoordinator之间完成。
 
 
 ## GroupCoordinator
