@@ -5,13 +5,13 @@ date:   2021-09-06 14:41:42
 categories: Kafka
 ---
 
-KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，拉取消息前还需完成JoinGroup、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理。这些逻辑均在
-ConsumerCoordinator与GroupCoordinator之间完成。
+KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，ConsumerJoinGroup、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理也均在poll方法内完成。这些逻辑涉及到
+两个角色：ConsumerCoordinator与GroupCoordinator。
 
 
 ## GroupCoordinator
 
-GroupCoordinator是Kafka Broker上的一个服务，每个Broker实例在运行时都会启动一个这样的服务。[KafkaConsumer概述]()中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，
+GroupCoordinator是Kafka Broker上的一个服务，每个Broker实例在运行时都会启动一个这样的服务。[KafkaConsumer概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/)中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，
 默认情况下该主题有50个partition，每个partition3个副本，Consumer通过groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
 
 ```
@@ -27,7 +27,7 @@ poll方法内主要可分为以下几步：
 * 通过记录当前线程id抢占锁，确保KafkaConsumer实例不会被多线程并发访问，保证线程安全。
 * 调用`updateAssignmentMetadataIfNeeded()`方法完成消费者拉取消息前的元数据获取。
 * 调用pollForFetches(timer)拉取消息。
-* 将经过ConsumerInterceptors处理过后的消息返回给消费者或拉取超时返回空集合。最后释放锁。
+* 将经过Consumer#Interceptors处理过后的消息返回给消费者或拉取超时返回空集合。最后释放锁。
 
 其中第二步的方法主要内容为Consumer的JoinGroup及Rebalance。接下来我们以updateAssignmentMetadataIfNeeded方法为入口来分析KafkaConsumer如何实现JoinGroup及Rebalance。
 
@@ -149,6 +149,10 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
 ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size最小)发送FindCoordinatorRequest，查找GroupCoordinator所在的Broker，
 并在请求回调方法中建立连接。
 
+
+![Find GroupCoordinator](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/find%20groupcoordinator.png)
+
+
 #### 1.1、SendFindCoordinatorRequest
 
 请求发送的方法调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendFindCoordinatorRequest()，这一步完成请求的发送及回调函数注册。
@@ -254,7 +258,11 @@ private def getCoordinator(request: RequestChannel.Request, keyType: Byte, key: 
 ### 2、JOIN_GROUP
 
 成功找到GroupCoordinator后，Consumer进入JoinGroup阶段，此阶段的Consumer会向GroupCoordinator发送JoinGroupRequest请求，GroupCoordinator会确认ConsumerGroup的Leader及分区分配策略，并响应给
-消费者。入口方法为`AbstractCoordinator#ensureActiveGroup()`，实现如下：
+消费者。
+
+![JOIN GROUP](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/join%20group.png)
+
+入口方法为`AbstractCoordinator#ensureActiveGroup()`，实现如下：
 
 ```
 boolean ensureActiveGroup(final Timer timer) {
@@ -677,6 +685,8 @@ private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
 上一阶段JOIN_GROUP阶段的最后，leader consumer会根据GroupCoordinator返回的分区分配策略及member metadata完成具体的分区分配。如何将分区分配的结果同步给其它consumer，这里Kafka并没有
 让leader consumer直接将分配结果同步给其它消费者，而是通过GroupCoordinator来实现中转，减少复杂性。此阶段即SYNC_GROUP阶段，**各个消费者会向GroupCoordinator发送SyncGroupRequest请求来同步分配方案**。
 
+![SYNC GROUP](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/sync%20group.png)
+
 #### 3.1 sendSyncGroupRequest
 
 Consumer端发送SyncGroupRequest请求的方法如下，发送时会注册一个回调函数SyncGroupResponseHandler。
@@ -835,20 +845,4 @@ protected void onJoinComplete(int generation,String memberId,String assignmentSt
     }
 }
 ```
-
-### 4、HEARTBEAT
-
-此时，consumer已完成JoinGroup以及Rebalance，处于正常工作状态。**consumer需要向GroupCoordinator定时发送心跳来证明存活，以保证不会被移除group，维持对现有TopicPartition的所有权**，如果消费者停
-发送心跳的时间足够长，则整个会话就被判定为过期， GroupCoordinator会认为这个消费者己经死亡，就会触发一次再均衡行为。
-
-Kafka中有一个单独的线程**HeartbeatThread**负责发送心跳,消费者的心跳间隔时间由参数heartbeat.interval.ms指定，这个参数必须比session.timeout.ms参数设定的值要小，
-一般情况下heartbeat.interval.ms的配置值不能超过session.timeout.ms配置值的1/3。这个参数可以调整得更低，以控制正常重新平衡的预期时间。
-
-如果一个消费者突然崩溃，GroupCoordinator会等待一段时间，确认消费者死亡后再触发rebalance，这段时间即为session.timeout.ms。session.timeout.ms的值必须在Broker端配置的
-参数`group.min.session.timeout.ms`和`group.min.session.timeout.ms`的值之前。默认6s~5min。
-
-HeartbeatThread#run()方法也会根据maxPollIntervalMs判断是否poll超时，若超时则发送LeaveGroupRequest（主动触发rebalance）。
-
-
-## 总结
 
