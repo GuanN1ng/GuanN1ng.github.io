@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  Kafka Consumer JoinGroup及Rebalance
+title:  Kafka Consumer JoinGroup及SyncGroup
 date:   2021-09-06 14:41:42
 categories: Kafka
 ---
@@ -9,7 +9,7 @@ KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉�
 两个角色：ConsumerCoordinator与GroupCoordinator。
 
 
-## GroupCoordinator
+## GroupCoordinator简介
 
 GroupCoordinator是Kafka Broker上的一个服务，每个Broker实例在运行时都会启动一个这样的服务。[KafkaConsumer概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/)中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，
 默认情况下该主题有50个partition，每个partition3个副本，Consumer通过groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
