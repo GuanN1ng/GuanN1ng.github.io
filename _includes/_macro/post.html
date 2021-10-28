@@ -400,7 +400,7 @@
           <div class="post-nav-prev post-nav-item">
             {% if post.previous %}
             <a href="{{ post.previous.url | relative_url }}" rel="prev" title="{{ post.previous.title }}">
-              {{ post.previous.title }} <i class="fa fa-chevron-right"></i>
+              {{ post.previous.title }} <i class="fa fa-chevron-left"></i>
             </a>
             {% endif %}
           </div>
@@ -410,7 +410,7 @@
           <div class="post-nav-next post-nav-item">
             {% if post.next %}
             <a href="{{ post.next.url | relative_url }}" rel="next" title="{{ post.next.title }}">
-              <i class="fa fa-chevron-left"></i> {{ post.next.title }}
+              <i class="fa fa-chevron-right"></i> {{ post.next.title }}
             </a>
             {% endif %}
           </div>
