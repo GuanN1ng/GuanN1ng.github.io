@@ -5,21 +5,38 @@ date:   2021-09-17 14:32:14
 categories: Kafka
 ---
 
+前面两篇内容已经介绍了consumer的join group以及heartbeat内容，consumer已经具备消息拉取的条件，本文继续KafkaConsumer#poll方法的源码解析，来了解消息拉取的内容。
+
+## updateFetchPositions
 
 
+
+
+## pollForFetches
 poll方法实现如下：
-
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
      //consumer不是线程安全的， CAS设置当前threadId获取锁，并确认consumer未关闭
     acquireAndEnsureOpen();
     try {
-        ...
+        //记录开始时间，用于超时返回
+        this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
+        if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
+            throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
+        }
         //do-while 超时判断
         do {
             //是否有线程调用wakeup方法，若有则抛出异常WakeupException，退出poll方法。
             client.maybeTriggerWakeup();
-            ...
+            //includeMetadataInTimeout 拉取消息的超时时间是否包含更新元数据的时间
+            if (includeMetadataInTimeout) {
+                updateAssignmentMetadataIfNeeded(timer, false);
+            } else {
+                //更新元数据请求
+                while (!updateAssignmentMetadataIfNeeded(time.timer(Long.MAX_VALUE), true)) {
+                    log.warn("Still waiting for metadata");
+                }
+            }
             //拉取消息
             Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(timer);
             if (!records.isEmpty()) {
@@ -39,7 +56,6 @@ private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetad
         this.kafkaConsumerMetrics.recordPollEnd(timer.currentTimeMs());
     }
 }
-
 ```
 
 

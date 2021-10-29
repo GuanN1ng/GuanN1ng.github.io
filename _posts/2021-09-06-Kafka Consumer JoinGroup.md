@@ -1,12 +1,12 @@
 ---
 layout: post
-title:  Kafka Consumer JoinGroup及SyncGroup
+title:  Kafka Consumer JoinGroup
 date:   2021-09-06 14:41:42
 categories: Kafka
 ---
 
-KafkaConsumer通过poll方法执行消息拉取，但poll方法内不仅是拉取消息，ConsumerJoinGroup、TopicPartition分配、ConsumerRebalance、心跳等逻辑的处理也均在poll方法内完成。这些逻辑涉及到
-两个角色：ConsumerCoordinator与GroupCoordinator。
+KafkaConsumer通过poll方法执行消息拉取，但poll方法拉取消息前，还有JoinGroup、TopicPartition分区计算、ConsumerRebalance、心跳等逻辑需要完成，而这些均在poll方法内完成。
+本篇内容主要介绍一个consumer如何加入消费组并分配到分区进行消息。这些逻辑涉及到两个角色：ConsumerCoordinator与GroupCoordinator。
 
 
 ## GroupCoordinator简介
@@ -22,7 +22,7 @@ def partitionFor(groupId: String): Int = Utils.abs(groupId.hashCode) % groupMeta
 
 ## KafkaConsumer#poll
 
-poll方法内主要可分为以下几步：
+首先来看KafkaConsumer#poll方法，主要可分为以下几步：
 
 * 通过记录当前线程id抢占锁，确保KafkaConsumer实例不会被多线程并发访问，保证线程安全。
 * 调用`updateAssignmentMetadataIfNeeded()`方法完成消费者拉取消息前的元数据获取。
@@ -300,12 +300,10 @@ boolean joinGroupIfNeeded(final Timer timer) {
         if (future.succeeded()) {
             Generation generationSnapshot;
             MemberState stateSnapshot;
-            
             synchronized (AbstractCoordinator.this) {
                 generationSnapshot = this.generation;
                 stateSnapshot = this.state;
             }
-
             if (!generationSnapshot.equals(Generation.NO_GENERATION) && stateSnapshot == MemberState.STABLE) {
                 // Duplicate the buffer in case `onJoinComplete` does not complete and needs to be retried.
                 ByteBuffer memberAssignment = future.value().duplicate();
@@ -320,21 +318,13 @@ boolean joinGroupIfNeeded(final Timer timer) {
                 resetJoinGroupFuture(); 
             }
         } else {
-            final RuntimeException exception = future.exception();
-            resetJoinGroupFuture();
-            if (可重试异常)
-                continue;
-            else if (!future.isRetriable())
-                throw exception;
-            //重试的backoff
-            resetStateAndRejoin(String.format("rebalance failed with retriable error %s", exception));
-            timer.sleep(rebalanceConfig.retryBackoffMs);
+            ...//异常处理
         }
     }
     return true;
 }
 ```
-initiateJoinGroup()方法中又调用了sendJoinGroupRequest()方法完成JoinGroupRequest请求的发送，这里的代码比较简单，其中参数rebalanceTimeoutMs的值为max.poll.interval.ms，
+initiateJoinGroup()方法中先更新consumer状态为PREPARING_REBALANCE，又调用了sendJoinGroupRequest()方法完成JoinGroupRequest请求的发送，这里的代码比较简单，其中参数rebalanceTimeoutMs的值为max.poll.interval.ms，
 而joinGroupTimeoutMs为max.poll.interval.ms加5s。protocolType为"consumer"，generation.memberId初始值为`""`空字符串。
 
 ```
@@ -612,8 +602,8 @@ initNextGeneration方法：
 
 #### 2.3、JoinGroupResponseHandler
 
-Consumer在sendJoinGroupRequest方法中，除了发送请求，还定义了响应的处理器JoinGroupResponseHandler，方法中根据broker返回的leader memberId判断，如果当前consumer就是leader，
-调用onJoinLeader，否则调用onJoinFollower。
+Consumer在sendJoinGroupRequest方法中，除了发送请求，还定义了响应的处理器JoinGroupResponseHandler，方法中首先consumer的状态更新为COMPLETING_REBALANCE，然后根据broker
+返回的leader memberId判断，如果当前consumer就是leader，调用onJoinLeader，否则调用onJoinFollower。
 
 ```
 private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGroupResponse, ByteBuffer> {
@@ -627,7 +617,8 @@ private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGr
                     if (state != MemberState.PREPARING_REBALANCE) {
                         future.raise(new UnjoinedGroupException());
                     } else {
-                        state = MemberState.COMPLETING_REBALANCE;
+                        //consumer 状态更新为COMPLETING_REBALANCE
+                        state = MemberState.COMPLETING_REBALANCE; 
                         if (heartbeatThread != null)
                             heartbeatThread.enable(); //开启心跳
                         ////初始化了generation，版本号
@@ -781,7 +772,49 @@ propagateAssignment方法调用回调方法，响应每个consumer，响应的�
 
 #### 3.3 SyncGroupResponseHandler
 
-收到SyncGroupResponse由SyncGroupResponseHandler进行处理，并调用ConsumerCoordinator#onJoinComplete完成元数据及分区信息更新，并触发rebalanceListener。
+收到SyncGroupResponse由SyncGroupResponseHandler#handle()进行处理，响应数据校验通过后，consumer的状态更新为STABLE。
+
+```
+public void handle(SyncGroupResponse syncResponse,
+                   org.apache.kafka.clients.consumer.internals.RequestFuture<ByteBuffer> future) {
+    Errors error = syncResponse.error();
+    if (error == Errors.NONE) {
+        if (isProtocolTypeInconsistent(syncResponse.data().protocolType())) {
+            future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);
+        } else {
+            log.debug("Received successful SyncGroup response: {}", syncResponse);
+            sensors.syncSensor.record(response.requestLatencyMs());
+            synchronized (AbstractCoordinator.this) {
+                if (!generation.equals(Generation.NO_GENERATION) && state == MemberState.COMPLETING_REBALANCE) {
+                    final String protocolName = syncResponse.data().protocolName();
+                    final boolean protocolNameInconsistent = protocolName != null && !protocolName.equals(generation.protocolName);
+                    if (protocolNameInconsistent) {
+                        future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);
+                    } else {
+                        //处理相应，consuemr stat转为STABLE
+                        log.info("Successfully synced group in generation {}", generation);
+                        state = MemberState.STABLE;
+                        rejoinNeeded = false;
+                        lastRebalanceEndMs = time.milliseconds();
+                        sensors.successfulRebalanceSensor.record(lastRebalanceEndMs - lastRebalanceStartMs);
+                        lastRebalanceStartMs = -1L;
+                        future.complete(ByteBuffer.wrap(syncResponse.data().assignment()));
+                    }
+                } else {
+                    future.raise(Errors.ILLEGAL_GENERATION);
+                }
+            }
+        }
+    } else {
+        ...//异常处理
+    }
+}
+```
+
+### 4、JoinComplete
+
+以上3个阶段后，consumer已完成入组并获取到主题分区，回到joinGroupIfNeeded方法，initiateJoinGroup方法的请求结果由ConsumerCoordinator#onJoinComplete处理，方法中完成了分区信息更新并触发rebalanceListener。
+至此，consumer已完成入组。
 
 ```
 protected void onJoinComplete(int generation,String memberId,String assignmentStrategy,ByteBuffer assignmentBuffer) {
@@ -846,3 +879,15 @@ protected void onJoinComplete(int generation,String memberId,String assignmentSt
 }
 ```
 
+## Consumer状态机
+
+consumer从创建到可以正常消费消息共有以下4种状态：
+
+```
+UNJOINED             // the client is not part of a group
+PREPARING_REBALANCE  // the client has sent the join group request, but have not received response
+COMPLETING_REBALANCE // the client has received join group response, but have not received assignment
+STABLE               // the client has joined and is sending heartbeats
+```
+
+UNJOINED为初始状态，join group失败或leave group后consumer会重置为UNJOINED。
