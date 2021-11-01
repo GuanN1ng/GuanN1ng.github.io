@@ -1,15 +1,12 @@
 ---
 layout: post
-title:  Kafka Consumer Poll详解
-date:   2021-09-17 14:32:14
+title:  Kafka GroupCoordinator
+date:   2021-10-12 17:18:31
 categories: Kafka
 ---
 
-前面两篇内容已经介绍了consumer的join group以及heartbeat内容，consumer已经具备消息拉取的条件，本文继续KafkaConsumer#poll方法的源码解析，来了解消息拉取的内容。
 
-## updateFetchPositions
-
-
+consumer端
 
 
 ## pollForFetches
@@ -88,3 +85,4 @@ private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer tim
     return fetcher.fetchedRecords();
 }
 ```
+
