@@ -319,5 +319,5 @@ Log层的源码实现后续分析Server端日志存储时再进行分析。
 
 ### 总结
 
-updateFetchPositions方法执行完毕后，无论是通过OffsetFetchRequest还是ListOffsetsRequest，consumer所有订阅的TopicPartition(除去auto.offset.reset=none的分区)已获取到有效的分区offset，
+updateFetchPositions方法执行完毕后，无论是通过OffsetFetchRequest还是ListOffsetsRequest，consumer所有订阅的TopicPartition(除去查询不到offset且auto.offset.reset=none的分区)已获取到有效的分区offset，
 拉取消息前的所有准备工作已经完成。
