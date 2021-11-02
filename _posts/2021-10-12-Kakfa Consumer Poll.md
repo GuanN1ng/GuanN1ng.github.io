@@ -1,16 +1,17 @@
 ---
 layout: post
-title:  Kafka GroupCoordinator
+title:  Kafka Poll
 date:   2021-10-12 17:18:31
 categories: Kafka
 ---
 
+前面几篇内容我们分析了`updateAssignmentMetadataIfNeeded`的执行流程，包含两部分内容：
 
-consumer端
+* ConsumerCoordinator#poll方法，获取GroupCoordinator，完成JoinGroup及主题分区方案获取，详情见[Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)；
+* KafkaConsumer#updateFetchPositions方法，更新consumer订阅的TopicPartition的有效offset，确认下次消息拉取的偏移量(offset)，详情见[Kafka Consumer UpdateFetchPosition](https://guann1ng.github.io/kafka/2021/09/17/Kafka-Consumer-UpdateFetchPosition/)。
 
+本篇内容我们继续KafkaConsumer#poll方法的后半部分内容，即消息拉取部分，方法为KafkaConsumer#pollForFetches。
 
-## pollForFetches
-poll方法实现如下：
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
      //consumer不是线程安全的， CAS设置当前threadId获取锁，并确认consumer未关闭
@@ -37,8 +38,7 @@ private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetad
             //拉取消息
             Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(timer);
             if (!records.isEmpty()) {
-                //如果拉取到的消息集合不为空，再返回该批消息之前，如果还有挤压的拉取请求，可以继续发送拉取请求，
-                //但此时会禁用warkup，主要的目的是用户在处理消息时，KafkaConsumer还可以继续向broker拉取消息。
+                //如果拉取到的消息集合不为空，再返回该批消息之前，如果还有挤压的拉取请求，继续发送拉取请求，
                 if (fetcher.sendFetches() > 0 || client.hasPendingRequests()) {
                     client.transmitSends();
                 }
@@ -55,34 +55,78 @@ private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetad
 }
 ```
 
+### pollForFetches
 
-KafkaConsumer#pollForFetches
+pollForFetches方法的源码如下，方法可分为三部分：
+
+* 发送消息拉取请求的**Fetcher#sendFetches()**；
+* 触发网络读写时间的**ConsumerNetworkClient#poll()**，底层为Java NIO;
+* 获取本地已拉取完成的消息记录的**Fetcher#fetchedRecords()**。
 
 ```
 private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer timer) {
-    long pollTimeout = coordinator == null ? timer.remainingMs() :
-            Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
-
+    //获取拉取超时时间
+    long pollTimeout = coordinator == null ? timer.remainingMs() : Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
+    //本地已有拉取的消息，返回
     Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
     if (!records.isEmpty()) {
         return records;
     }
-
+    //发送消息拉取请求
     fetcher.sendFetches();
-
     if (!cachedSubscriptionHashAllFetchPositions && pollTimeout > retryBackoffMs) {
         pollTimeout = retryBackoffMs;
     }
-
-    log.trace("Polling for fetches with timeout {}", pollTimeout);
-
     Timer pollTimer = time.timer(pollTimeout);
+    //NetworkClient poll 触发网络读写
     client.poll(pollTimer, () -> {
         return !fetcher.hasAvailableFetches();
     });
     timer.update(pollTimer.currentTimeMs());
-
+    //返回拉取数据
     return fetcher.fetchedRecords();
 }
+```
+
+可以看到，消息拉取的核心类为Fetcher，下面简单介绍下org.apache.kafka.clients.consumer.internals.Fetcher。
+
+### Fetcher
+
+
+```
+public class Fetcher<K, V> implements Closeable {
+    private final Logger log;
+    private final LogContext logContext;
+    private final ConsumerNetworkClient client;
+    private final Time time;
+    private final int minBytes;
+    private final int maxBytes;
+    private final int maxWaitMs;
+    private final int fetchSize;
+    private final long retryBackoffMs;
+    private final long requestTimeoutMs;
+    private final int maxPollRecords;
+    private final boolean checkCrcs;
+    private final String clientRackId;
+    private final ConsumerMetadata metadata;
+    private final FetchManagerMetrics sensors;
+    private final SubscriptionState subscriptions;
+    private final ConcurrentLinkedQueue<CompletedFetch> completedFetches;
+    private final BufferSupplier decompressionBufferSupplier = BufferSupplier.create();
+    private final Deserializer<K> keyDeserializer;
+    private final Deserializer<V> valueDeserializer;
+    private final IsolationLevel isolationLevel;
+    private final Map<Integer, FetchSessionHandler> sessionHandlers;
+    private final AtomicReference<RuntimeException> cachedListOffsetsException = new AtomicReference<>();
+    private final AtomicReference<RuntimeException> cachedOffsetForLeaderException = new AtomicReference<>();
+    private final OffsetsForLeaderEpochClient offsetsForLeaderEpochClient;
+    private final Set<Integer> nodesWithPendingFetchRequests;
+    private final ApiVersions apiVersions;
+    private final AtomicInteger metadataUpdateVersion = new AtomicInteger(-1);
+
+    private CompletedFetch nextInLineFetch = null;
+    ...
+}
+
 ```
 
