@@ -1,25 +1,19 @@
 ---
-title:  Kafka Producer消息发送
+title:  Kafka Producer 消息发送
 date:   2021-08-30 21:33:42
 categories: Kafka
 ---
 
-Kafka进行消息发送的入口是KafkaProducer#send()方法，该方法核心内容为：
-
-* 调用waitOnMetadata，更新TopicPartition元数据信息。
-
-* 调用RecordAccumulator#append方法，将消息写入缓存。
-
-后续将消息发送至Kafka Broker的工作主要由2个Kafka组件完成：**Sender线程及NetworkClient网络客户端**。Sender线程负责拉取AccumulatorRecord中的消息转化为网络请求的ClientRequest对象，而NetworkClient负责具体的发送实现。
+RecordAccumulator主要用来缓存消息，真正实现消息发送是**Sender线程及NetworkClient网络客户端**。Sender线程负责从AccumulatorRecord中批量的拉取消息并封装为网络请求的ClientRequest对象，
+而NetworkClient封装了Java NIO，负责将消息通过网络IO发送至Broker端。
 
 
 ### Sender初始化
 
 Sender在创建Kafka Producer时完成初始化并启动：
 
-KafkaProducer#KafkaProducer
-
 ```
+//KafkaProducer#KafkaProducer 
 this.sender = newSender(logContext, kafkaClient, this.metadata);
 String ioThreadName = NETWORK_THREAD_PREFIX + " | " + clientId;
 this.ioThread = new KafkaThread(ioThreadName, this.sender, true);
@@ -65,7 +59,7 @@ public void wakeup() {
 
 ### Run方法
 
-run方法中通过调用while循环调用runOnce方法实现消息发送(runOnce方法中还包含了事务处理，后续更新)：
+run方法中通过调用while循环调用runOnce方法实现消息发送(runOnce方法中还包含了事务相关处理，后续更新)：
 
 ```
 void runOnce() {
@@ -383,3 +377,16 @@ void pollSelectionKeys(Set<SelectionKey> selectionKeys, boolean isImmediatelyCon
 }
 
 ```
+
+
+
+
+
+#### 发送异常
+
+消息发送异常可分为两类：**可重试异常、不可重试异常**。当发生不可重试异常时，send方法会直接抛出异常；可重试异常时，如果**retries参数不为0，kafkaProducer在规定的重试次数内会自动重试**，
+不会抛出异常，超出次数还未成功时，则会抛出异常，由外层逻辑处理。
+
+可重试异常：TimeoutException、InvalidMetadataException、UnknownTopicOrPartitionException
+
+不可重试异常：InvalidTopicException、RecordTooLargeException、UnknownServerException

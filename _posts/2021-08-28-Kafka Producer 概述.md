@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Kafka Producer Send"
+title:  "Kafka Producer 概述"
 date:   2021-08-28 17:14:02
 categories: Kafka
 ---
@@ -119,6 +119,7 @@ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback call
         //向RecordAccumulator append数据
         RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,serializedValue, headers, interceptCallback, remainingWaitMs, true, nowMs);
         if (result.abortForNewBatch) {
+            //需新建消息批次时，重新计算消息分区并尝试再次追加
             int prevPartition = partition;
             partitioner.onNewBatch(record.topic(), cluster, prevPartition);
             partition = partition(record, serializedKey, serializedValue, cluster);
@@ -142,7 +143,7 @@ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback call
 }
 ```
 
-主要可分为以下：
+主要可分为以下几步：
 
 * 1、waitOnMetadata方法，确认主题元数据有效，若无则阻塞等待，超时抛出异常；
 * 2、使用序列化器完成消息的序列化,key和value；
@@ -151,8 +152,13 @@ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback call
 * 5、将消息写入RecordAccumulator中；
 * 6、写入的RecordBatch大小已满(如到达batch.size)，唤醒sender线程发送数据。
 
-除去获取元数据外，一条消息要经过**生产者拦截器、序列化器、分区器，然后写入RecordAccumulator中，最后唤醒Sender线程执行发送任务**才能实现数据发送。下面先介绍下生产者拦截器、序列化器、分区器
-这几个角色，RecordAccumulator及Sender线程后续有单独的篇章进行分析。
+KafkaProducer的发送流程如下：
+
+![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
+
+除去获取元数据外，一条消息要经过**生产者拦截器、序列化器、分区器，然后写入RecordAccumulator中，最后唤醒Sender线程执行发送任务并通过网络IO发送到Broker中去**才能实现数据发送。可以看出，kafkaProducer由两个线程协调运行，
+分别为主线程(用户线程)及Sender线程，主线程负责创建消息，并完成序列化、分区选择等处理，并写入RecordAccumulator中。Sender线程负责从RecordAccumulator中获取消息发送到Kafka Broker。下面先介
+绍下生产者拦截器、序列化器、分区器这几个角色，RecordAccumulator及Sender线程后续再通过单独的篇章进行分析。
 
 
 ### 生产者拦截器
@@ -214,7 +220,7 @@ public interface Partitioner extends Configurable, Closeable {
 }
 ```
 
-Kafka提供了DefaultPartitioner、RoundRobinPartitioner、UniformStickyPartitioner三种分区器的实现，默认使用DefaultPartitioner作为生产者端的分区器，实现如下：
+Kafka提供了DefaultPartitioner、RoundRobinPartitioner、UniformStickyPartitioner三种分区器的实现，默认使用DefaultPartitioner作为生产者端的分区器，其方法实现如下：
 
 ```
 public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster,
@@ -225,6 +231,11 @@ public int partition(String topic, Object key, byte[] keyBytes, Object value, by
     }
     //使用key的Hash值与主题分区数取模
     return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+}
+
+//更新stickyPartitionCache 重新计算无key消息分区
+public void onNewBatch(String topic, Cluster cluster, int prevPartition) {
+    stickyPartitionCache.nextPartition(topic, cluster, prevPartition);
 }
 ```
 用户也可自行实现Partitioner接口，创建自定义的分区器。
