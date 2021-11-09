@@ -65,7 +65,7 @@ new Callback(){
 
 这两个方法只是简单API，消息ProducerRecord经过**拦截器**处理后，是调用**doSend()**方法实现发送。
 
-#### KafkaProducer.doSend
+### KafkaProducer.doSend
 
 doSend方法源码如下：
 
@@ -152,7 +152,7 @@ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback call
 * 5、将消息写入RecordAccumulator中；
 * 6、写入的RecordBatch大小已满(如到达batch.size)，唤醒sender线程发送数据。
 
-KafkaProducer的发送流程如下：
+发送流程如下：
 
 ![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
 

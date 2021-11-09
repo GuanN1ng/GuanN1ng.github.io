@@ -27,7 +27,7 @@ public RecordAppendResult append(TopicPartition tp,long timestamp,byte[] key,byt
             if (appendResult != null)
                 return appendResult;
         }
-        //若为true，返回，创建新ProducerBatch前，调用分区器的onNewBatch方法
+        //追加失败，若abortOnNewBatch为true，返回，创建新ProducerBatch前，调用分区器的onNewBatch方法
         if (abortOnNewBatch) {
             return new RecordAppendResult(null, false, false, true);
         }
@@ -67,12 +67,12 @@ public RecordAppendResult append(TopicPartition tp,long timestamp,byte[] key,byt
 
 可以看出，RecordAccumulator#append方法只是将消息数据添加到缓存队列中，可分为以下几步：
 
-* 1、调用`getOrCreateDeque(TopicPartition tp)`获取缓存队列。**数据结构为双端队列ArrayDeque<ProducerBatch>，队列内元素为ProducerBatch**；
+* 1、调用`getOrCreateDeque(TopicPartition tp)`获取缓存队列。数据结构为双端队列ArrayDeque<ProducerBatch>，队列内元素为ProducerBatch；
 * 2、对缓存队列**加锁**，调用`tryAppend()`将消息数据写入ArrayDeque<ProducerBatch>中；
 * 3、追加失败，若需要重新计算消息分区，返回，否则申请内存`free.allocate()`，申请的内存大小取配置值batch.size(默认16KB)和消息大小中的较大值，创建新的ProducerBatch，完成消息写入并将新的ProducerBatch添加入队列；
 * 4、若上一步申请的内存未使用，释放未使用内存。
 
-而这些步骤都是围绕ArrayDeque<ProducerBatch>和free这两个数据进行缓存操作，下面开始介绍RecordAccumulator实现缓存的数据结构。
+而这些步骤都是围绕`ArrayDeque<ProducerBatch>`和`free`这两个数据进行缓存操作，下面开始介绍RecordAccumulator实现缓存的数据结构。
 
 
 ## 数据结构
@@ -94,7 +94,7 @@ ProducerBatch表示一个消息发送批次，用于存储一条或多条消息�
 
 #### CopyOnWriteMap
 
-batches维护的是分区信息与消息队列的映射关系，它写的场景仅存在于当batches中不存在这个分区对应的deque，需要创建这个分区对应的deque，而每次进行append操作同会调用getOrCreateDeque进行读取，
+batches维护的是分区信息与消息队列的映射关系，发生写的场景仅存在于当batches中不存在这个分区对应的deque，需要创建这个分区对应的deque，而每次进行append操作同会调用getOrCreateDeque进行读取，
 基于**batches是"读多写少"的数据结构**，Kafka使用自定义的CopyOnWriteMap实现(只给出部分源码)：
 
 ```
@@ -354,7 +354,7 @@ public void deallocate(ByteBuffer buffer, int size) {
 
 ### 总结
 
-1、 **BufferPool只会针对batch.size大小的ByteBuffer进行池化管理**，开发中，需要评估消息的大小，适当的调大batch.size，尽可能的重复利用缓存。
+1、 **BufferPool只会针对batch.size大小的ByteBuffer进行池化管理**，开发中，需要评估消息的大小，并合理调整batch.size的配置，尽可能的重复利用缓存。
 
 2、如果生产者发送消息的速度超过发送到服务器的速度，则会导致BufferPool可用空间长时间的不足，此时**KafkaProducer#send方法调用会被阻塞，抛出异常**，这个取决于参数**max.block.ms的配置，此参数的默认值为60000，即60s**。
 需评估项目中消息生产的速度及BufferPool的大小。
