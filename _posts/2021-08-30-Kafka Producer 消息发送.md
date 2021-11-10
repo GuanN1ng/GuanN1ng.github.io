@@ -4,7 +4,7 @@ date:   2021-08-30 21:33:42
 categories: Kafka
 ---
 
-RecordAccumulator主要作用是缓存消息，KafkaProducer#doSend方法中将消息追加入RecordAccumulator后，会调用`sender.wakeup()`将Sender线程唤醒，即真正实现消息发送是**Sender线程及NetworkClient网络客户端**。
+RecordAccumulator主要作用是缓存消息，KafkaProducer#doSend方法中将消息追加入RecordAccumulator后，会调用`sender.wakeup()`将Sender线程唤醒，负责实现消息发送是**Sender线程及NetworkClient网络客户端**。
 Sender线程负责从AccumulatorRecord中批量的拉取消息并封装为网络请求的ClientRequest对象，而NetworkClient封装了Java NIO，负责将消息通过网络IO发送至Broker端。
 
 
@@ -41,7 +41,7 @@ public class KafkaThread extends Thread {
 Sender#wakeup()方法的实现如下：
 
 ```
-#org.apache.kafka.clients.producer.internals.Sender#wakeup
+#Sender#wakeup
 public void wakeup() {
     this.client.wakeup();
 }
@@ -114,7 +114,7 @@ public void run() {
 
 #### runOnce
 
-runOnce方法的作用时运行一次发送任务，通过调用sendProducerData方法实现。
+runOnce方法的作用时运行一次发送任务：① 调用sendProducerData方法发送消息数据，② 调用NetworkClient#poll，进行相应的IO操作。
 
 ```
 void runOnce() {
@@ -122,7 +122,9 @@ void runOnce() {
         //幂等及事务相关处理下篇内容分析    
     }
     long currentTimeMs = time.milliseconds();
+    //发送消息数据
     long pollTimeout = sendProducerData(currentTimeMs);
+    //Socket IO操作
     client.poll(pollTimeout, currentTimeMs);
 }
 
@@ -130,42 +132,54 @@ void runOnce() {
 
 #### sendProducerData
 
+sendProducerData方法源码如下，可简单概括为通过`Accumulator#drain`方法拉取数据，并调用`sendProduceRequests`方法完成消息发送，还有一些如对元数据无效、Broker节点的网络连接不可用、ProducerBatch超时未发送等条件的判断过滤及
+保证消息有序的分区加锁的业务。
+
+Accumulator中缓存消息时采用的是`Map<TopicPartition, Deque<ProducerBatch>>`的数据结构，通过主题分区进行分类，而调用drain获取的是`Map<Integer, List<ProducerBatch>>`，key代表的是节点id，
+这里进行了数据形式转变，因为对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是将数据发向哪个Broker，并建立连接，不关心消息属于哪个分区，
+通过按照broker分区，一次请求就把所有在这台broker上的分区leader的消息发送完，可以提升消息发送的效率。
+
 
 ```
 private long sendProducerData(long now) {
+    //获取当前Kafka集群信息，如节点、主题、分区等
     Cluster cluster = metadata.fetch();
+    //获取可发送消息数据对应的分区leader副本所在Broker节点集合， 如ProducerBatch isFull或到达配置时间linger.ms 
     RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
-
+    //有分区节点未知的主题，更新元数据
     if (!result.unknownLeaderTopics.isEmpty()) {
         for (String topic : result.unknownLeaderTopics)
             this.metadata.add(topic, now);
         this.metadata.requestUpdate();
     }
-
+    
     Iterator<Node> iter = result.readyNodes.iterator();
     long notReadyTimeout = Long.MAX_VALUE;
     while (iter.hasNext()) {
         Node node = iter.next();
+        //移除网络IO异常的节点
         if (!this.client.ready(node, now)) {
             iter.remove();
             notReadyTimeout = Math.min(notReadyTimeout, this.client.pollDelayMs(node, now));
         }
     }
-
+    //拉取数据
     Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
     addToInflightBatches(batches);
     if (guaranteeMessageOrder) {
+        //需确保消息有序
         for (List<ProducerBatch> batchList : batches.values()) {
             for (ProducerBatch batch : batchList)
+                对TopicPartition加排他锁，当前消息未发送前，不允许从该Tp对应的Deque中再次拉取数据
                 this.accumulator.mutePartition(batch.topicPartition);
         }
     }
-
+    
     accumulator.resetNextBatchExpiryTime();
+    //处理过期ProducerBatch 超时未发送    delivery.timeout.ms > linger.ms +request.timeout.ms
     List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
     List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
     expiredBatches.addAll(expiredInflightBatches);
-
     if (!expiredBatches.isEmpty())
         log.trace("Expired {} batches in accumulator", expiredBatches.size());
     for (ProducerBatch expiredBatch : expiredBatches) {
@@ -174,97 +188,72 @@ private long sendProducerData(long now) {
             transactionManager.markSequenceUnresolved(expiredBatch);
         }
     }
-    sensors.updateProduceRequestMetrics(batches);
-    long pollTimeout = Math.min(result.nextReadyCheckDelayMs, notReadyTimeout);
-    pollTimeout = Math.min(pollTimeout, this.accumulator.nextExpiryTimeMs() - now);
-    pollTimeout = Math.max(pollTimeout, 0);
-    if (!result.readyNodes.isEmpty()) {
-        pollTimeout = 0;
-    }
+    ...
+    //发送数据
     sendProduceRequests(batches, now);
     return pollTimeout;
 }
-
 ```
 
+#### sendProduceRequests
 
-
-对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是与哪个Broker建立连接，不关心消息属于哪个分区，Sender线程
-需要将<TopicPartition,Deque<ProducerBatch>>的数据结构转变为<NodeId,List<ProducerBatch>>的形式，NodeId即为Kafka Broker的id,最终封装成为ClientRequest对象。
-
-* 1、通过RecordAccumulator#ready方法获取已就绪的分区节点。遍历`ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches`获取大小达到batch.size大小或时间达到linger.ms的分区及其
-对应的分区leader节点(会跳过加锁的分区，保证有序)。
+Accumulator中拉取的消息将通过sendProduceRequests方法实现发送，源码如下：
 
 ```
-Cluster cluster = metadata.fetch(); 
-ReadyCheckResult result = accumulator.ready(cluster, now); //获取待发送节点数据
-if (!result.unknownLeaderTopics.isEmpty()) {
-    //有未知leader分区的Topic,再次请求获取元数据
-    for (String topic : result.unknownLeaderTopics)
-        this.metadata.add(topic, now);
-    log.debug("Requesting metadata update due to unknown leader topics from the batched records: {}",
-        result.unknownLeaderTopics);
-    this.metadata.requestUpdate();
+private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
+    for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
+        //遍历，按照Broker节点发送
+        sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue());
 }
-```
 
-* 2、判断与Broker节点的IO连接是否可用，不可用，移除节点。
+private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
+    if (batches.isEmpty())
+        return;
 
-```
-Iterator<Node> iter = result.readyNodes.iterator();
-long notReadyTimeout = Long.MAX_VALUE;
-while (iter.hasNext()) {
-    Node node = iter.next();
-    if (!this.client.ready(node, now)) {  //判断连接是否可用
-        iter.remove();
-        notReadyTimeout = Math.min(notReadyTimeout, this.client.pollDelayMs(node, now));
+    final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
+    //数据处理
+    byte minUsedMagic = apiVersions.maxUsableProduceMagic();
+    for (ProducerBatch batch : batches) {
+        if (batch.magic() < minUsedMagic)
+            minUsedMagic = batch.magic();
     }
-}
-```
-
-* 3、从RecordAccumulator中拉取消息，按照BrokerId分类，并判断是否保证发送顺序，**max.in.flight.requests.per.connection参数为1，表示需要保证分区发送顺序，则调用accumulator.mutePartition(),对当前分区加锁**。
-
-```
-Map<Integer, List<ProducerBatch>> batches = accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
-addToInflightBatches(batches);
-if (guaranteeMessageOrder) {
-    // 确保分区消息有序   maxInflightRequests == 1
-    for (List<org.apache.kafka.clients.producer.internals.ProducerBatch> batchList : batches.values()) {
-        for (org.apache.kafka.clients.producer.internals.ProducerBatch batch : batchList)
-            this.accumulator.mutePartition(batch.topicPartition); //对当前分区加锁
+    ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
+    for (ProducerBatch batch : batches) {
+        TopicPartition tp = batch.topicPartition;
+        MemoryRecords records = batch.records();
+        if (!records.hasMatchingMagic(minUsedMagic))
+            records = batch.records().downConvert(minUsedMagic, 0, time).records();
+        ProduceRequestData.TopicProduceData tpData = tpd.find(tp.topic());
+        if (tpData == null) {
+            tpData = new ProduceRequestData.TopicProduceData().setName(tp.topic());
+            tpd.add(tpData);
+        }
+        tpData.partitionData().add(new ProduceRequestData.PartitionProduceData().setIndex(tp.partition()).setRecords(records));
+        recordsByPartition.put(tp, batch);
     }
-}
-```
 
-* 4、处理超时消息，移除超时未发送消息，delivery.timeout.ms参数，默认时间是120s
-
-```
-accumulator.resetNextBatchExpiryTime();
-List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
-List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
-expiredBatches.addAll(expiredInflightBatches);
-if (!expiredBatches.isEmpty())
-    log.trace("Expired {} batches in accumulator", expiredBatches.size());
-for (org.apache.kafka.clients.producer.internals.ProducerBatch expiredBatch : expiredBatches) {
-    String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
-        + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
-    failBatch(expiredBatch, new TimeoutException(errorMessage), false);
-    if (transactionManager != null && expiredBatch.inRetry()) {
-        transactionManager.markSequenceUnresolved(expiredBatch);
+    String transactionalId = null;
+    if (transactionManager != null && transactionManager.isTransactional()) {
+        //事务id 后续分析
+        transactionalId = transactionManager.transactionalId();
     }
+    ProduceRequest.Builder requestBuilder = ProduceRequest.forMagic(minUsedMagic, new ProduceRequestData().setAcks(acks).setTimeoutMs(timeout).setTransactionalId(transactionalId).setTopicData(tpd));
+    //响应处理器
+    RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
+    String nodeId = Integer.toString(destination);
+    //请求构建
+    ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,requestTimeoutMs, callback);
+    //发送
+    client.send(clientRequest, now);
 }
-sensors.updateProduceRequestMetrics(batches);
 ```
 
-* 5、注册结果回调处理函数，并完成ClientRequest的构造，调用NetworkClient#send()方法发送消息。
+sendProduceRequest方法的内容主要是两部分：
 
-```
-RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
-String nodeId = Integer.toString(destination);
-ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
-        requestTimeoutMs, callback);
-client.send(clientRequest, now);
-```
+* 1、完成消息发送请求ClientRequest的创建，及设置响应处理的Handler；
+* 2、调用NetworkClient将消息通过Socket IO发送至Broker端。
+
+至此。Sender部分的内容已结束。下面开始介绍Producer消息发送中网络IO部分的内容。
 
 ## NetworkClient
 
