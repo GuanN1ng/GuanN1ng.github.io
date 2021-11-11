@@ -63,7 +63,7 @@ public void wakeup() {
 
 ### Run
 
-Sender#run方法中主要是两部分内容：① 通过while循环调用runOnce方法实现消息发送；② Producer关闭，Sender线程退出前，将Accumulator、事务管理器、等待确认的请求队列中的数据处理完成。
+Sender#run方法中主要是两部分内容：① 通过while循环调用runOnce方法实现消息发送；② 非立即关闭时，Sender线程退出前，会将Accumulator、事务管理器、等待确认的请求队列中的数据处理完成。
 
 ```
 public void run() {
@@ -75,7 +75,7 @@ public void run() {
             log.error("Uncaught error in kafka producer I/O thread: ", e);
         }
     }
-    //Producer非立即关闭，此时停止接收请求，但会等待Accumulator、事务管理器、等待确认的请求队列中的数据处理完成
+    //Producer非立即关闭，此时停止接收数据，但会等待Accumulator、事务管理器、等待确认的请求队列中的数据处理完成
     while (!forceClose && ((this.accumulator.hasUndrained() || this.client.inFlightRequestCount() > 0) || hasPendingTransactionalRequests())) {
         try {
             runOnce();
@@ -170,7 +170,7 @@ private long sendProducerData(long now) {
         //需确保消息有序
         for (List<ProducerBatch> batchList : batches.values()) {
             for (ProducerBatch batch : batchList)
-                对TopicPartition加排他锁，当前消息未发送前，不允许从该Tp对应的Deque中再次拉取数据
+                //对TopicPartition加排他锁，当前消息未发送前，不允许从该Tp对应的Deque中再次拉取数据
                 this.accumulator.mutePartition(batch.topicPartition);
         }
     }
@@ -217,6 +217,7 @@ private void sendProduceRequest(long now, int destination, short acks, int timeo
         if (batch.magic() < minUsedMagic)
             minUsedMagic = batch.magic();
     }
+    //ProduceRequest
     ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
     for (ProducerBatch batch : batches) {
         TopicPartition tp = batch.topicPartition;
@@ -253,45 +254,146 @@ sendProduceRequest方法的内容主要是两部分：
 * 1、完成消息发送请求ClientRequest的创建，及设置响应处理的Handler；
 * 2、调用NetworkClient将消息通过Socket IO发送至Broker端。
 
-至此。Sender部分的内容已结束。下面开始介绍Producer消息发送中网络IO部分的内容。
+至此。Sender部分的内容已结束。下面开始介绍消息发送中网络IO部分的内容。
 
 ## NetworkClient
 
-NetworkClient对Kafka对网络层的封装实现，底层采用Java NIO类库实现，添加了一些额外的功能，具体关系如下：
+NetworkClient是Kafka对网络IO操作的封装，Producer端与Broker间的所有请求都是通过NetworkClient进行发送,底层采用Java NIO类库实现，具体组件关系如下：
 
 ![kafka NIO](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/networkclient.png)
 
 
-* NetworkSend 数据发送Buffer
-* NetworkReceive 接收数据Buffer，通过MemoryPool进行池化管理，超过memoryPool时，暂停读取channel。
-* TransportLayer  对SocketChannel的封装
-* Kafka Selector持有Java NIO中Selector类型的成员变量，以及所有的KafkaChannel
+* Selector持有Java NIO中Selector类型的成员变量，以及所有的KafkaChannel。
+* NetworkSend 数据发送Buffer；
+* NetworkReceive 接收数据Buffer，通过MemoryPool进行池化管理，超过memoryPool时，暂停读取channel；
+* TransportLayer  对SocketChannel的封装。
 
-```
-private final java.nio.channels.Selector nioSelector;
-private final Map<String, KafkaChannel> channels;
-```
-
-NetworkClient的消息发送通过两个核心方法完成：
+NetworkClient中的网络IO操作主要通过两个核心方法完成：
 
 ```
 public void send(ClientRequest request, long now)
 public List<ClientResponse> poll(long timeout, long now)
 ```
 
-#### NetworkClient#send
+### Send
 
-send方法完成NetworkSend对象的构建并调用Selector.send()发送该对象。
+#### NetworkClient#send()
+
+NetworkClient#send()方法源码如下：
 
 ```
-inFlightRequests.add(inFlightRequest);
-selector.send(new NetworkSend(clientRequest.destination(), send));
+public void send(ClientRequest request, long now) {
+    doSend(request, false, now);
+}
+
+private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now) {
+    //未关闭
+    ensureActive();
+    String nodeId = clientRequest.destination();
+    if (!isInternalRequest) {
+        //当前节点连接可用 且 未完成的请求数小于 max.in.flight.requests.per.connection （有序性相关）
+        if (!canSendRequest(nodeId, now))
+            throw new IllegalStateException("Attempt to send a request to node " + nodeId + " which is not ready.");
+    }
+    AbstractRequest.Builder<?> builder = clientRequest.requestBuilder();
+    try {
+        NodeApiVersions versionInfo = apiVersions.get(nodeId);
+        short version;
+        if (versionInfo == null) {
+            version = builder.latestAllowedVersion();
+            if (discoverBrokerVersions && log.isTraceEnabled())
+                log.trace("No version information found when sending {} with correlation id {} to node {}. " +"Assuming version {}.", clientRequest.apiKey(), clientRequest.correlationId(), nodeId, version);
+        } else {
+            version = versionInfo.latestUsableVersion(clientRequest.apiKey(), builder.oldestAllowedVersion(),builder.latestAllowedVersion());
+        }
+        // 构建ProduceRequest
+        doSend(clientRequest, isInternalRequest, now, builder.build(version));
+    } catch (UnsupportedVersionException unsupportedVersionException) {
+        //构建异常响应
+        ClientResponse clientResponse = new ClientResponse(clientRequest.makeHeader(builder.latestAllowedVersion()),clientRequest.callback(), clientRequest.destination(), now, now,false, unsupportedVersionException, null, null);
+        if (!isInternalRequest)
+            //记录消息发送失败 后续处理
+            abortedSends.add(clientResponse);
+        else if (clientRequest.apiKey() == ApiKeys.METADATA)
+            //元数据更新失败 调用Handler
+            metadataUpdater.handleFailedRequest(now, Optional.of(unsupportedVersionException));
+    }
+}
+
+private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now, AbstractRequest request) {
+    String destination = clientRequest.destination();
+    RequestHeader header = clientRequest.makeHeader(request.version());
+    Send send = request.toSend(header);
+    InFlightRequest inFlightRequest = new InFlightRequest(clientRequest,header,isInternalRequest,request,send,now);
+    //缓存未收到响应的请求 用于后续 失败重试 及 max.in.flight.requests.per.connection判断
+    this.inFlightRequests.add(inFlightRequest);
+    //调用selector.send发送
+    selector.send(new NetworkSend(clientRequest.destination(), send));
+}
 ```
 
-* 将请求保存到InFlightRequests中，InFlightRequests中保存着准备发送或等待响应的请求(**leastLoadedNode为InFlightRequests.size最小的节点**)。
-* 调用Selector#send，将数据写入对应KafkaChannel的NetworkSend(Buffer)中，并注册TransportLayer(SocketChannel)对应的写事件。
+业务流程可概括为：
 
-#### NetworkClient#poll
+* 1、确认消息可发送，需满足条件如下：
+    * ensureActive()，NetworkClient未关闭；
+    * connectionStates.isReady(node, now)，节点连接状态正常；
+    * selector.isChannelReady(node)，SocketChannel正常；
+    * inFlightRequests.canSendMore()， 未完成的请求数小于 max.in.flight.requests.per.connection。
+* 2、检查版本信息，构建ProduceRequest，版本信息检查异常的请求构建失败响应进行处理；
+* 3、记录待发送的请求，添加入inFlightRequests中，InFlightRequests中保存着准备发送或等待响应的请求(**leastLoadedNode为InFlightRequests.size最小的节点**)；
+* 4、创建NetworkSend，调用`selector.send`发送。
+
+#### Selector#send
+
+Selector#send方法比较简单，获取目标Broker的KafkaChannel，调用KafkaChannel.setSend方法。
+
+```
+public void send(NetworkSend send) {
+    String connectionId = send.destinationId();
+    KafkaChannel channel = openOrClosingChannelOrFail(connectionId);
+    if (closingChannels.containsKey(connectionId)) {
+        this.failedSends.add(connectionId);
+    } else {
+        try {
+            channel.setSend(send);
+        } catch (Exception e) {
+            channel.state(ChannelState.FAILED_SEND);
+            this.failedSends.add(connectionId);
+            close(channel, CloseMode.DISCARD_NO_NOTIFY);
+            if (!(e instanceof CancelledKeyException)) {
+                throw e;
+            }
+        }
+    }
+}
+```
+
+#### KafkaChannel#setSend
+
+KafkaChannel#setSend方法主要是将要发送的NetworkSend对象的引用赋值给KafkaChannel中的send，并注册`SelectionKey.OP_WRITE`写事件。
+
+```
+public void setSend(NetworkSend send) {
+    if (this.send != null)
+        throw new IllegalStateException("Attempt to begin a send operation with prior send operation still in progress, connection id is " + id);
+    this.send = send;
+    //注册写事件
+    this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
+}
+//写事件就绪时写入
+public long write() throws IOException {
+    if (send == null)
+        return 0;
+    midWrite = true;
+    //将消息写入Socket
+    return send.writeTo(transportLayer);
+}
+```
+
+
+
+
+### Poll
 
 poll中，调用Selector#poll方法，并完成Selector中所有Channel的事件。
 
