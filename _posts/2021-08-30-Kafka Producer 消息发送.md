@@ -114,7 +114,7 @@ public void run() {
 
 #### runOnce
 
-runOnce方法的作用时运行一次发送任务：① 调用sendProducerData方法发送消息数据，② 调用NetworkClient#poll，进行相应的IO操作。
+runOnce方法的作用是运行一次发送任务：① 调用sendProducerData方法发送消息数据，② 调用NetworkClient#poll，进行相应的IO操作。
 
 ```
 void runOnce() {
@@ -124,7 +124,7 @@ void runOnce() {
     long currentTimeMs = time.milliseconds();
     //发送消息数据
     long pollTimeout = sendProducerData(currentTimeMs);
-    //Socket IO操作
+    //Socket IO操作及响应处理
     client.poll(pollTimeout, currentTimeMs);
 }
 
@@ -170,7 +170,7 @@ private long sendProducerData(long now) {
         //需确保消息有序
         for (List<ProducerBatch> batchList : batches.values()) {
             for (ProducerBatch batch : batchList)
-                //对TopicPartition加排他锁，当前消息未发送前，不允许从该Tp对应的Deque中再次拉取数据
+                //对TopicPartition加排他锁，保证一个Tp只有一个RecordBatch在发送, 防止网络IO不稳定，实现有序性
                 this.accumulator.mutePartition(batch.topicPartition);
         }
     }
@@ -268,10 +268,17 @@ NetworkClient是Kafka对网络IO操作的封装，Producer端与Broker间的所�
 * NetworkReceive 接收数据Buffer，通过MemoryPool进行池化管理，超过memoryPool时，暂停读取channel；
 * TransportLayer  对SocketChannel的封装。
 
-NetworkClient中的网络IO操作主要通过两个核心方法完成：
+NetworkClient中主要通过两个核心方法完成消息的发送：
+
+* send方法，完成数据准备，注册写事件
 
 ```
 public void send(ClientRequest request, long now)
+```
+
+* poll方法，遍历就绪事件，进行Socket读写及响应处理
+
+```
 public List<ClientResponse> poll(long timeout, long now)
 ```
 
@@ -370,7 +377,7 @@ public void send(NetworkSend send) {
 
 #### KafkaChannel#setSend
 
-KafkaChannel#setSend方法主要是将要发送的NetworkSend对象的引用赋值给KafkaChannel中的send，并注册`SelectionKey.OP_WRITE`写事件。
+KafkaChannel#setSend方法主要是将要发送的NetworkSend对象的引用赋值给KafkaChannel中的send，并注册`SelectionKey.OP_WRITE`写事件，等待KafkaChannel可写状态。
 
 ```
 public void setSend(NetworkSend send) {
@@ -380,102 +387,78 @@ public void setSend(NetworkSend send) {
     //注册写事件
     this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
 }
-//写事件就绪时写入
-public long write() throws IOException {
-    if (send == null)
-        return 0;
-    midWrite = true;
-    //将消息写入Socket
-    return send.writeTo(transportLayer);
-}
 ```
-
-
 
 
 ### Poll
 
-poll中，调用Selector#poll方法，并完成Selector中所有Channel的事件。
+#### NetworkClient#poll
+
+NetworkClient#poll()方法的主要作用可分为三部分：
+
+* 判断是否需要更新MetaData，若果需要，发送MetadataRequest进行更新；
+* 调用Selector#poll进行IO操作；
+* 处理IO操作完成后的业务。
 
 ```
-//更新元数据信息
-long metadataTimeout = metadataUpdater.maybeUpdate(now);
-//调用 Selector.poll()进行socket相关的IO操作
-try {
-    this.selector.poll(Utils.min(timeout, metadataTimeout, defaultRequestTimeoutMs));
-} catch (IOException e) {
-    log.error("Unexpected error during I/O", e);
+public List<ClientResponse> poll(long timeout, long now) {
+    ensureActive();
+    if (!abortedSends.isEmpty()) {
+        //处理发送失败的请求
+        List<ClientResponse> responses = new ArrayList<>();
+        handleAbortedSends(responses);
+        completeResponses(responses);
+        return responses;
+    }
+    //判断是否需要更新MetaData，若果需要，发送MetadataRequest进行更新
+    long metadataTimeout = metadataUpdater.maybeUpdate(now);
+    try {
+        //处理IO事件，如连接建立，读&写
+        this.selector.poll(Utils.min(timeout, metadataTimeout, defaultRequestTimeoutMs));
+    } catch (IOException e) {
+        log.error("Unexpected error during I/O", e);
+    }
+    
+    //IO操作结束后的业务处理
+    long updatedNow = this.time.milliseconds();
+    List<ClientResponse> responses = new ArrayList<>();
+    //处理已完成发送的NetworkSend，构建响应
+    handleCompletedSends(responses, updatedNow);
+    //处理从Broker端接收到NetWorkReceive，构建响应
+    handleCompletedReceives(responses, updatedNow);
+    //处理失效连接，构建响应
+    handleDisconnections(responses, updatedNow);
+    //处理新建立的连接，构建响应
+    handleConnections();
+    handleInitiateApiVersionRequests(updatedNow);
+    handleTimedOutConnections(responses, updatedNow);
+    //处理超时请求，构建响应
+    handleTimedOutRequests(responses, updatedNow);
+    
+    //对所有响应进行处理
+    completeResponses(responses);
+    return responses;
 }
 
-// 处理完成后的操作
-long updatedNow = this.time.milliseconds();
-List<ClientResponse> responses = new ArrayList<>();
-handleCompletedSends(responses, updatedNow);
-handleCompletedReceives(responses, updatedNow);
-handleDisconnections(responses, updatedNow);
-handleConnections();
-handleInitiateApiVersionRequests(updatedNow);
-handleTimedOutConnections(responses, updatedNow);
-handleTimedOutRequests(responses, updatedNow);
-completeResponses(responses);
 ```
-
-completeResponses方法内调用Sender线程设置的回调函数RequestCompletionHandler->Sender#completeBatch()，完成消息重试、ProducerBatch清理及事务处理。
-
-```
-if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() &&
-        (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 || batch.isCompressed())) {
-    //消息太大，分割再次尝试发送，不占用重试次数
-    if (transactionManager != null)
-        transactionManager.removeInFlightBatch(batch);
-    this.accumulator.splitAndReenqueue(batch);
-    maybeRemoveAndDeallocateBatch(batch);
-    this.sensors.recordBatchSplit();
-} else if (error != Errors.NONE) {
-    //可重试的异常
-    if (canRetry(batch, response, now)) {
-        reenqueueBatch(batch, now); //重试
-    } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {
-        //重试机制导致发送出去重复的消息  SEQUENCE_NUMBER 幂等时的序列号
-        completeBatch(batch, response);
-    } else {
-        //
-        failBatch(batch, response, batch.attempts() < this.retries);
-    }
-    if (error.exception() instanceof InvalidMetadataException) {
-        //更新元数据
-        metadata.requestUpdate();
-    }
-} else {
-    completeBatch(batch, response);
-}
-
-// Unmute the completed partition.
-if (guaranteeMessageOrder)
-    this.accumulator.unmutePartition(batch.topicPartition);
-
-```
-
 
 #### Selector#poll
 
-poll方法封装了JAVA NIO的业务操作。
+Selector#poll会遍历所有的IO就绪事件，并进行处理，
 
 ```
 public void poll(long timeout) throws IOException {
-    if (timeout < 0)
-        throw new IllegalArgumentException("timeout should be >= 0");
-
+    if (timeout < 0) throw new IllegalArgumentException("timeout should be >= 0");
     boolean madeReadProgressLastCall = madeReadProgressLastPoll;
     //清除上次poll的缓存
     clear();
-
+    
     boolean dataInBuffers = !keysWithBufferedRead.isEmpty();
     //连接事件不为空或Channel有数据在缓冲区中但却无法读取(比如因为内存不足),timeout为0 ，select立即返回
     if (!immediatelyConnectedKeys.isEmpty() || (madeReadProgressLastCall && dataInBuffers))
         timeout = 0;
     
-    //若之前内存池内存耗尽, 而现在又可用了, 将一些因为内存压力而暂时取消读事件的 Channel 重新注册读事件
+    //若之前内存池内存耗尽, 而现在又可用了, 将一些因为内存压力而暂时取消读事件的Channel解锁，重新注册读事件
     if (!memoryPool.isOutOfMemory() && outOfMemory) {
         for (KafkaChannel channel : channels.values()) {
             if (channel.isInMutableState() && !explicitlyMutedChannels.contains(channel)) {
@@ -485,8 +468,8 @@ public void poll(long timeout) throws IOException {
         outOfMemory = false;
     }
 
-   
     long startSelect = time.nanoseconds();
+    //获取就绪IO事件数
     int numReadyKeys = select(timeout);
     long endSelect = time.nanoseconds();
     this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
@@ -496,6 +479,7 @@ public void poll(long timeout) throws IOException {
         Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
 
         if (dataInBuffers) {
+            //处理未读取完的channel（如因内存不足），最多对一个key处理2次，这里清空
             keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice
             Set<SelectionKey> toPoll = keysWithBufferedRead;
             keysWithBufferedRead = new HashSet<>(); //poll() calls will repopulate if needed
@@ -505,7 +489,6 @@ public void poll(long timeout) throws IOException {
 
         // 处理底层有数据的channel
         pollSelectionKeys(readyKeys, false, endSelect);
-        // Clear all selected keys so that they are included in the ready count for the next select
         readyKeys.clear();
         //处理待连接的channel
         pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
@@ -516,16 +499,12 @@ public void poll(long timeout) throws IOException {
 
     long endIo = time.nanoseconds();
     this.sensors.ioTime.record(endIo - endSelect, time.milliseconds());
-
-    // Close channels that were delayed and are now ready to be closed
     completeDelayedChannelClose(endIo);
-
-    // 在关闭过期连接后, 将完成接收的 Channels 加入 completedReceives.
     maybeCloseOldestConnection(endSelect);
 }
 
 ```
-pollSelectionKey方法内对相应的SelectionKey事件进行处理。同JAVA NIO。
+pollSelectionKey方法内对相应的SelectionKey事件进行处理。
 
 ```
 void pollSelectionKeys(Set<SelectionKey> selectionKeys, boolean isImmediatelyConnected, long currentTimeNanos) {
@@ -552,12 +531,20 @@ void pollSelectionKeys(Set<SelectionKey> selectionKeys, boolean isImmediatelyCon
             //....省略部分代码
             
             //读事件处理
+            if (channel.ready() && channel.state() == ChannelState.NOT_CONNECTED)
+                 channel.state(ChannelState.READY);
+            Optional<NetworkReceive> responseReceivedDuringReauthentication = channel.pollResponseReceivedDuringReauthentication();
+            responseReceivedDuringReauthentication.ifPresent(receive -> {
+                long currentTimeMs = time.milliseconds();
+                addToCompletedReceives(channel, receive, currentTimeMs);
+            });
             if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
                     && !explicitlyMutedChannels.contains(channel)) {
+                //读取数据
                 attemptRead(channel);
             }
-
             if (channel.hasBytesBuffered() && !explicitlyMutedChannels.contains(channel)) {
+                //记录正在处理读取的事件
                 keysWithBufferedRead.add(key);
             } 
             ...            
@@ -570,23 +557,36 @@ void pollSelectionKeys(Set<SelectionKey> selectionKeys, boolean isImmediatelyCon
                 throw e;
             }
 
-            /* cancel any defunct sockets */
             if (!key.isValid())
                 close(channel, CloseMode.GRACEFUL);
-
-        } 
-        ...
-        } finally {
-            maybeRecordTimePerConnection(channel, channelStartTimeNanos);
+        } catch (Exception e) {
+            ...
         }
+        ...
     }
+}
+```
+
+attemptWrite方法中调用KafkaChannel#write方法，将之前设置的NetworkSend发送出去。至此，Producer端的正常消息发送流程已全部分析完毕。
+
+```
+//写事件就绪时写入Socket
+public long write() throws IOException {
+    if (send == null)
+        return 0;
+    midWrite = true;
+    //将消息写入Socket
+    return send.writeTo(transportLayer);
 }
 
 ```
 
+### handleProduceResponse
 
 
+#### 异常重试 
 
+KafkaProducer端
 
 #### 发送异常
 
