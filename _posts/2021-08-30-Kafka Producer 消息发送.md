@@ -583,6 +583,82 @@ public long write() throws IOException {
 
 ### handleProduceResponse
 
+poll方法中对所有事件的处理都会封装为`org.apache.kafka.clients.ClientResponse`对象，由`Sender#sendProduceRequest()`方法中构建请求时注册的handler进行处理，源码如下：
+
+```
+private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
+    RequestHeader requestHeader = response.requestHeader();
+    int correlationId = requestHeader.correlationId();
+    if (response.wasDisconnected()) {
+        //消息未发送成功，异常处理
+        for (ProducerBatch batch : batches.values())
+            completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NETWORK_EXCEPTION, String.format("Disconnected from node %s", response.destination())),correlationId, now);
+    } else if (response.versionMismatch() != null) {
+        for (ProducerBatch batch : batches.values())
+            completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.UNSUPPORTED_VERSION), correlationId, now);
+    } else {
+        //broker端有相应
+        if (response.hasResponse()) {
+            ProduceResponse produceResponse = (ProduceResponse) response.responseBody();
+            produceResponse.data().responses().forEach(r -> r.partitionResponses().forEach(p -> {
+                TopicPartition tp = new TopicPartition(r.name(), p.index());
+                ProduceResponse.PartitionResponse partResp = new ProduceResponse.PartitionResponse(
+                        Errors.forCode(p.errorCode()),
+                        p.baseOffset(),
+                        p.logAppendTimeMs(),
+                        p.logStartOffset(),
+                        p.recordErrors()
+                            .stream()
+                            .map(e -> new ProduceResponse.RecordError(e.batchIndex(), e.batchIndexErrorMessage()))
+                            .collect(Collectors.toList()),
+                        p.errorMessage());
+                ProducerBatch batch = batches.get(tp);
+                completeBatch(batch, partResp, correlationId, now);
+            }));
+            this.sensors.recordLatency(response.destination(), response.requestLatencyMs());
+        } else {
+            //ack = 0时，没有相应，所有请求直接视作无异常完成 
+            for (ProducerBatch batch : batches.values()) {
+                completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NONE), correlationId, now);
+            }
+        }
+    }
+}
+```
+
+handleProduceResponse
+
+```
+private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId,long now) {
+    Errors error = response.error;
+    if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() && (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 || batch.isCompressed())) {
+        
+        if (transactionManager != null)
+            transactionManager.removeInFlightBatch(batch);
+        this.accumulator.splitAndReenqueue(batch);
+        maybeRemoveAndDeallocateBatch(batch);
+        this.sensors.recordBatchSplit();
+    } else if (error != Errors.NONE) {
+        if (canRetry(batch, response, now)) {          
+            reenqueueBatch(batch, now);
+        } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {        
+            completeBatch(batch, response);
+        } else {
+            failBatch(batch, response, batch.attempts() < this.retries);
+        }
+        if (error.exception() instanceof InvalidMetadataException) {
+            metadata.requestUpdate();
+        }
+    } else {
+        completeBatch(batch, response);
+    }
+    if (guaranteeMessageOrder)
+        this.accumulator.unmutePartition(batch.topicPartition);
+}
+
+
+```
+
 
 #### 异常重试 
 
