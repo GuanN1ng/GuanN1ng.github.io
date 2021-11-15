@@ -59,6 +59,7 @@ public RecordAppendResult append(TopicPartition tp,long timestamp,byte[] key,byt
         }
     } finally {
         if (buffer != null)
+            //释放未使用的buffer
             free.deallocate(buffer);
         appendsInProgress.decrementAndGet();
     }
@@ -79,9 +80,9 @@ public RecordAppendResult append(TopicPartition tp,long timestamp,byte[] key,byt
 
 RecordAccumulator中涉及消息缓存的数据结构主要有2个：
 
-* CopyOnWriteMap<TopicPartition, Deque<ProducerBatch>> batches：分区信息与待发送消息队列的映射关系
+* `CopyOnWriteMap<TopicPartition, Deque<ProducerBatch>> batches`：分区信息与待发送消息队列的映射关系
 
-* BufferPool free：通过池化思想管理RecordAccumulator缓冲区，可用内存大小由参数buffer.memory设置，默认32MB。
+* `BufferPool free`：通过池化思想管理RecordAccumulator缓冲区，可用内存大小由参数buffer.memory设置，默认32MB。
 
 二者关系如下，ProducerBatch内的消息是通过从BufferPool申请到的ByteBuffer存储的 ：
 

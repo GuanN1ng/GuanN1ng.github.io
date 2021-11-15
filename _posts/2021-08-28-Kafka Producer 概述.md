@@ -22,6 +22,21 @@ public Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callbac
 }
 ```
 
+Kafka中消息被封装为ProducerRecord对象，属性如下：
+
+```
+public class ProducerRecord<K, V> {
+
+    private final String topic; //消息主题
+    private final Integer partition; //消息分区
+    private final Headers headers; //消息头部信息
+    private final K key; //消息 key
+    private final V value;  //消息值
+    private final Long timestamp; //时间戳
+    ...
+}
+```
+
 通过这两种方法可实现**消息发送的三种模式：发后即忘、同步、异步**：
 
 * 发后即忘
@@ -210,7 +225,7 @@ public interface Partitioner extends Configurable, Closeable {
     //为给定的消息计算分区
     int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster);
     void close();
-    //使用StickyPartitioner时，此方法可以修改新RecordBatch写入的分区
+    //重新计算新RecordBatch写入的分区
     default void onNewBatch(String topic, Cluster cluster, int prevPartition) {}
 }
 ```
