@@ -254,7 +254,7 @@ sendProduceRequest方法的内容主要是两部分：
 * 1、完成消息发送请求ClientRequest的创建，及设置响应处理的Handler；
 * 2、调用NetworkClient将消息通过Socket IO发送至Broker端。
 
-至此。Sender部分的内容已结束。下面开始介绍消息发送中网络IO部分的内容。
+下面开始介绍消息发送中网络IO部分的内容。
 
 ## NetworkClient
 
@@ -444,7 +444,7 @@ public List<ClientResponse> poll(long timeout, long now) {
 
 #### Selector#poll
 
-Selector#poll会遍历所有的IO就绪事件，并进行处理，
+Selector#poll会遍历所有的IO就绪事件，并调用进行`pollSelectionKeys`方法处理，源码如下：
 
 ```
 public void poll(long timeout) throws IOException {
@@ -583,17 +583,18 @@ public long write() throws IOException {
 
 ### handleProduceResponse
 
-poll方法中对所有事件的处理都会封装为`org.apache.kafka.clients.ClientResponse`对象，由`Sender#sendProduceRequest()`方法中构建请求时注册的handler进行处理，源码如下：
+poll方法中对所有事件的处理都会封装为`org.apache.kafka.clients.ClientResponse`对象，由`Sender#sendProduceRequest()`方法中构建请求时注册的回调handler进行处理，源码如下：
 
 ```
 private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
     RequestHeader requestHeader = response.requestHeader();
     int correlationId = requestHeader.correlationId();
     if (response.wasDisconnected()) {
-        //消息未发送成功，异常处理
+        //网络连接异常
         for (ProducerBatch batch : batches.values())
             completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NETWORK_EXCEPTION, String.format("Disconnected from node %s", response.destination())),correlationId, now);
     } else if (response.versionMismatch() != null) {
+        //Api版本校验异常 UnsupportedVersionException
         for (ProducerBatch batch : batches.values())
             completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.UNSUPPORTED_VERSION), correlationId, now);
     } else {
@@ -617,7 +618,7 @@ private void handleProduceResponse(ClientResponse response, Map<TopicPartition, 
             }));
             this.sensors.recordLatency(response.destination(), response.requestLatencyMs());
         } else {
-            //ack = 0时，没有相应，所有请求直接视作无异常完成 
+            //acks = 0时，没有响应，所有请求直接视作无异常完成 
             for (ProducerBatch batch : batches.values()) {
                 completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NONE), correlationId, now);
             }
@@ -626,49 +627,120 @@ private void handleProduceResponse(ClientResponse response, Map<TopicPartition, 
 }
 ```
 
-handleProduceResponse
+handleProduceResponse根据ClientResponse内容进一步分类封装为PartitionResponse，并调用completeBatch方法，这里介绍下Broker端无返回响应的情况，**KafkaProducer端可通过配置参数`acks`来指定Broker端目标分区的ISR副本中有多少个完成写入后，才会响应给Producer，确认消息写入成功**，acks参数
+有3种类型的值：
+
+* acks=1。此为默认值，Producer发送消息后，只要目标主题分区的**leader副本**成功写入消息，那么Producer就会收到Broker端的响应；
+* acks=0。**无论消息写入成功或失败，Broker端都不会响应给Producer**，极有可能造成消息丢失，但可以**提高吞吐量**；
+* acks=-1 or all。Producer发送消息后，需要目标主题分区的**所有ISR副本**成功写入消息，Producer才会收到Broker端的响应。
+
+`acks=-1`时，若ISR副本中只有leader副本时，此时可靠性退化为`acks=1`的情况，要需要更高的消息可靠性需要配合`min.insync.replicas`等参数的联动。
+
+#### completeBatch
+
+下面继续分析Sender#completeBatch方法：
 
 ```
 private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId,long now) {
     Errors error = response.error;
     if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() && (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 || batch.isCompressed())) {
-        
+        //ProducerBatch过大，超过Broker端 message.max.bytes 的配置值，且ProducerBatch中有超过一条的消息，
         if (transactionManager != null)
             transactionManager.removeInFlightBatch(batch);
+        //切分ProducerBatch并再次追加到Accumulator中，等待发送
         this.accumulator.splitAndReenqueue(batch);
+        //将旧的ProducerBatch内存释放。BufferPool
         maybeRemoveAndDeallocateBatch(batch);
         this.sensors.recordBatchSplit();
     } else if (error != Errors.NONE) {
-        if (canRetry(batch, response, now)) {          
+        //存在异常，判断是否可重试
+        if (canRetry(batch, response, now)) {
+            //将ProducerBatch重新追加到Accumulator中，等待下一次拉取发送          
             reenqueueBatch(batch, now);
-        } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {        
+        } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {   
+            //网络等原因造成的同一消息多次发送，消息发送成功     
             completeBatch(batch, response);
         } else {
+            //消息发送失败，释放内存。执行回调
             failBatch(batch, response, batch.attempts() < this.retries);
         }
         if (error.exception() instanceof InvalidMetadataException) {
+            //元数据异常，触发更新
             metadata.requestUpdate();
         }
     } else {
+        //消息发送成功，释放内存。执行回调
         completeBatch(batch, response);
     }
     if (guaranteeMessageOrder)
+        //有序性要求下，对发送阶段的锁做解锁
         this.accumulator.unmutePartition(batch.topicPartition);
 }
-
-
 ```
 
+completeBatch方法主要是根据响应是否有异常对ProducerBatch进行处理，如失败重试、ProducerBatch内存释放、回调处理等。下面主要分析下异常重试的实现。
 
 #### 异常重试 
 
-KafkaProducer端
+异常重试主要依靠两个方法来实现：`canRetry()`和`reenqueueBatch()`，下面开始源码分析：
 
-#### 发送异常
+##### canRetry
 
-消息发送异常可分为两类：**可重试异常、不可重试异常**。当发生不可重试异常时，send方法会直接抛出异常；可重试异常时，如果**retries参数不为0，kafkaProducer在规定的重试次数内会自动重试**，
-不会抛出异常，超出次数还未成功时，则会抛出异常，由外层逻辑处理。
+completeBatch方法中通过调用`canRetry()`方法判断是否进行重试，源码如下：
 
-可重试异常：TimeoutException、InvalidMetadataException、UnknownTopicOrPartitionException
+```
+private boolean canRetry(ProducerBatch batch, ProduceResponse.PartitionResponse response, long now) {
+            //ProducerBatch未过期，delivery.timeout.ms，
+    return !batch.hasReachedDeliveryTimeout(accumulator.getDeliveryTimeoutMs(), now) &&
+            //已发送次数低于retires
+            batch.attempts() < this.retries &&
+            //batch未完成
+            !batch.isDone() &&
+            (transactionManager == null ?
+                    //非事务消息，异常为可重试异常
+                    response.error.exception() instanceof RetriableException :
+                    //事务消息后续分析
+                    transactionManager.canRetry(response, batch));
+}
+```
 
-不可重试异常：InvalidTopicException、RecordTooLargeException、UnknownServerException
+retries为KafkaProducer端的配置参数，Producer共有两个配置参数控制消息重试机制：
+
+* `retires`配置Producer异常重试的次数，默认为0；
+* `retry.backoff.ms`来控制两次重试之间的时间间隔，避免无效的频繁重试。
+
+不过并不是所有异常都可以通过重试解决，RetriableException表示可重试异常，Kafka中消息发送异常可分为两类：**可重试异常、不可重试异常**。当发生不可重试异常时，send方法会直接抛出异常；可重试异常时，如果**retries参数不为0，kafkaProducer在规定的重试次数内会自动重试**，
+不会抛出异常，超出次数还未成功时，则会抛出异常，由外层逻辑处理。常见的可重试异常如：TimeoutException、InvalidMetadataException、UnknownTopicOrPartitionException等。
+
+##### reenqueueBatch
+
+确认当前ProducerBatch可再次发送后，调用`reenqueueBatch()`方法将ProducerBatch再次写入Accumulator中，等待下次拉取发送，源码如下：
+
+```
+//Sender#reenqueueBatch
+private void reenqueueBatch(ProducerBatch batch, long currentTimeMs) {
+    //再次写入accumulator中
+    this.accumulator.reenqueue(batch, currentTimeMs);
+    //清理inflight记录
+    maybeRemoveFromInflightBatches(batch);
+    this.sensors.recordRetries(batch.topicPartition.topic(), batch.recordCount);
+}
+
+//RecordAccumulator#reenqueue
+public void reenqueue(ProducerBatch batch, long now) {
+    batch.reenqueued(now);
+    //获取队列
+    Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
+    synchronized (deque) {
+        if (transactionManager != null)
+            //按序列号排序插入 幂等与事务后续分析
+            insertInSequenceOrder(deque, batch);
+        else
+            //添加到队列头部
+            deque.addFirst(batch);
+    }
+}
+``` 
+
+
+至此，客户端的消息发送与响应处理已全部分析完毕，Broker端的请求处理后续单独分析。
