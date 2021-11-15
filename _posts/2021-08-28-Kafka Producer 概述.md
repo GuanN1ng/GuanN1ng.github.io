@@ -146,19 +146,14 @@ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback call
 主要可分为以下几步：
 
 * 1、waitOnMetadata方法，确认主题元数据有效，若无则阻塞等待，超时抛出异常；
-* 2、使用序列化器完成消息的序列化,key和value；
+* 2、使用序列化器完成消息的序列化，key和value；
 * 3、根据配置的分区器完成消息分区计算；
 * 4、校验消息大小，不超过`max.request.size`和`buffer.memory`配置的大小；
 * 5、将消息写入RecordAccumulator中；
 * 6、写入的RecordBatch大小已满(如到达batch.size)，唤醒sender线程发送数据。
 
-发送流程如下：
-
-![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
-
-除去获取元数据外，一条消息要经过**生产者拦截器、序列化器、分区器，然后写入RecordAccumulator中，最后唤醒Sender线程执行发送任务并通过网络IO发送到Broker中去**才能实现数据发送。可以看出，kafkaProducer由两个线程协调运行，
-分别为主线程(用户线程)及Sender线程，主线程负责创建消息，并完成序列化、分区选择等处理，并写入RecordAccumulator中。Sender线程负责从RecordAccumulator中获取消息发送到Kafka Broker。下面先介
-绍下生产者拦截器、序列化器、分区器这几个角色，RecordAccumulator及Sender线程后续再通过单独的篇章进行分析。
+可以看出，一条消息是经过**生产者拦截器、序列化器、分区器，然后写入RecordAccumulator中，最后唤醒Sender执行发送任务实现的消息发送**。下面先简单介绍下拦截器、序列化器、分区器的实现及功能，
+Accumulator及Sender后续单独进行分析。
 
 
 ### 生产者拦截器

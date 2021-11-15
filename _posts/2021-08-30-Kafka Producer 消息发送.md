@@ -743,4 +743,13 @@ public void reenqueue(ProducerBatch batch, long now) {
 ``` 
 
 
+## 总结
+
+Kafka消息的整体发送流程如下：
+
+![Kafka 发送流程](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/producer.png)
+
+一条消息要经过**生产者拦截器、序列化器、分区器，然后写入RecordAccumulator中，最后唤醒Sender线程执行发送任务并通过网络IO发送到Broker中去**才能实现数据发送。可以看出，kafkaProducer由两个线程协调运行，
+分别为主线程(用户线程)及Sender线程，主线程负责创建消息，并完成序列化、分区选择等处理，并写入RecordAccumulator中。Sender线程负责从RecordAccumulator中获取消息并通过NetworkClient发送到Kafka Broker。
+
 至此，客户端的消息发送与响应处理已全部分析完毕，Broker端的请求处理后续单独分析。
