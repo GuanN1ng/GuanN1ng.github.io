@@ -11,188 +11,305 @@ categories: Kafka
 * exactly once：正好一次，消息不会丢失，也不会被重复发送。
 
 Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消息就不会丢失。当遇到网络问题而导致请求超时，生产者无法判断是否提交成功，此时生产者可以通过多次重试来确保消息
-成功提交，但重试过程可能造成消息的重复写入，此时，Kafka提供的消息传输保障为at least once。
+成功提交，但重试过程可能造成消息的重复写入，即Kafka默认提供的消息传输保障为at least once。
 
-**Kafka通过引入幂等和事务特性实现exactly once**。
+但**Kafka通过引入幂等和事务特性实现不同程度的exactly once**。
 
 ## 幂等
 
-Kafka引入**幂等性来解决消息重复问题**，开启幂等特性后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。此处的幂等是有条件的：
-
-* 只能保证Producer在单个会话内的幂等
-* 只能保证单个TopicPartition内的幂等
-
-通过将参数**enable.idempotence设置为true即可开启幂等**功能，此时retries参数默认为Integer.MAX_VALUE，acks默认为all，并确保max.in.flight.requests.per.connection不能大于5。
+Kafka引入**幂等性来解决异常重试机制导致的消息重复问题**，开启幂等特性后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。通过将参数**enable.idempotence设置为true即可开启幂等**功能，
+此时retries参数默认为Integer.MAX_VALUE，acks默认为all，并确保max.in.flight.requests.per.connection(指定了Producer在收到Broker晌应之前单连接可以发送多少个Batch)不能大于5。
 
 ### 实现原理
 
-Kafka引入了两个机制实现幂等：
+幂等要求Broker端能够鉴别消息的唯一性，鉴于主题多分区及多Producer的情况，Kafka引入了两个机制实现幂等：
 
 * PID(Producer ID)，用来标识生产者，全局唯一。初始化时被分配，对用户透明，重启后会重新分配到新的PID。
 * sequence number，标识消息，每一个PID，每个TopicPartition都有对应的sequence number，从0单调递增。
 
+可以看出，此处的幂等是有条件的：
+
+* 因为Producer每次重启都会申请到新的PID，所以只能保证Producer在单个会话内的幂等；
+* 只能保证单个TopicPartition内的幂等。
 
 ### 幂等消息发送流程
 
+下面通过幂等消息的发送来了解Kafka如何实现消息幂等。
+
 #### 1、获取PID InitProducerIdRequest
 
-Sender线程在发送消息前，会判断是否开启幂等，以及是否完成PID参数的获取，如没有，则发送InitProducerIdRequest请求，完成PID的初始化。入口方法为bumpIdempotentEpochAndResetIdIfNeeded()。
+幂等相关的逻辑处理是从Sender#runOnce方法开始的，当Producer开启了幂等或事务后，在进行普通消息发送流程前，必须等待幂等及事务相关的处理的完成。这里首先关注PID的获取，通过源码注释可知PID的获取是通过`TransactionManager#bumpIdempotentEpochAndResetIdIfNeeded()`和
+`Sender#maybeSendAndPollTransactionalRequest`方法实现。
 
 ```
-Sender#runOnce
-
 void runOnce() {
-    //省略...
+    //Producer开启幂等或事务后，在初始化时会新建一个TransactionManager，负责维护Producer端的幂等或事务信息。
     if (transactionManager != null) {
-        // Check whether we need a new producerId. If so, we will enqueue an InitProducerIdrequest which will be sent below
-        transactionManager.bumpIdempotentEpochAndResetIdIfNeeded();
-    }
-    //...      
-}
-
-ransactionManager#bumpIdempotentEpochAndResetIdIfNeeded
-
-synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
-    if (!isTransactional()) {
-        if (epochBumpRequired) {
-            bumpIdempotentProducerEpoch();
+        //幂等及事务处理
+        try {
+            ...//省略部分事务代码
+             // Check whether we need a new producerId. If so, we will enqueue an InitProducerId
+             // request which will be sent below
+            transactionManager.bumpIdempotentEpochAndResetIdIfNeeded();
+            if (maybeSendAndPollTransactionalRequest()) {
+                //返回，等待下次任务
+                return;
+            }
+        } catch (AuthenticationException e) {
+            transactionManager.authenticationFailed(e);
         }
+    }
+    //普通消息发送流程
+    long currentTimeMs = time.milliseconds();
+    long pollTimeout = sendProducerData(currentTimeMs);
+    client.poll(pollTimeout, currentTimeMs);
+}
+```
+
+bumpIdempotentEpochAndResetIdIfNeeded()方法主要是完成请求及响应处理Handler的构建。
+
+```
+synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
+    //只开启幂等，未开启事务
+    if (!isTransactional()) {
+        //初始化为false
+        if (epochBumpRequired) { bumpIdempotentProducerEpoch(); }
+        //状态不为初始化且没有PID，新建对象的状态为UNINITIALIZED
         if (currentState != State.INITIALIZING && !hasProducerId()) {
+            //状态转换
             transitionTo(State.INITIALIZING);
+            //构建请求数据及Handler
             InitProducerIdRequestData requestData = new InitProducerIdRequestData()
+                    //Transaction为null,只开启了事务
                     .setTransactionalId(null)
                     .setTransactionTimeoutMs(Integer.MAX_VALUE);
             InitProducerIdHandler handler = new InitProducerIdHandler(new InitProducerIdRequest.Builder(requestData), false);
+            //加入队列，等待发送
             enqueueRequest(handler);
         }
     }
 }
 ```
 
-#### 2、Broker端处理 InitProducerIdRequest
-
-InitProducerIdRequest会被**KafakApis#handleInitProducerIdRequest**方法接受处理，方法内调用**TransactionCoordinator#handleInitProducerId()**，
-最终是通过**ProducerIdManage#generateProducerId**方法产生一个PID，如下：
+maybeSendAndPollTransactionalRequest将会完成InitProducerIdRequest的发送，源码如下：
 
 ```
-def generateProducerId(): Long = {
-    this synchronized {
-      // grab a new block of producerIds if this block has been exhausted
-      if (nextProducerId > currentProducerIdBlock.producerIdEnd) {
-        //申请新的PID段
-        allocateNewProducerIdBlock()
-        nextProducerId = currentProducerIdBlock.producerIdStart
-      }
-      nextProducerId += 1
-      nextProducerId - 1
+private boolean maybeSendAndPollTransactionalRequest() {
+    //Producer刚初始化。这里先忽略这里的分支流程
+    if (transactionManager.hasInFlightRequest()) { ... }
+    if (transactionManager.hasAbortableError() || transactionManager.isAborting()) { ... }
+    
+    //获取上一步构建的Handler
+    TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.nextRequest(accumulator.hasIncomplete());
+    if (nextRequestHandler == null)
+        return false;
+    //构建request
+    AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
+    Node targetNode = null;
+    try {
+        FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
+        //只开启幂等时，coordinatorType == null，此时只需要找到leastLoadedNode即可
+        targetNode = coordinatorType != null ?
+                transactionManager.coordinator(coordinatorType) :
+                client.leastLoadedNode(time.milliseconds());
+        if (targetNode != null) {
+            //NetworkClient 连接是否可用
+            if (!awaitNodeReady(targetNode, coordinatorType)) {
+                log.trace("Target node {} not ready within request timeout, will retry when node is ready.", targetNode);
+                maybeFindCoordinatorAndRetry(nextRequestHandler);
+                return true;
+            }
+        //省略
+        } else if (coordinatorType != null) {...} else {...}
+        //是否是重试，进行retryBackoffMs的休眠，避免无效的频繁请求
+        if (nextRequestHandler.isRetry())
+            time.sleep(nextRequestHandler.retryBackoffMs());
+        //请求发送
+        long currentTimeMs = time.milliseconds();
+        ClientRequest clientRequest = client.newClientRequest(targetNode.idString(), requestBuilder, currentTimeMs,true, requestTimeoutMs, nextRequestHandler);
+        client.send(clientRequest, currentTimeMs);
+        transactionManager.setInFlightCorrelationId(clientRequest.correlationId());
+        client.poll(retryBackoffMs, time.milliseconds());
+        return true;
+    } catch (IOException e) {
+        maybeFindCoordinatorAndRetry(nextRequestHandler);
+        return true;
     }
-  }
 }
 ```
 
-ProducerIdManager是在TransactionCoordinator对象初始化时初始化的，这个对象主要是用来管理PID信息，有两个作用：
+InitProducerIdRequest的发送逻辑比较简单，这里需要注意的是**在选择处理请求的目标节点时，仅开启了幂等的Producer只需获取负载最小的Broker节点发送请求即可(leastLoadedNode)**，事务的情况下面再分析。
 
-* 在本地的PID段用完了或者处于新建状态时，申请PID段（默认情况下，每次申请1000个PID）；
-* TransactionCoordinator对象通过generateProducerId()方法获取下一个可以使用的PID；
+#### 2、Broker端处理 generateProducerId
 
-PID段的申请是通过Zookeeper实现。在ZK中维护/latest_producer_id_block节点，每个Broker向zk申请一个PID段后，都会把自己申请的PID段信息写入到这个节点，这样当其他Broker再申请PID段时，
-会首先读写这个节点的信息，然后根据block_end选择一个PID段，最后再把信息写会到zk的这个节点，这个节点信息格式如下所示：
+InitProducerIdRequest会被**KafkaApis#handleInitProducerIdRequest**方法接受处理，方法内调用**TransactionCoordinator#handleInitProducerId()**，
+最终是通过**ProducerIdManage#generateProducerId**方法产生一个PID，这里只关注PID的生成，其他源码未贴出，如下：
+
+```
+  def generateProducerId(): Long = {
+    this synchronized {
+      if (nextProducerId > currentProducerIdBlock.blockEndId) {
+        // 当前实例的PID端已耗尽 ，重新获取
+        getNewProducerIdBlock()
+        nextProducerId = currentProducerIdBlock.blockStartId + 1
+      } else {
+       //未耗尽，下次获取值+1
+        nextProducerId += 1
+      }
+      //返回本次获取的PID
+      nextProducerId - 1
+    }
+  }
+```
+
+由上可知，ProducerIdManager对象主要是Broker实例用来管理PID信息，当第一次获取或本地已获取的PID段耗尽后，调用`getNewProducerIdBlock()`获取新的PID段，否则使用本地PID段自增返回。
+Kafka是如何获取新的PID段的，`getNewProducerIdBlock()`方法源码如下：
+
+```
+  private def getNewProducerIdBlock(): Unit = {
+    var zkWriteComplete = false
+    while (!zkWriteComplete) { //直到从Zookeeper获取到PID段
+      // refresh current producerId block from zookeeper again  
+      val (dataOpt, zkVersion) = zkClient.getDataAndVersion(ProducerIdBlockZNode.path)
+
+      // generate the new producerId block
+      currentProducerIdBlock = dataOpt match {
+        case Some(data) =>
+          //从zookeeper获取最新的PID信息
+          val currProducerIdBlock = ProducerIdManager.parseProducerIdBlockData(data)
+
+          if (currProducerIdBlock.blockEndId > Long.MaxValue - ProducerIdManager.PidBlockSize) {
+            //当 PID 分配超过限制时,直接报错 Long类型  2^64  不太可能用完
+            // we have exhausted all producerIds (wow!), treat it as a fatal error
+            fatal(s"Exhausted all producerIds as the next block's end producerId is will has exceeded long type limit (current block end producerId is ${currProducerIdBlock.blockEndId})")
+            throw new KafkaException("Have exhausted all producerIds.")
+          }
+          //val PidBlockSize: Long = 1000L   加1000获取
+          ProducerIdBlock(brokerId, currProducerIdBlock.blockEndId + 1L, currProducerIdBlock.blockEndId + ProducerIdManager.PidBlockSize)
+        case None =>
+          //第一次获取PID段 获取0-999的PID端
+          debug(s"There is no producerId block yet (Zk path version $zkVersion), creating the first block")
+          ProducerIdBlock(brokerId, 0L, ProducerIdManager.PidBlockSize - 1)
+      }
+
+      val newProducerIdBlockData = ProducerIdManager.generateProducerIdBlockJson(currentProducerIdBlock)
+      //尝试写入zookeeper
+      val (succeeded, version) = zkClient.conditionalUpdatePath(ProducerIdBlockZNode.path, newProducerIdBlockData, zkVersion, Some(checkProducerIdBlockZkData))
+      zkWriteComplete = succeeded
+
+      if (zkWriteComplete)
+        info(s"Acquired new producerId block $currentProducerIdBlock by writing to Zk with path version $version")
+    }
+  }
+
+```
+
+方法中的PID段申请是通过Zookeeper实现。Kafka会在ZK中维护`/latest_producer_id_block`节点，Broker首先要获取该节点下的信息，并累加需申请的长度，最后把自己申请的PID段长度写回到这个节点，重复这个过程直至成功写回ZK。
+ZK节点的信息格式如下：
 
 ```
 {"version":1,"broker":35,"block_start":"4000","block_end":"4999"}
 ```
 
-方法如下：
-
-```
-private def allocateNewProducerIdBlock(): Unit = {
-    this synchronized {
-      currentProducerIdBlock = ZkProducerIdManager.getNewProducerIdBlock(brokerId, zkClient, this)
-    }
-}
-
-ZkProducerIdManager#getNewProducerIdBlock
-def getNewProducerIdBlock(brokerId: Int, zkClient: KafkaZkClient, logger: Logging): ProducerIdsBlock = {
-    var zkWriteComplete = false
-    while (!zkWriteComplete) {
-      // refresh current producerId block from zookeeper again
-      val (dataOpt, zkVersion) = zkClient.getDataAndVersion(ProducerIdBlockZNode.path)
-
-      // generate the new producerId block
-      val newProducerIdBlock = dataOpt match {
-        case Some(data) =>
-          val currProducerIdBlock = ProducerIdBlockZNode.parseProducerIdBlockData(data)
-          logger.debug(s"Read current producerId block $currProducerIdBlock, Zk path version $zkVersion")
-           //PID已耗尽，Long类型
-          if (currProducerIdBlock.producerIdEnd > Long.MaxValue - ProducerIdsBlock.PRODUCER_ID_BLOCK_SIZE) {
-            // we have exhausted all producerIds (wow!), treat it as a fatal error
-            logger.fatal(s"Exhausted all producerIds as the next block's end producerId is will has exceeded long type limit (current block end producerId is ${currProducerIdBlock.producerIdEnd})")
-            throw new KafkaException("Have exhausted all producerIds.")
-          }
-        
-          new ProducerIdsBlock(brokerId, currProducerIdBlock.producerIdEnd + 1L, ProducerIdsBlock.PRODUCER_ID_BLOCK_SIZE)
-        case None =>
-         //节点不存在，第一次获取PID段 
-         logger.debug(s"There is no producerId block yet (Zk path version $zkVersion), creating the first block")
-          new ProducerIdsBlock(brokerId, 0L, ProducerIdsBlock.PRODUCER_ID_BLOCK_SIZE)
-      }
-
-      val newProducerIdBlockData = ProducerIdBlockZNode.generateProducerIdBlockJson(newProducerIdBlock)
-
-      //将新的PID信息写回ZK，version 乐观锁
-      val (succeeded, version) = zkClient.conditionalUpdatePath(ProducerIdBlockZNode.path, newProducerIdBlockData, zkVersion, None)
-      zkWriteComplete = succeeded
-
-      if (zkWriteComplete) {
-        logger.info(s"Acquired new producerId block $newProducerIdBlock by writing to Zk with path version $version")
-        return newProducerIdBlock
-      }
-    }
-    throw new IllegalStateException()
-}
-
-```
+* version 版本，乐观锁
+* broker  BrokerId
+* block_start 对应实例申请的PID段起始位置
+* block_end 对应实例申请的PID段结束位置
 
 #### 3、幂等消息发送
 
-成功获取的PID信息，由KafkaProducer侧的TransactionManager维护，该类的作用主要有以下几个部分：
+Broker端返回的PID信息，由KafkaProducer侧的TransactionManager通过`ProducerIdAndEpoch`属性维护，该对象不仅保存了申请到的producerId，还有一个epoch属性，也是由Broker返回，
+主要用于producer有效判断，防止多个producer客户端使用同一个PID进行消息发送，当发送消息的Producer的epoch不等于Broker端存储的元数据中的值，则会返回异常。
 
-* 记录本地事务状态(开始事务时)
-* 记录幂等状态信息：每个TopicPartition对应的下一个sequence number和last acked batch(最近一个已经确认的batch)的最大的sequence number等；
-* 记录 ProducerIdAndEpoch信息（PID 信息）。
-
-
-Sender线程从RecordAccumulator中拉取消息时，完成PID及sequence number的设置。
+幂等消息与普通消息发送流程基本一致，但幂等消息需要为ProducerBatch设置producerId、epoch以及sequenceNumber参数。这一步是在Sender从Accumulator中拉取消息时完成的，`RecordAccumulator#drainBatchesForOneNode()`方法
+源码如下：
 
 ```
 private List<ProducerBatch> drainBatchesForOneNode(Cluster cluster, Node node, int maxSize, long now) {
+    int size = 0;
+    List<PartitionInfo> parts = cluster.partitionsForNode(node.id());
+    List<ProducerBatch> ready = new ArrayList<>();
+    /* to make starvation less likely this loop doesn't start at 0 */
+    int start = drainIndex = drainIndex % parts.size();
+    do {
+        PartitionInfo part = parts.get(drainIndex);
+        TopicPartition tp = new TopicPartition(part.topic(), part.partition());
+        this.drainIndex = (this.drainIndex + 1) % parts.size();
+        //分区锁，有序保证
+        if (isMuted(tp))
+            continue;
+        Deque<ProducerBatch> deque = getDeque(tp);
+        if (deque == null)
+            continue;
+        synchronized (deque) {
+            ProducerBatch first = deque.peekFirst();
+            if (first == null) continue;
+            
+            boolean backoff = first.attempts() > 0 && first.waitedTimeMs(now) < retryBackoffMs;
+            ////该ProducerBatch是重试batch,且未到时间
+            if (backoff)  continue;
         
-    //省略...
-    //判断当前TopicPartition是否可以进行发送，如PID是否有效，epoch是否一致，分区sequence number是否正确 
-    if (shouldStopDrainBatchesForPartition(first, tp))
-            break;
-
-        boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
-        ProducerIdAndEpoch producerIdAndEpoch =
-            transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
-        org.apache.kafka.clients.producer.internals.ProducerBatch batch = deque.pollFirst();
-        if (producerIdAndEpoch != null && !batch.hasSequence()) {
-            // 
-            transactionManager.maybeUpdateProducerIdAndEpoch(batch.topicPartition);
-
-            // 给这个 batch 设置相应的 pid、seq等信息
-            batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
-            // seq自增
-            transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
-          
-            transactionManager.addInFlightBatch(batch);
+            if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
+                //超出max.request.size
+                break;
+            } else {
+                // 幂等及事务消息发送前检验，如producerIdAndEpoch是否有效、是否有未响应的消息等
+                // 普通消息，方法返回false
+                if (shouldStopDrainBatchesForPartition(first, tp))
+                    break;
+                
+                boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
+                ProducerIdAndEpoch producerIdAndEpoch = transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
+                ProducerBatch batch = deque.pollFirst();
+                
+                if (producerIdAndEpoch != null && !batch.hasSequence()) {
+                    //幂等及事务消息处理
+                    transactionManager.maybeUpdateProducerIdAndEpoch(batch.topicPartition);
+                    //pid 、epoch及sequenceNumber设置
+                    batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
+                    //自增，下一条消息的sequenceNumber
+                    transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
+                    transactionManager.addInFlightBatch(batch);
+                }
+                batch.close();
+                //size 累加
+                size += batch.records().sizeInBytes();
+                ready.add(batch);
+                batch.drained(now);
+            }
         }
-    //省略...
+    } while (start != drainIndex);
+    return ready;
 }
-
 ```
 
-sequence number大于Integer.MAX_VALUE后，再次从0开始递增。
+sequenceNumber相关的操作都是通过TransactionManager类实现的：
+
+* TransactionManager#sequenceNumber()，用于获取指定分区的序列号，实现如下：
+
+```
+//同步方法 返回值类型为Integer
+synchronized Integer sequenceNumber(TopicPartition topicPartition) {
+    //每个分区单独维护，初始值从0开始
+    return topicPartitionBookkeeper.getOrCreatePartition(topicPartition).nextSequence;
+}
+```
+
+* TransactionManager#incrementSequenceNumber，实现sequenceNumber的自增，实现如下：
+
+```
+//同步方法
+synchronized void incrementSequenceNumber(TopicPartition topicPartition, int increment) {
+    //获取当前分区的下一个序列号
+    Integer currentSequence = sequenceNumber(topicPartition);
+    //计算下一条消息的sequenceNumber
+    currentSequence = DefaultRecordBatch.incrementSequence(currentSequence, increment);
+    //更新nextSequence
+    topicPartitionBookkeeper.getPartition(topicPartition).nextSequence = currentSequence;
+}
+```
+
+sequenceNumber的类型是Integer，DefaultRecordBatch.incrementSequence()方法会保证sequenceNumber大于Integer.MAX_VALUE后，再次从0开始递增。
 
 ```
 public static int incrementSequence(int sequence, int increment) {
@@ -202,7 +319,7 @@ public static int incrementSequence(int sequence, int increment) {
 }
 ```
 
-#### 4、Broker处理
+#### 4、Broker处理幂等消息
 
 Broker内会为每一对<PID,TopicPartition>记录一个sequence number，当一个RecordBatch到来时，会先检查PID是否已过期，然后再检查序列号：
 
@@ -275,9 +392,7 @@ private void insertInSequenceOrder(Deque<ProducerBatch> deque, ProducerBatch bat
         List<ProducerBatch> orderedBatches = new ArrayList<>();
         while (deque.peekFirst() != null && deque.peekFirst().hasSequence() && deque.peekFirst().baseSequence() < batch.baseSequence())
             orderedBatches.add(deque.pollFirst());
-
         deque.addFirst(batch);
-
         for (int i = orderedBatches.size() - 1; i >= 0; --i) {
             deque.addFirst(orderedBatches.get(i));
         }
@@ -343,7 +458,7 @@ TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确�
     幂等性引入的PID机制会在Producer重启后更新为新的PID，无法确保Producer fail后事务继续正确执行，Kafka Producer引入TransactionId参数，**由用户通过txn.id配置**。Kafka保证具有相同TransactionId
 的新Producer被创建后，旧的Producer将不再工作(通过epoch实现)，且新的Producer实例可以保证任何未完成的事务要么被commit，要么被abort。
 
-* 事务状态转移
+* 事务状态
 
     将事务从开始、进行到结束等阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
     

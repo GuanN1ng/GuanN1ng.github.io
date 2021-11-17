@@ -238,6 +238,7 @@ private void sendProduceRequest(long now, int destination, short acks, int timeo
         //事务id 后续分析
         transactionalId = transactionManager.transactionalId();
     }
+    //ApiKeys.PRODUCE
     ProduceRequest.Builder requestBuilder = ProduceRequest.forMagic(minUsedMagic, new ProduceRequestData().setAcks(acks).setTimeoutMs(timeout).setTransactionalId(transactionalId).setTopicData(tpd));
     //响应处理器
     RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
@@ -251,7 +252,7 @@ private void sendProduceRequest(long now, int destination, short acks, int timeo
 
 sendProduceRequest方法的内容主要是两部分：
 
-* 1、完成消息发送请求ClientRequest的创建，及设置响应处理的Handler；
+* 1、完成消息发送请求ProduceRequest及ClientRequest的创建，及设置响应处理的Handler；
 * 2、调用NetworkClient将消息通过Socket IO发送至Broker端。
 
 下面开始介绍消息发送中网络IO部分的内容。
@@ -658,7 +659,7 @@ private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionRespons
             //将ProducerBatch重新追加到Accumulator中，等待下一次拉取发送          
             reenqueueBatch(batch, now);
         } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {   
-            //网络等原因造成的同一消息多次发送，消息发送成功     
+            //幂等。网络等原因造成的同一消息多次发送，消息发送成功     
             completeBatch(batch, response);
         } else {
             //消息发送失败，释放内存。执行回调
