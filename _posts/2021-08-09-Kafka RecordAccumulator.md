@@ -329,8 +329,8 @@ public ByteBuffer allocate(int size, long maxTimeToBlockMs) throws InterruptedEx
 
 内存归还比较简单，分两种情况：
 
-* 若归还大小等于batch.size，直接将ByteBuffer清空，并添加到free deque中；
-* 否则直接将增加PooledAvailableMemory的大小，**ByteBuffer中的对象需要靠GC回收**；
+* 若归还大小等于batch.size，直接将ByteBuffer清空(重置position、limit、mark，后续使用直接覆盖写)，并添加到free deque中；
+* 否则直接将增加PooledAvailableMemory的大小，**ByteBuffer被丢弃，需要靠GC回收**；
 
 归还buffer后唤醒等待队列的第一个线程。
 
@@ -355,7 +355,7 @@ public void deallocate(ByteBuffer buffer, int size) {
 
 ### 总结
 
-1、 **BufferPool只会针对batch.size大小的ByteBuffer进行池化管理**，开发中，需要评估消息的大小，并合理调整batch.size的配置，尽可能的重复利用缓存。
+1、 **BufferPool只会针对batch.size大小的ByteBuffer进行池化管理**，开发中，需要评估消息的大小，并合理调整batch.size的配置，尽可能的重复利用缓存，避免导致频繁的GC。
 
 2、如果生产者发送消息的速度超过发送到服务器的速度，则会导致BufferPool可用空间长时间的不足，此时**KafkaProducer#send方法调用会被阻塞，抛出异常**，这个取决于参数**max.block.ms的配置，此参数的默认值为60000，即60s**。
 需评估项目中消息生产的速度及BufferPool的大小。
