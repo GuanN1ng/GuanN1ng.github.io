@@ -5,7 +5,7 @@ date:   2021-08-03 17:14:02
 categories: Kafka
 ---
 
-KafkaProducer的职责是将消息发送到Broker端，用户使用时，只需调用KafkaProducer#send方法即可完成，本文将通过KafkaProducer#send方法源码来分析Kakfa消息发送的流程。
+KafkaProducer的职责是将消息发送到Broker端，用户使用时，只需调用KafkaProducer#send方法即可完成，本文将从KafkaProducer#send方法源码来分析Kakfa消息发送的流程。
 
 ### KafkaProducer#send
 

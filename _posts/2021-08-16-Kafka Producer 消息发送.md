@@ -132,13 +132,7 @@ void runOnce() {
 
 #### sendProducerData
 
-sendProducerData方法源码如下，可简单概括为通过`Accumulator#drain`方法拉取数据，并调用`sendProduceRequests`方法完成消息发送，还有一些如对元数据无效、Broker节点的网络连接不可用、ProducerBatch超时未发送等条件的判断过滤及
-保证消息有序的分区加锁的业务。
-
-Accumulator中缓存消息时采用的是`Map<TopicPartition, Deque<ProducerBatch>>`的数据结构，通过主题分区进行分类，而调用drain获取的是`Map<Integer, List<ProducerBatch>>`，key代表的是节点id，
-这里进行了数据形式转变，因为对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是将数据发向哪个Broker，并建立连接，不关心消息属于哪个分区，
-通过按照broker分区，一次请求就把所有在这台broker上的分区leader的消息发送完，可以提升消息发送的效率。
-
+sendProducerData方法源码如下：
 
 ```
 private long sendProducerData(long now) {
@@ -194,6 +188,13 @@ private long sendProducerData(long now) {
     return pollTimeout;
 }
 ```
+
+可简单概括为通过`Accumulator#drain`方法拉取数据，并调用`sendProduceRequests`方法完成消息发送，还有一些如对元数据无效、Broker节点的网络连接不可用、ProducerBatch超时未发送等条件的判断过滤及
+保证消息有序的分区加锁的业务。
+
+Accumulator中缓存消息时采用的是`Map<TopicPartition, Deque<ProducerBatch>>`的数据结构，通过主题分区进行分类，而调用drain获取的是`Map<Integer, List<ProducerBatch>>`，key代表的是节点id，
+这里进行了数据形式转变，因为对于KafkaProducer的应用逻辑来说，需要关注消息是发向哪个主题分区，但对于网络连接来说，客户端需要关注的是将数据发向哪个Broker，并建立连接，不关心消息属于哪个分区，
+通过按照broker分区，一次请求就把所有在这台broker上的分区leader的消息发送完，可以提升消息发送的效率。
 
 #### sendProduceRequests
 

@@ -37,4 +37,23 @@
   line-height: 1.8;
 }
 
+.post-toc .nav .nav-child { display: none; }
 
+.post-toc .nav .active > .nav-child { display: block; }
+
+.post-toc .nav .active-current > .nav-child {
+  display: block;
+  & > .nav-item { display: block; }
+}
+
+.post-toc .nav .active > a {
+  color: $toc-link-active-color;
+  border-bottom-color: $toc-link-active-border-color;
+}
+
+.post-toc .nav .active-current > a {
+  color: $toc-link-active-current-color;
+  &:hover {
+    color: $toc-link-active-current-border-color;
+  }
+}
