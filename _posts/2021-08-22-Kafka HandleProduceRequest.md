@@ -239,7 +239,7 @@ appendRecordsToLeader()方法的内容可分为以下几部分：
 
 ## Log
 
-Log是消息日志的抽象，[Kafka 简介]()中介绍了实际上的日志是以一段一段存在的，即LogSegment，Log对象中负责维护当前分区副本的所有LogSegment集合，属性如下：
+Log是消息日志的抽象，[Kafka 简介](https://guann1ng.github.io/kafka/2021/07/29/Kafka-%E7%AE%80%E4%BB%8B/)中介绍了实际上的日志是以一段一段存在的，即LogSegment，Log对象中负责维护当前分区副本的所有LogSegment集合，属性如下：
 
 ```
 //key 为每段LogSegment起始偏移量  value为对应的LogSegment
