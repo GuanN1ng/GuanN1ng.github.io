@@ -36,7 +36,7 @@ Kafka引入**幂等性来解决异常重试机制导致的消息重复问题**�
 
 下面通过幂等消息的发送来了解Kafka如何实现消息幂等。
 
-#### 1、获取PID InitProducerIdRequest
+#### 获取PID InitProducerIdRequest
 
 幂等相关的逻辑处理是从Sender#runOnce方法开始的，当Producer开启了幂等或事务后，在进行普通消息发送流程前，必须等待幂等及事务相关的处理的完成。这里首先关注PID的获取，通过源码注释可知PID的获取是通过`TransactionManager#bumpIdempotentEpochAndResetIdIfNeeded()`和
 `Sender#maybeSendAndPollTransactionalRequest`方法实现。
@@ -140,7 +140,7 @@ private boolean maybeSendAndPollTransactionalRequest() {
 
 InitProducerIdRequest的发送逻辑比较简单，这里需要注意的是**在选择处理请求的目标节点时，仅开启了幂等的Producer只需获取负载最小的Broker节点发送请求即可(leastLoadedNode)**，事务的情况下面再分析。
 
-#### 2、Broker端处理 generateProducerId
+#### Broker端处理 generateProducerId
 
 InitProducerIdRequest会被**KafkaApis#handleInitProducerIdRequest**方法接受处理，方法内调用**TransactionCoordinator#handleInitProducerId()**，
 最终是通过**ProducerIdManage#generateProducerId**方法产生一个PID，这里只关注PID的生成，其他源码未贴出，如下：
@@ -216,7 +216,7 @@ ZK节点的信息格式如下：
 * block_start 对应实例申请的PID段起始位置
 * block_end 对应实例申请的PID段结束位置
 
-#### 3、幂等消息发送
+#### 幂等消息发送
 
 Broker端返回的PID信息，由KafkaProducer侧的TransactionManager通过`ProducerIdAndEpoch`属性维护，该对象不仅保存了申请到的producerId，还有一个epoch属性，也是由Broker返回，
 主要用于producer有效判断，防止多个producer客户端使用同一个PID进行消息发送，当发送消息的Producer的epoch不等于Broker端存储的元数据中的值，则会返回异常。
@@ -319,7 +319,7 @@ public static int incrementSequence(int sequence, int increment) {
 }
 ```
 
-#### 4、Broker处理幂等消息
+#### Broker处理幂等消息
 
 Broker内会为每一对<PID,TopicPartition>记录一个sequence number，当一个RecordBatch到来时，会先检查PID是否已过期，然后再检查序列号：
 
@@ -489,7 +489,7 @@ while (true) {
 
 官网详解可见[Exactly Once Delivery and Transactional Messaging](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging#KIP98ExactlyOnceDeliveryandTransactionalMessaging-DataFlow)
 
-#### 1、Finding a transaction coordinator -- the FindCoordinatorRequest
+#### Finding a transaction coordinator -- the FindCoordinatorRequest
 
 TransactionCoordinator负责分配PID和事务管理，因此Producer发送事务消息时的第一步就是找出对应的TransactionCoordinator，Producer会向LeastLoadedNode(inflightRequests.size对应的Broker)发送FindCoordinatorRequest，
 Broker收到请求后，**根据transactionalId的哈希值计算主题_transaction_state中的分区编号，再找出分区Leader所在的Broker节点**，该Broker节点即为这个transactionalId对应的TransactionCoordinator节点。
@@ -499,7 +499,7 @@ def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashC
 ```
 其中transactionTopicPartitionCount为主题_transaction_state的分区个数 ，可通过broker端参数transaction.state.log.num.partitions来配置，默认值为50。
 
-#### 2、Getting a producer Id -- the InitPidRequest
+#### Getting a producer Id -- the InitPidRequest
 
 找到TransactionCoordinator后，当前Producer就可以向TransactionCoordinator发送InitPidRequest获取PID（只开启幂等未开启事务的Producer,可以向任意Broker节点发送请求），PID的分配同幂等部分处理，
 事务相关的TransactionCoordinator处理流程如下：
@@ -555,24 +555,24 @@ txnMetadata.state match {
 
 * 3.将transactionId与相应的TransactionMetadata持久化到事务日志中，对于新的transactionId，这个持久化的数据主要是保存transactionId与PID关系信息
 
-#### 3、Starting a Transaction – The beginTransaction() API
+#### Starting a Transaction – The beginTransaction() API
 
 调用org.apache.kafka.clients.producer.KafkaProducer#beginTransaction即可，Producer端将本地事务状态标记为INITIALIZING状态，表明开启一个事务。
 
-#### 4、The consume-transform-produce loop
+#### The consume-transform-produce loop
 
 这个阶段囊括了整个事务的数据处理过程，如拉取数据，处理业务，写入下游等过程。
 
 具体实现可分为以下几步：
 
-##### 4.1 AddPartitionsToTxnRequest
+##### AddPartitionsToTxnRequest
 
 当Producer向一个TopicPartition发送数据前，需要先向TransactionCoordinator发送AddPartitionsToTxnRequest请求，TransactionCoordinator会将这个TopicPartition更新
 到TransactionId对应的TransactionMetadata中，并将<transactionId, TopicPartition>的对应关系存储在主题_transaction_state中。
 
 如果该分区是对应事务中的第一个分区， 那么此时TransactionCoordinator还会启动对该事务的计时。
 
-##### 4.2 ProduceRequest
+##### ProduceRequest
 
 生产者通过ProduceRequest请求发送消息到用户自定义主题中， 这一点和发送普通消息时相同，和普通的消息不同的是， 事务消息内的ProducerBatch中会包含实质的PID、 producerEpoch和sequence number参数。源码详见
 org.apache.kafka.clients.producer.internals.RecordAccumulator#drainBatchesForOneNode，Sender方法获取消息批次时完成事务参数设置。
@@ -584,7 +584,7 @@ public void setProducerState(ProducerIdAndEpoch producerIdAndEpoch, int baseSequ
 }
 ```
 
-##### 4.3 AddOffsetsToTxnRequest
+##### AddOffsetsToTxnRequest
 
 调用`sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets,ConsumerGroupMetadata groupMetadata)`方法可以在一个事务批次里处理consume-transform-produce，这个方法会向TransactionCoordinator发送
 AddOffsetsToTxnRequest请求，将group对应的_consumer_offsets的Partition（与写入涉及的TopicPartition一样）保存到事务对应的meta中，并持久化到主题_transaction_state中。
@@ -601,16 +601,16 @@ public void sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offs
 }
 ```
 
-##### 4.4 TxnOffsetsCommitRequest
+##### TxnOffsetsCommitRequest
 
 Producer在收到TransactionCoordinator关于AddOffsetsToTxnRequest请求的结果后，后再次发送TxnOffsetsCommitRequest请求给对应的GroupCoordinator，从而将本次事务
 中包含的消费位移信息offsets存储到主题_consumer_offsets中。
 
-#### 5、Committing or Aborting a Transaction
+#### Committing or Aborting a Transaction
 
 上述事务流程处理完成后，Producer需要调用commitTransaction()或者abortTransaction()方法来commit或者abort这个事务操作。
 
-##### 5.1 EndTxnRequest
+##### EndTxnRequest
 
 无论调用commitTransaction()方法还是abortTransaction()方法，Producer都会向Transaction Coordinator发送EndTxnRequest请求，以此来通知它提交(Commit)事务还是中止(Abort)事务。
 
@@ -620,7 +620,7 @@ TransactionCoordinator在收到EndTxnRequest请求后会执行如下操作:
 * 根据事务meta信息，向事务涉及到的所有TopicPartition的leader发送WriteTxnMarkerRequest请求，将COMMIT或ABORT信息写入用户所使用的普通主题和_consumer_offsets;
 * 完成事务，将COMPLETE_COMMIT或COMPLETE_ABORT信息写入内部主题_transaction_state
 
-##### 5.2 WriteTxnMarkerRequest
+##### WriteTxnMarkerRequest
 
 WriteTxnMarkersRequest请求是由TransactionCoordinator发向事务中各个分区的leader节点的，Transaction Marker也叫做控制消息(ControlBatch)，它的作用主要是告诉这个事务操作涉
 及的TopicPartitions当前的事务操作已经完成，可以执行commit或者abort。
@@ -653,7 +653,7 @@ public enum ControlRecordType {
 ```
 
 
-##### 5.3 Writing the final Commit or Abort Message
+##### Writing the final Commit or Abort Message
 
 当这个事务涉及到所有TopicPartition都已经把WriteTxnMarkerRequest信息持久化到日志文件之后，TransactionCoordinator将最终的COMPLETE_COMMIT 或COMPLETE_ABORT信息写入主题_transaction_state以表明当前事务已经结束，
 此时TransactionCoordinator缓存的很多关于这个事务的数据可以被清除,且主题_transaction_state中所有关于该事务的消息也可以被设置为墓碑消息，等到日志压缩处理。

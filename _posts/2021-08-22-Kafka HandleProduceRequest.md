@@ -78,7 +78,7 @@ handleProduceRequest()方法源码如下：
         }
     })
 
-    //定义响应回调 这里先省略
+    //回调处理，消息完成写入后，通过sendResponseCallback方法发送produceResponse
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = { ... }
 
