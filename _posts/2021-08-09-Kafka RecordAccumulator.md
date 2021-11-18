@@ -1,6 +1,6 @@
 ---
 title: Kafka RecordAccumulator
-date:   2021-08-29 Kafka Accumulator
+date:   2021-08-09 Kafka Accumulator
 categories: Kafka
 ---
 
