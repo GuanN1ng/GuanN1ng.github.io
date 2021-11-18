@@ -242,8 +242,11 @@ appendRecordsToLeader()方法的内容可分为以下几部分：
 Log是消息日志的抽象，[Kafka 简介]()中介绍了实际上的日志是以一段一段存在的，即LogSegment，Log对象中负责维护当前分区副本的所有LogSegment集合，属性如下：
 
 ```
-//跳表结构
+//key 为每段LogSegment起始偏移量  value为对应的LogSegment
+//SkipListMap  可根据offset快速定位对应的LogSegment
 private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] = new ConcurrentSkipListMap[java.lang.Long, LogSegment]
+//活跃的日志分段，即当前负责写的segments，为最后一个entry的value
+def activeSegment = segments.lastEntry.getValue
 ```
 
 LogSegment是根据可配置的策略创建的，配置如下：
@@ -254,7 +257,7 @@ LogSegment是根据可配置的策略创建的，配置如下：
 
 ### append
 
-追加日志的方法源码如下：
+日志的追加写入是通过append()方法实现，相关方法源码如下(代码有省略)：
 
 ```
   def appendAsLeader(records: MemoryRecords,leaderEpoch: Int,origin: AppendOrigin = AppendOrigin.Client,interBrokerProtocolVersion: ApiVersion = ApiVersion.latestVersion): LogAppendInfo = {
@@ -272,7 +275,6 @@ LogSegment是根据可配置的策略创建的，配置如下：
     // return if we have no valid messages or if this is a duplicate of the last appended entry
     if (appendInfo.shallowCount == 0) appendInfo
     else {
-
       //去除无效消息
       var validRecords = trimInvalidBytes(records, appendInfo)
 
@@ -281,7 +283,36 @@ LogSegment是根据可配置的策略创建的，配置如下：
         maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
           checkIfMemoryMappedBufferClosed()
 
-          ...//省略部分消息验证
+          if (validateAndAssignOffsets) {
+              //获取消息集的起始offset
+              val offset = new LongRef(nextOffsetMetadata.messageOffset)
+              appendInfo.firstOffset = Some(LogOffsetMetadata(offset.value))
+              val now = time.milliseconds
+              val validateAndOffsetAssignResult = try {
+                //消息校验及为消息分配偏移量
+                LogValidator.validateMessagesAndAssignOffsets(...)
+              } catch {
+                case e: IOException =>
+                  throw new KafkaException(s"Error validating messages while appending to log $name", e)
+              }
+              //更新appendInfo
+              validRecords = validateAndOffsetAssignResult.validatedRecords
+              appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
+              appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
+              appendInfo.lastOffset = offset.value - 1 //最后一条消息的 offset
+              appendInfo.recordConversionStats = validateAndOffsetAssignResult.recordConversionStats
+              if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
+                appendInfo.logAppendTime = now
+  
+              if (!ignoreRecordSize && validateAndOffsetAssignResult.messageSizeMaybeChanged) {
+                validRecords.batches.forEach { batch =>
+                  //maxMessageSize配置判断
+                  if (batch.sizeInBytes > config.maxMessageSize) {
+                    throw new RecordTooLargeException(s"Message batch size is ${batch.sizeInBytes} bytes in append to" +s"partition $topicPartition which exceeds the maximum configured size of ${config.maxMessageSize}.")
+                  }
+                }
+              }
+            } else {...}
 
           //消息大小大于LogSegment的最大长度，抛出异常
           if (validRecords.sizeInBytes > config.segmentSize) {
@@ -290,17 +321,19 @@ LogSegment是根据可配置的策略创建的，配置如下：
 
           //判断是否新建LogSegment
           val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
-          
+          //日志偏移量元数据
           val logOffsetMetadata = LogOffsetMetadata(
             messageOffset = appendInfo.firstOrLastOffsetOfFirstBatch,
             segmentBaseOffset = segment.baseOffset,
             relativePositionInSegment = segment.size)
-
+          
+          //验证幂等及事务  
           val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(
             logOffsetMetadata, validRecords, origin)
 
           maybeDuplicate match {
             case Some(duplicate) =>
+               //开启幂等或事务时，重复消息不处理
               appendInfo.firstOffset = Some(LogOffsetMetadata(duplicate.firstOffset))
               appendInfo.lastOffset = duplicate.lastOffset
               appendInfo.logAppendTime = duplicate.timestamp
@@ -309,26 +342,18 @@ LogSegment是根据可配置的策略创建的，配置如下：
               appendInfo.firstOffset = appendInfo.firstOffset.map { offsetMetadata =>
                 offsetMetadata.copy(segmentBaseOffset = segment.baseOffset, relativePositionInSegment = segment.size)
               }
-
-              segment.append(largestOffset = appendInfo.lastOffset,
-                largestTimestamp = appendInfo.maxTimestamp,
-                shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
-                records = validRecords)
-
-              updateLogEndOffset(appendInfo.lastOffset + 1)
-
-              updatedProducers.values.foreach(producerAppendInfo => producerStateManager.update(producerAppendInfo))
-
+              //调用segment.append写入
+              segment.append(largestOffset = appendInfo.lastOffset,largestTimestamp = appendInfo.maxTimestamp,shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,records = validRecords)
+              //事务消息处理
               completedTxns.foreach { completedTxn =>
                 val lastStableOffset = producerStateManager.lastStableOffset(completedTxn)
                 segment.updateTxnIndex(completedTxn, lastStableOffset)
                 producerStateManager.completeTxn(completedTxn)
               }
-
               producerStateManager.updateMapEndOffset(appendInfo.lastOffset + 1)
-
+               / update the first unstable offset (which is used to compute LSO)
               maybeIncrementFirstUnstableOffset()
-
+              //是否到达刷盘配置log.flush.interval.messages消息数
               if (unflushedMessages >= config.flushInterval) flush()
           }
           appendInfo
@@ -336,5 +361,282 @@ LogSegment是根据可配置的策略创建的，配置如下：
       }
     }
   }
+```
+
+`append()`方法的主要内容可分为以下几点：
+
+* `analyzeAndValidateRecords()`，主要是检查消息大小及CRC校验，返回appendInfo；
+* `LogValidator.validateMessagesAndAssignOffsets()`，为每条消息设置偏移量；
+* `maybeRoll()`，获取activeSegment，若需要新建segment，则新建并返回;
+* `analyzeAndValidateProducerState()`，幂等及事务判断，如重复消息；
+* `LogSegment#append()`,向segment中追加消息；
+* `flush()`，若距离上一次文件刷盘后的写入消息数已到达配置`log.flush.interval.messages`，调用flush()完成刷盘。
+
+这里主要关注日志写入相关的实现：`maybeRoll()`和`LogSegment#append()`方法。
+
+### maybeRoll
+
+LogSegment的获取是通过`maybeRoll()`方法，这里涉及到segment的新建，源码如下：
 
 ```
+  private def maybeRoll(messagesSize: Int, appendInfo: LogAppendInfo): LogSegment = {
+    //当前活跃日志分段
+    val segment = activeSegment
+    val now = time.milliseconds
+
+    val maxTimestampInMessages = appendInfo.maxTimestamp
+    val maxOffsetInMessages = appendInfo.lastOffset
+    //是否需要新建日志分段
+    if (segment.shouldRoll(RollParams(config, appendInfo, messagesSize, now))) {
+      val rollOffset = appendInfo
+        .firstOffset
+        .map(_.messageOffset)
+        .getOrElse(maxOffsetInMessages - Integer.MAX_VALUE)
+      //新建日志分段
+      roll(Some(rollOffset))
+    } else {
+      //不需新建，直接返回
+      segment
+    }
+  }
+
+```
+
+#### LogSegment#shouldRoll
+
+是否需要创建新的LogSegment的条件判断在方法`shouldRoll()`中，源码如下：
+
+```
+  def shouldRoll(rollParams: RollParams): Boolean = {
+    //距离上次创建日志分段的时间是否达到了设置的阈值（log.roll.hours or log.roll.ms）
+    val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
+    size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
+      (size > 0 && reachedRollMs) ||
+      offsetIndex.isFull || timeIndex.isFull || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages)
+  }
+``` 
+
+具体条件为(以下给出的配置均为Broker端的默认配置项，另有Topic粒度的配置项，可[自行查找](https://kafka.apache.org/081/documentation.html#topic-config))：
+
+* 1、`size > rollParams.maxSegmentBytes - rollParams.messagesSize`，待写入的消息大小加上segment的当前大小超过了log.segment.bytes配置值；
+* 2、`size > 0 && reachedRollMs`，当前segment不为空且已到达segment定时切换的时间配置log.roll.hours或log.roll.ms(优先级高)；
+* 3、`offsetIndex.isFull`，偏移量索引文件已写满(默认log.index.size.max.bytes)；
+* 4、`timeIndex.isFull`，时间戳索引文件已写满(默认log.index.size.max.bytes)；
+* 5、`!canConvertToRelativeOffset(rollParams.maxOffsetInMessages)`，当前segment的相对偏移量超过了Int的阈值
+
+以上5个条件满足任意一个，则会调用`roll()`方法创建新的LogSegment。
+
+#### roll
+
+roll()源码如下：
+
+```
+  def roll(expectedNextOffset: Option[Long] = None): LogSegment = {
+    maybeHandleIOException(s"Error while rolling log segment for $topicPartition in dir ${dir.getParent}") {
+      val start = time.hiResClockMs()
+      lock synchronized {
+        checkIfMemoryMappedBufferClosed()
+        //新LogSegment的基准偏移量  
+        val newOffset = math.max(expectedNextOffset.getOrElse(0L), logEndOffset)
+        //新建磁盘文件 baseOffset.log
+        val logFile = Log.logFile(dir, newOffset)
+        
+        //是否已有此偏移量的日志文件
+        if (segments.containsKey(newOffset)) {
+          //segment with the same base offset already exists and loaded
+          if (activeSegment.baseOffset == newOffset && activeSegment.size == 0) {
+            // We have seen this happen (see KAFKA-6388) after shouldRoll() returns true for an active segment of size zero because of one of the indexes is "full" (due to _maxEntries == 0).
+            removeAndDeleteSegments(Seq(activeSegment), asyncDelete = true, LogRoll)
+          } else {
+            //抛出已存在异常
+            throw new KafkaException(s"Trying to roll a new log segment for topic partition $topicPartition with start offset $newOffset" +s" =max(provided offset = $expectedNextOffset, LEO = $logEndOffset) while it already exists. Existing " +s"segment is ${segments.get(newOffset)}.")
+          }
+        } else if (!segments.isEmpty && newOffset < activeSegment.baseOffset) {
+          //存在大于该偏移量的文件
+          throw new KafkaException(s"Trying to roll a new log segment for topic partition $topicPartition with " +s"start offset $newOffset =max(provided offset = $expectedNextOffset, LEO = $logEndOffset) lower than start offset of the active segment $activeSegment")
+        } else {
+          
+          //创建对应的偏移量索引文件
+          val offsetIdxFile = offsetIndexFile(dir, newOffset)
+          //时间戳索引
+          val timeIdxFile = timeIndexFile(dir, newOffset)
+          //事务索引 如果Producer有事务
+          val txnIdxFile = transactionIndexFile(dir, newOffset)
+
+          for (file <- List(logFile, offsetIdxFile, timeIdxFile, txnIdxFile) if file.exists) {
+            //删除同名文件
+            Files.delete(file.toPath)
+          }
+          //将上一个LogSegment结束操作，如添加最后的时间索引，并trim 日志文件和偏移量索引
+          Option(segments.lastEntry).foreach(_.getValue.onBecomeInactiveSegment())
+        }
+
+        producerStateManager.updateMapEndOffset(newOffset)
+        producerStateManager.takeSnapshot()
+        //创建LogSegment对象
+        val segment = LogSegment.open(dir,
+          baseOffset = newOffset,
+          config,
+          time = time,
+          initFileSize = initFileSize,
+          preallocate = config.preallocate)
+
+        //添加到集合中
+        addSegment(segment)
+
+        updateLogEndOffset(nextOffsetMetadata.messageOffset)
+        //定时刷新任务
+        scheduler.schedule("flush-log", () => flush(newOffset), delay = 0L)
+
+        segment
+      }
+    }
+  }
+```
+
+roll()方法完成了LogSegment对象的创建，主要包含三部分文件：Log数据文件、offsetIdxFile以及timeIdxFile。
+
+
+### LogSegment#append
+
+获取到LogSegment后，即可调用`append()`完成消息的写入。
+
+```
+  @nonthreadsafe
+  def append(largestOffset: Long,largestTimestamp: Long,shallowOffsetOfMaxTimestamp: Long,records: MemoryRecords): Unit = {
+    if (records.sizeInBytes > 0) {
+      val physicalPosition = log.sizeInBytes()
+      if (physicalPosition == 0)
+        rollingBasedTimestamp = Some(largestTimestamp)
+      
+      //最大物理偏移量 - 文件基准偏移量  要大于0且小于Int.MaxValue
+      ensureOffsetInRange(largestOffset)
+      //写入日志文件
+      val appendedBytes = log.append(records)
+      if (largestTimestamp > maxTimestampSoFar) {
+        maxTimestampSoFar = largestTimestamp
+        offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
+      }
+      //如果需要，添加索引  log.index.interval.bytes 每隔多少字节添加一个索引
+      if (bytesSinceLastIndexEntry > indexIntervalBytes) {
+        offsetIndex.append(largestOffset, physicalPosition)
+        timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
+        bytesSinceLastIndexEntry = 0
+      }
+      bytesSinceLastIndexEntry += records.sizeInBytes
+    }
+  }
+```
+
+将消息写入日志文件后，还需判断是否需要添加对应的索引，可通过配置`log.index.interval.bytes`参数控制每隔多少字节添加一个索引。
+
+#### FileRecords#append
+
+消息日志文件的写入通过Java NIO实现。
+
+```
+public int append(MemoryRecords records) throws IOException {
+    if (records.sizeInBytes() > Integer.MAX_VALUE - size.get())
+        throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
+                " bytes is too large for segment with current file position at " + size.get());
+
+    int written = records.writeFullyTo(channel);
+    size.getAndAdd(written);
+    return written;
+}
+
+public int writeFullyTo(GatheringByteChannel channel) throws IOException {
+    buffer.mark();
+    int written = 0;
+    while (written < sizeInBytes())
+        written += channel.write(buffer);
+    buffer.reset();
+    return written;
+}
+```
+
+#### OffsetIndex#append
+
+偏移量索引的添加实现如下：
+
+```
+  def append(offset: Long, position: Int): Unit = {
+    inLock(lock) {
+      require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
+      if (_entries == 0 || offset > _lastOffset) {
+        trace(s"Adding index entry $offset => $position to ${file.getAbsolutePath}")
+        //根据绝对位移获取相对位移
+        mmap.putInt(relativeOffset(offset))
+        mmap.putInt(position)
+        //索引计数
+        _entries += 1
+        _lastOffset = offset
+        require(_entries * entrySize == mmap.position(), s"$entries entries but file position in index is ${mmap.position()}.")
+      } else {
+        throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to position $entries no larger than the last offset appended (${_lastOffset}) to ${file.getAbsolutePath}.")
+      }
+    }
+  }
+```
+
+可以看出偏移量索引包含两部分内容：
+
+* relativeOffset(相对位移)
+    
+    该参数表示消息的offset相对于该LogSegment的baseOffset的偏移量，这里将消息Long类型的offset转化为Int类型，这样可以**节省4个字节，减小索引文件占用的空间**。如一个LogSegment的baseOffset为1024，对应的偏移量索引文件为
+    `00000000000000000032.index`，offset为35的消息如果有索引的话，其relativeOffset = 35 - 32 = 3。
+    
+```
+  private def toRelative(offset: Long): Option[Int] = {
+    val relativeOffset = offset - baseOffset
+    if (relativeOffset < 0 || relativeOffset > Int.MaxValue)
+      None
+    else
+      Some(relativeOffset.toInt)
+  }
+  
+```
+
+* position：消息在**Log文件中对应的物理位置**，可以根据索引快速找到对应的消息
+
+偏移量索引特点总结：
+
+* 1、每隔`log.index.interval.bytes`字节创建一个索引，即偏移量索引是稀疏的；
+* 2、偏移量索引中通过`relativeOffset`达到节省文件空间的目的，方便映射到内存读取；
+* 3、偏移量索引有序，可通过二分查找定位指定位移的索引，然后通过position找到消息；
+
+#### TimeIndex#maybeAppend
+
+时间索引的添加实现如下：
+
+```
+  def maybeAppend(timestamp: Long, offset: Long, skipFullCheck: Boolean = false): Unit = {
+    inLock(lock) {
+      if (!skipFullCheck)
+        require(!isFull, "Attempt to append to a full time index (size = " + _entries + ").")
+      //有效性校验
+      if (_entries != 0 && offset < lastEntry.offset)
+        throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to slot ${_entries} no larger than the last offset appended (${lastEntry.offset}) to ${file.getAbsolutePath}.")
+      if (_entries != 0 && timestamp < lastEntry.timestamp)
+        throw new IllegalStateException(s"Attempt to append a timestamp ($timestamp) to slot ${_entries} no larger" +
+          s" than the last timestamp appended (${lastEntry.timestamp}) to ${file.getAbsolutePath}.")
+      
+      if (timestamp > lastEntry.timestamp) {
+        trace(s"Adding index entry $timestamp => $offset to ${file.getAbsolutePath}.")
+        mmap.putLong(timestamp)
+        mmap.putInt(relativeOffset(offset))
+        _entries += 1
+        _lastEntry = TimestampOffset(timestamp, offset)
+        require(_entries * entrySize == mmap.position(), s"${_entries} entries but file position in index is ${mmap.position()}.")
+      }
+    }
+  }
+```
+
+时间索引的属性如下：
+
+* timestamp(Long) 写入消息批次的最大时间戳
+* relativeOffset(Int)，时间戳对应消息的相对偏移量的relativeOffset，计算方式同偏移量索引
+
+每个追加的时间戳索引项中的timestamp必须大于之前追加的索引项的timestamp，否则不予追加，抛出异常，如果Broker端参数log.message.timestamp.type设置为LogAppendTime，那么消息的时间戳必定能够保持单调递增；
+相反，如果是CreateTime类型则无法保证。
