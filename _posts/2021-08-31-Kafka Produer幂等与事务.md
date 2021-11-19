@@ -7,7 +7,7 @@ categories: Kafka
 一般而言，消息中间件的消息传输保障有3个层级：
 
 * at most once：至多一次，消息可能会丢失，但绝对不会重复传输。
-* at least once：最少一次，消息绝不会丢失，但可能重复传输。
+* at least once：至少一次，消息绝不会丢失，但可能重复传输。
 * exactly once：正好一次，消息不会丢失，也不会被重复发送。
 
 Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消息就不会丢失。当遇到网络问题而导致请求超时，生产者无法判断是否提交成功，此时生产者可以通过多次重试来确保消息
@@ -17,7 +17,7 @@ Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消
 
 ## 幂等
 
-Kafka引入**幂等性来解决异常重试机制导致的消息重复问题**，开启幂等特性后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。通过将参数**enable.idempotence设置为true即可开启幂等**功能，
+Kafka引入**幂等特性来解决异常重试机制导致的消息重复问题**，开启幂等后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。通过将参数**enable.idempotence设置为true即可开启幂等**功能，
 此时retries参数默认为Integer.MAX_VALUE，acks默认为all，并确保max.in.flight.requests.per.connection(指定了Producer在收到Broker晌应之前单连接可以发送多少个Batch)不能大于5。
 
 ### 实现原理
@@ -38,8 +38,8 @@ Kafka引入**幂等性来解决异常重试机制导致的消息重复问题**�
 
 #### 获取PID InitProducerIdRequest
 
-幂等相关的逻辑处理是从Sender#runOnce方法开始的，当Producer开启了幂等或事务后，在进行普通消息发送流程前，必须等待幂等及事务相关的处理的完成。这里首先关注PID的获取，通过源码注释可知PID的获取是通过`TransactionManager#bumpIdempotentEpochAndResetIdIfNeeded()`和
-`Sender#maybeSendAndPollTransactionalRequest`方法实现。
+幂等相关的逻辑处理是从Sender#runOnce方法开始的，当Producer开启了幂等或事务后，在进行普通消息发送流程前，必须等待幂等及事务相关的处理的完成。这里首先关注PID的获取，
+通过源码注释可知PID的获取是通过`TransactionManager#bumpIdempotentEpochAndResetIdIfNeeded()`和`Sender#maybeSendAndPollTransactionalRequest`方法实现。
 
 ```
 void runOnce() {
@@ -66,7 +66,7 @@ void runOnce() {
 }
 ```
 
-bumpIdempotentEpochAndResetIdIfNeeded()方法主要是完成请求及响应处理Handler的构建。
+`bumpIdempotentEpochAndResetIdIfNeeded()`方法主要是完成请求及响应处理Handler的构建。
 
 ```
 synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
@@ -108,9 +108,11 @@ private boolean maybeSendAndPollTransactionalRequest() {
     Node targetNode = null;
     try {
         FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
-        //只开启幂等时，coordinatorType == null，此时只需要找到leastLoadedNode即可
+       
         targetNode = coordinatorType != null ?
-                transactionManager.coordinator(coordinatorType) :
+                //若开启事务后，则需要找到对应的TransactionCoordinator
+                transactionManager.coordinator(coordinatorType) : 
+                //只开启幂等时，coordinatorType == null，此时只需要找到leastLoadedNode即可
                 client.leastLoadedNode(time.milliseconds());
         if (targetNode != null) {
             //NetworkClient 连接是否可用
@@ -309,7 +311,7 @@ synchronized void incrementSequenceNumber(TopicPartition topicPartition, int inc
 }
 ```
 
-sequenceNumber的类型是Integer，DefaultRecordBatch.incrementSequence()方法会保证sequenceNumber大于Integer.MAX_VALUE后，再次从0开始递增。
+sequenceNumber的类型是Integer，当sequenceNumber大于Integer.MAX_VALUE后，DefaultRecordBatch.incrementSequence()方法会重置sequenceNumber，再次从0开始递增。
 
 ```
 public static int incrementSequence(int sequence, int increment) {
@@ -320,6 +322,43 @@ public static int incrementSequence(int sequence, int increment) {
 ```
 
 #### Broker处理幂等消息
+
+普通消息的完整处理可见[Kafka HandleProduceRequest](https://guann1ng.github.io/kafka/2021/08/22/Kafka-HandleProduceRequest/)一文，下面将主要分析有关幂等性处理的源码。
+`Log#append()`方法中在进行消息追加前会调用`Log#analyzeAndValidateProducerState()`方法校验幂等及事务状态。实现如下：
+
+```
+  private def analyzeAndValidateProducerState(appendOffsetMetadata: LogOffsetMetadata,records: MemoryRecords,origin: AppendOrigin):
+  (mutable.Map[Long, ProducerAppendInfo], List[CompletedTxn], Option[BatchMetadata]) = {
+    val updatedProducers = mutable.Map.empty[Long, ProducerAppendInfo]
+    val completedTxns = ListBuffer.empty[CompletedTxn]
+    var relativePositionInSegment = appendOffsetMetadata.relativePositionInSegment
+
+    records.batches.forEach { batch =>
+      //ProducerId不为null，该消息为幂等或事务消息
+      if (batch.hasProducerId) {
+        if (origin == AppendOrigin.Client) {
+          //获取producerId对应的ProducerStateEntry，该对象内会保存之前发送的5批ProducerBatch元信息
+          val maybeLastEntry = producerStateManager.lastEntry(batch.producerId)
+          //查询是否有重复消息
+          maybeLastEntry.flatMap(_.findDuplicateBatch(batch)).foreach { duplicate =>
+            
+            return (updatedProducers, completedTxns.toList, Some(duplicate))
+          }
+        }
+        ...//省略事务
+      }
+      relativePositionInSegment += batch.sizeInBytes
+    }
+    (updatedProducers, completedTxns.toList, None)
+  }
+```
+
+
+
+
+
+
+
 
 Broker内会为每一对<PID,TopicPartition>记录一个sequence number，当一个RecordBatch到来时，会先检查PID是否已过期，然后再检查序列号：
 
