@@ -640,3 +640,56 @@ public int writeFullyTo(GatheringByteChannel channel) throws IOException {
 
 每个追加的时间戳索引项中的timestamp必须大于之前追加的索引项的timestamp，否则不予追加，抛出异常，如果Broker端参数log.message.timestamp.type设置为LogAppendTime，那么消息的时间戳必定能够保持单调递增；
 相反，如果是CreateTime类型则无法保证。
+
+
+## sendResponseCallback
+
+消息追加的结果会回调handleProduceRequest()方法中定义的sendResponseCallback()响应给Producer，源码如下：
+
+```
+def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
+      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
+      var errorInResponse = false
+      //遍历所有分区追加结果，判断是否存在异常
+      mergedResponseStatus.forKeyValue { (topicPartition, status) =>
+        if (status.error != Errors.NONE) {
+          //异常标志
+          errorInResponse = true
+      }
+      //kafka限流实现
+      val timeMs = time.milliseconds()
+      val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request, requestSize, timeMs)
+      val requestThrottleTimeMs =
+        if (produceRequest.acks == 0) 0
+        else quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+      val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
+      if (maxThrottleTimeMs > 0) {
+        request.apiThrottleTimeMs = maxThrottleTimeMs
+        if (bandwidthThrottleTimeMs > requestThrottleTimeMs) {
+          quotas.produce.throttle(request, bandwidthThrottleTimeMs, requestChannel.sendResponse)
+        } else {
+          quotas.request.throttle(request, requestThrottleTimeMs, requestChannel.sendResponse)
+        }
+      }
+
+      if (produceRequest.acks == 0) {
+        //acks = 0
+        if (errorInResponse) {
+          val exceptionsSummary = mergedResponseStatus.map { case (topicPartition, status) =>
+            topicPartition -> status.error.exceptionName }.mkString(", ")
+          //通过关闭Socket连接间接的通知Producer，Producer会更新元数据重新建立连接
+          requestHelper.closeConnection(request, new ProduceResponse(mergedResponseStatus.asJava).errorCounts)
+        } else {
+          //不发送响应
+          requestHelper.sendNoOpResponseExemptThrottle(request)
+        }
+      } else {
+        //acks =1 or -1
+        requestHelper.sendResponse(request, Some(new ProduceResponse(mergedResponseStatus.asJava, maxThrottleTimeMs)), None)
+      }
+    }
+```
+
+这里主要关注acks=0时Broker的处理，当消息追加出现异常时，Broker会主动关闭与Producer的Socket连接，间接地使Producer感知异常，使Producer重新建立连接并刷新元数据。
+
+

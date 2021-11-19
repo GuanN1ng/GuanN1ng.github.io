@@ -10,10 +10,11 @@ categories: Kafka
 * at least once：至少一次，消息绝不会丢失，但可能重复传输。
 * exactly once：正好一次，消息不会丢失，也不会被重复发送。
 
-Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消息就不会丢失。当遇到网络问题而导致请求超时，生产者无法判断是否提交成功，此时生产者可以通过多次重试来确保消息
-成功提交，但重试过程可能造成消息的重复写入，即Kafka默认提供的消息传输保障为at least once。
+Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消息就不会丢失(acks=-1)。当生产者无法判断是否提交成功时，如遇到网络问题而导致请求超时，生产者可以通过多次重试来确保消息
+成功提交，但重试过程可能造成消息的重复写入，此时KafkaProducer提供的消息传输保障为at least once。同时，Kafka允许Producer灵活的指定级别，如消息采用发后即忘的方式发送且acks=0，或retries=0，
+则KafkaProducer的传输保障为at most one。
 
-但**Kafka通过引入幂等和事务特性实现不同程度的exactly once**。
+Kafka为实现exactly once，引入了幂等和事务特性。
 
 ## 幂等
 
@@ -341,11 +342,16 @@ public static int incrementSequence(int sequence, int increment) {
           val maybeLastEntry = producerStateManager.lastEntry(batch.producerId)
           //查询是否有重复消息
           maybeLastEntry.flatMap(_.findDuplicateBatch(batch)).foreach { duplicate =>
-            
             return (updatedProducers, completedTxns.toList, Some(duplicate))
           }
         }
-        ...//省略事务
+        val firstOffsetMetadata = if (batch.isTransactional)
+          Some(LogOffsetMetadata(batch.baseOffset, appendOffsetMetadata.segmentBaseOffset, relativePositionInSegment))
+        else
+          None
+        //sequence验证
+        val maybeCompletedTxn = updateProducers(producerStateManager, batch, updatedProducers, firstOffsetMetadata, origin)
+        maybeCompletedTxn.foreach(completedTxns += _)
       }
       relativePositionInSegment += batch.sizeInBytes
     }
@@ -353,34 +359,84 @@ public static int incrementSequence(int sequence, int increment) {
   }
 ```
 
+这里关于幂等消息的验证主要分为两部分：
+
+* 是否是重复消息Batch：通过`producerStateManager.lastEntry(batch.producerId)`获取该PID已完成消息追加的最新5个BatchMetadata，遍历判断是否存在相同批次；
+*  updateProducers()中会调用`checkSequence()`方法验证sequence是否连续。
+
+下面将分别分析具体的源码实现。
 
 
+##### findDuplicateBatch
 
-
-
-
-
-Broker内会为每一对<PID,TopicPartition>记录一个sequence number，当一个RecordBatch到来时，会先检查PID是否已过期，然后再检查序列号：
-
-* RecordBatch中的firstSeq = Broker中维护的序列号 + 1，保存数据
-* 否则，抛出异常OutOfOrderSequenceException
+ProducerStateManager对象中维护了<PID,ProducerStateEntry>的Map结构，lastEntry()方法的功能是通过PID获取对应的ProducerStateEntry。
 
 ```
-private def maybeValidateDataBatch(producerEpoch: Short, firstSeq: Int, offset: Long): Unit = {
-    checkProducerEpoch(producerEpoch, offset)
-    if (origin == AppendOrigin.Client) {
-      checkSequence(producerEpoch, firstSeq, offset)
+private val producers = mutable.Map.empty[Long, ProducerStateEntry]
+def lastEntry(producerId: Long): Option[ProducerStateEntry] = producers.get(producerId)
+```
+
+ProducerStateEntry定义如下：
+
+```
+private[log] class ProducerStateEntry(val producerId: Long, //PID
+                                      //BatchMetadata队列
+                                      val batchMetadata: mutable.Queue[BatchMetadata], 
+                                      var producerEpoch: Short,
+                                      var coordinatorEpoch: Int,
+                                      var lastTimestamp: Long,
+                                      var currentTxnFirstOffset: Option[Long]) {
+
+
+  def addBatch(producerEpoch: Short, lastSeq: Int, lastOffset: Long, offsetDelta: Int, timestamp: Long): Unit = {
+    maybeUpdateProducerEpoch(producerEpoch)
+    addBatchMetadata(BatchMetadata(lastSeq, lastOffset, offsetDelta, timestamp))
+    this.lastTimestamp = timestamp
+  }
+
+  private def addBatchMetadata(batch: BatchMetadata): Unit = {
+    // ProducerStateEntry.NumBatchesToRetain = 5
+    if (batchMetadata.size == ProducerStateEntry.NumBatchesToRetain)
+      //移除最早的BatchMetadata
+      batchMetadata.dequeue()
+    batchMetadata.enqueue(batch)
+  }
+
+
+  def findDuplicateBatch(batch: RecordBatch): Option[BatchMetadata] = {
+    if (batch.producerEpoch != producerEpoch)
+       None
+    else
+      batchWithSequenceRange(batch.baseSequence, batch.lastSequence)
+  }
+
+  def batchWithSequenceRange(firstSeq: Int, lastSeq: Int): Option[BatchMetadata] = {
+    val duplicate = batchMetadata.filter { metadata =>
+      //判断Batch是否相同
+      firstSeq == metadata.firstSeq && lastSeq == metadata.lastSeq
     }
+    duplicate.headOption
+  }
 }
 
+```
 
+可以看到，BatchMetadata通过队列维护，`addBatchMetadata()`中，当此时的队列长度等于5时，会先进行移除再插入，**Broker端最多只会维护最新的5个消息追加Batch元数据，这也是当开启幂等后，
+KafkaProducer会要求max.in.flight.requests.per.connection的配置值不超过5的原因**。
+
+`findDuplicateBatch()`方法则通过遍历`Queue[BatchMetadata]`并对比新的RecordBatch是否为重复数据。
+
+##### checkSequence
+
+checkSequence方法主要是校验消息的sequenceNumber是否连续，若不连续，抛出OutOfOrderSequenceException。实现如下：
+
+```
 private def checkSequence(producerEpoch: Short, appendFirstSeq: Int, offset: Long): Unit = {
     if (producerEpoch != updatedEntry.producerEpoch) {
-      if (appendFirstSeq != 0) {
+      if (appendFirstSeq != 0) {    
         if (updatedEntry.producerEpoch != RecordBatch.NO_PRODUCER_EPOCH) {
-          throw new OutOfOrderSequenceException(s"Invalid sequence number for new epoch of producer $producerId " +
-            s"at offset $offset in partition $topicPartition: $producerEpoch (request epoch), $appendFirstSeq (seq. number), " +
-            s"${updatedEntry.producerEpoch} (current producer epoch)")
+          //epoch不同，且之前存在epoch，此时对应的pid已过期，新epoch的seq不是从0开始，抛出异常
+          throw new OutOfOrderSequenceException(...)
         }
       }
     } else {
@@ -390,13 +446,9 @@ private def checkSequence(producerEpoch: Short, appendFirstSeq: Int, offset: Lon
         currentEntry.lastSeq
       else
         RecordBatch.NO_SEQUENCE
-
-      // If there is no current producer epoch (possibly because all producer records have been deleted due to
-      // retention or the DeleteRecords API) accept writes with any sequence number
+       //相同的epoch seq不连续 抛出异常
       if (!(currentEntry.producerEpoch == RecordBatch.NO_PRODUCER_EPOCH || inSequence(currentLastSeq, appendFirstSeq))) {
-        throw new OutOfOrderSequenceException(s"Out of order sequence number for producer $producerId at " +
-          s"offset $offset in partition $topicPartition: $appendFirstSeq (incoming seq. number), " +
-          s"$currentLastSeq (current end sequence number)")
+        throw new OutOfOrderSequenceException(...)
       }
     }
 }

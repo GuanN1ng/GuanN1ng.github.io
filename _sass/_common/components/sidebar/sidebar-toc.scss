@@ -36,3 +36,15 @@
   white-space: if(not jekyll-config('toc.wrap'), nowrap, null);
   line-height: 1.8;
 }
+
+.post-toc .nav .active > a {
+  color: $toc-link-active-color;
+  border-bottom-color: $toc-link-active-border-color;
+}
+
+.post-toc .nav .active-current > a {
+  color: $toc-link-active-current-color;
+  &:hover {
+    color: $toc-link-active-current-border-color;
+  }
+}
