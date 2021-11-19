@@ -462,25 +462,43 @@ private def inSequence(lastSeq: Int, nextSeq: Int): Boolean = {
 
 ### 幂等消息有序性
 
-我们可通过将max.in.flight.requests.per.connection设置为1来保证有序性，因为只允许一个请求正在发送，但这会导致性能的下降，Kafka2.0.0后的版本如果开启幂等后，
-能够动态调整max.in.flight.requests.per.connection的值，并根据序列号将Batch放到合适的位置：
+普通消息需通过将max.in.flight.requests.per.connection设置为1来保证有序性，即对同一个Broker节点只允许有一个未获得响应的请求，但这会导致性能的下降，Kafka开启幂等后，
+会要求max.in.flight.requests.per.connection的值不超过5，此时KafkaProducer如何保证消息的有序性呢？
+
+介绍Broker端处理幂等消息时，`checkSequence()`方法会判断序列号是否连续，若不连续则会抛出异常。KafkaProducer收到异常后，会将对应的ProducerBatch再次放入Accumulator中，待下次消息发送进行拉取，实现重试，`reenqueue()`实现如下：
+
+```
+public void reenqueue(ProducerBatch batch, long now) {
+    batch.reenqueued(now);
+    Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
+    synchronized (deque) {
+        if (transactionManager != null)
+            //幂等及事务消息
+            insertInSequenceOrder(deque, batch);
+        else
+            deque.addFirst(batch);
+    }
+}
+```
+
+普通的消息直接追加到待发送队列末尾，幂等及事务消息则是通过`insertInSequenceOrder`实现重试，方法源码如下：
 
 ```
 private void insertInSequenceOrder(Deque<ProducerBatch> deque, ProducerBatch batch) {
     //不存在序列号 抛出异常
     if (batch.baseSequence() == RecordBatch.NO_SEQUENCE)
-        throw new IllegalStateException("Trying to re-enqueue a batch which doesn't have a sequence even " +
-            "though idempotency is enabled.");
+        throw new IllegalStateException("Trying to re-enqueue a batch which doesn't have a sequence even though idempotency is enabled.");
 
     if (transactionManager.nextBatchBySequence(batch.topicPartition) == null)
         throw new IllegalStateException("We are re-enqueueing a batch which is not tracked as part of the in flight " +
             "requests. batch.topicPartition: " + batch.topicPartition + "; batch.baseSequence: " + batch.baseSequence());
-      
+    //获取头部的ProducerBatch  
     ProducerBatch firstBatchInQueue = deque.peekFirst();
     //通过序列号比较
     if (firstBatchInQueue != null && firstBatchInQueue.hasSequence() && firstBatchInQueue.baseSequence() < batch.baseSequence()) {
         
         List<ProducerBatch> orderedBatches = new ArrayList<>();
+        //while找到重试的ProducerBatch对应的位置
         while (deque.peekFirst() != null && deque.peekFirst().hasSequence() && deque.peekFirst().baseSequence() < batch.baseSequence())
             orderedBatches.add(deque.pollFirst());
         deque.addFirst(batch);
