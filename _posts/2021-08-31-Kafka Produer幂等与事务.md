@@ -463,7 +463,7 @@ private def inSequence(lastSeq: Int, nextSeq: Int): Boolean = {
 ### 幂等消息有序性
 
 普通消息需通过将max.in.flight.requests.per.connection设置为1来保证有序性，即对同一个Broker节点只允许有一个未获得响应的请求，但这会导致性能的下降，Kafka开启幂等后，
-会要求max.in.flight.requests.per.connection的值不超过5，此时KafkaProducer如何保证消息的有序性呢？
+max.in.flight.requests.per.connection的值最大是可以等于5的，此时KafkaProducer如何保证消息的有序性呢？
 
 介绍Broker端处理幂等消息时，`checkSequence()`方法会判断序列号是否连续，若不连续则会抛出异常。KafkaProducer收到异常后，会将对应的ProducerBatch再次放入Accumulator中，待下次消息发送进行拉取，实现重试，`reenqueue()`实现如下：
 
@@ -536,10 +536,10 @@ if (firstInFlightSequence != RecordBatch.NO_SEQUENCE && first.hasSequence()
 
 ## 事务
 
-Kafka通过引入幂等实现了单会话单TopicPartition的Exactly-Once语义，但因为PID机制无法提供跨多个TopicPartition和跨会话场景下的Exactly-Once保证,Kafka引入事务来弥补这个缺陷，
-**事务可以保证对多个分区写入操作的原子性**。
+Kafka通过引入幂等实现了单会话单TopicPartition的Exactly-Once语义，但幂等无法提供跨多个TopicPartition和跨会话场景下的Exactly-Once保证,Kafka引入事务来弥补这个缺陷，
+**通过事务可以保证对多个分区写入操作的原子性**。
 
-Kafka引入事务可以保证**Producer跨会话跨分区的消息幂等发送，跨会话的事务恢复**，但不能保证已提交的事务中所有消息都能够被消费，原因有以下几点：
+Kafka引入事务可以保证**Producer跨会话跨分区的消息幂等发送，以及跨会话的事务恢复**，但不能保证已提交的事务中所有消息都能够被消费，原因有以下几点：
 
 * 对于采用日志压缩策略的主题(cleanup.policy=compact)，相同key的消息。后写入的消息会覆盖前面写入的消息；
 * 事务消息可能持久化在同一个分区的不同LogSegment中，当老的日志分段被删除，对应的消息会丢失；
@@ -559,7 +559,7 @@ Kafka事务需要确保跨会话多分区的写入保证原子性，实现机制
 
 * TransactionCoordinator高可用
 
-    为应对一个事务的TransactionCoordinator突然宕机，Kafka将事务消息持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + ack**确保事务状态不丢失，
+    为应对一个事务的TransactionCoordinator突然宕机，Kafka将事务消息持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
 TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确保事务事务可恢复。
 
 * 跨会话
@@ -569,28 +569,66 @@ TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确�
 
 * 事务状态
 
-    将事务从开始、进行到结束等阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
+    将事务从开始、进行到结束等每一个阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
     
     
     
 
-### 执行流程
+### 事务使用
 
-Kafka事务执行示例代码如下：
+只需配置KafkaProducer的`transactional.id`参数，即可启用事务，同时KafkaProducer会默认的将`enable.idempotence`幂等参数设置为true，若用户手动将`enable.idempotence`参数设为false，
+将抛出ConfigException。 
 
 ```
-producer.initTransactions();
-
-while (true) {
-  ConsumerRecords records = consumer.poll(Long.MAX_VALUE);
-  producer.beginTransaction();
-  for (ConsumerRecord record : records)
-    //doSomething dataTransform
-    producer.send(producerRecord(“outputTopic”, record));
-  producer.sendOffsetsToTransaction(currentOffsets(consumer), group);  
-  producer.commitTransaction();
+boolean idempotenceEnabled() {
+    boolean userConfiguredIdempotence = this.originals().containsKey(ENABLE_IDEMPOTENCE_CONFIG);
+    //是否配置了transactional.id
+    boolean userConfiguredTransactions = this.originals().containsKey(TRANSACTIONAL_ID_CONFIG);
+    boolean idempotenceEnabled = userConfiguredIdempotence && this.getBoolean(ENABLE_IDEMPOTENCE_CONFIG);
+    //配置transactional.id，且enable.idempotence为false
+    if (!idempotenceEnabled && userConfiguredIdempotence && userConfiguredTransactions)
+        throw new ConfigException("Cannot set a " + ProducerConfig.TRANSACTIONAL_ID_CONFIG + " without also enabling idempotence.");
+    return userConfiguredTransactions || idempotenceEnabled;
 }
 ```
+
+Kafka事务API使用示例代码如下：
+
+```
+// 创建生产者 消费者
+KafkaProducer<String, String> producer = new KafkaProducer<>(getProducerProps());
+KafkaConsumer<String, String> consumer = new KafkaConsumer<>(getConsumerProps());
+// 初始化事务
+producer.initTransactions();
+consumer.subscribe(Arrays.asList("consumer-tran"));
+while(true){
+    ConsumerRecords<String, String> records = consumer.poll(500);
+    if(!records.isEmpty()){
+        try {
+            // 开启事务
+            producer.beginTransaction();
+            Map<TopicPartition, OffsetAndMetadata> commits = new HashMap<>();
+            for(ConsumerRecord record : records){
+                // doSomething..
+                // 记录提交的偏移量
+                commits.put(new TopicPartition(record.topic(), record.partition()),new OffsetAndMetadata(record.offset()));
+                // 生产消息
+                Future<RecordMetadata> metadataFuture = producer.send(new ProducerRecord<>("new-topic",record.value()));
+            }
+            // 提交偏移量
+            producer.sendOffsetsToTransaction(commits,"groupId");
+            // 事务提交
+            producer.commitTransaction();
+        }catch (Exception e){
+             e.printStackTrace();
+             //终止事务
+             producer.abortTransaction();
+        }
+    }
+}
+```
+
+### 执行流程
 
 流程图如下：
 
