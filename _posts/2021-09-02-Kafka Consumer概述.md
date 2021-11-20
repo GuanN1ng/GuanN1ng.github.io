@@ -7,10 +7,10 @@ categories: Kafka
 Kafka中的Topic是一个逻辑概念，它还可以细分为多个分区(Partition)，一个分区只属于单个主题，消息存储是基于分区进行存储的，每个分区可被视作一个可追加的日志文件，
 Producer会在分区日志的尾部追加数据，而Consumer负责订阅Topic，并从主题所属的分区日志的特定的位置(offset)读取并消费数据。
 
-### 消费者组
+## 消费者组
 
 Kafka引入consumer group的概念来表示一组消费者实例的集合，每个消费者只属于一个消费者组，消费者组内订阅同一topic的消费者按照一定的分区分配策略进行消费，一个TopicPartition只能被同一消费者组
-内的一个消费者消费，消费者组之间不受影响。
+内的一个消费者消费，消费者组之间不受影响，如下图。
 
 ![consumer group](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/consumer%20group.png)
 
@@ -28,11 +28,11 @@ Kafka引入consumer group的概念来表示一组消费者实例的集合，每�
 * 所有的Consumer实例都属于不同的consumer group，则所有的消息都会被广播给每一个消费者，即每条消息会被所有的Consumer处理，此时为发布订阅模式。
 
 
-### Consumer Client
+## Consumer Client
 
 下面介绍一下Consumer客户端使用时的一些API。
 
-#### 订阅主题
+### 订阅主题
 
 消费者进行数据消费时，首先需要完成相关主题的订阅，一个消费者可以订阅一个或多个主题，使用subscribe()方法完成主题订阅，以下为Consumer类内subscribe()方法的重载列表。
 
@@ -51,12 +51,12 @@ subscribe API可分为两类：使用topic集合的方式订阅以及通过正�
 ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消费者的主题分区发生变化时触发回调该Listener，后续分析消费者再均衡时再详解。
 
 
-#### 分配主题分区
+### 分配主题分区
 
-消费者组内订阅同一topic的消费者即可通过配置**分区分配策略进行主题分区自动分配**，也可以使用**assign()方法完成手动订阅某些主题的特定分区**。但使用**assign方法订阅主题分区的
+消费者组内订阅同一topic的消费者可通过配置**分区分配策略进行主题分区自动分配**，也可以使用**assign()方法完成手动订阅某些主题的特定分区**。但使用**assign方法订阅主题分区的
 消费者不具备自动再均衡的功能**，无法实现消费负载均衡及故障自动转移。
 
-##### assign
+#### assign
 
 主题分区信息可通过KafkaConsumer#partitionsFor(topic)方法进行查询获取。然后通过调用KafkaConsumer#assign(Collection)方法实现手动指定主题分区进行消费：
 
@@ -96,31 +96,151 @@ public final class TopicPartition implements Serializable {
 
 ```
 
-##### ConsumerPartitionAssignor
+#### PartitionAssignor
 
-采用subscribe方法订阅主题的消费者会根据配置的分区分配策略完成消费分区分配，Kafka还为用户提供了RangeAssignor、RoundRobinAssignor、StickyAssignor等实现。
-用户也可实现AbstractPartitionAssignor接口创建自定义的分区分配策略。
+采用subscribe方法订阅主题的消费者会根据配置的分区分配策略完成消费分区分配，Kafka为用户提供了RangeAssignor、RoundRobinAssignor、StickyAssignor等实现。
+用户也可实现AbstractPartitionAssignor接口创建自定义的分区分配策略只需实现AbstractPartitionAssignor中的assign方法即可:
+                                             
+ ```
+ /**
+  * org.apache.kafka.clients.consumer.internals.AbstractPartitionAssignor
+  * @param partitionsPerTopic  <主题-分区编号>集合
+  * @param subscriptions  <消费者id-订阅信息>集合
+  * @return
+  */
+ public abstract Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                          Map<String, Subscription> subscriptions);
+ ```
+ 
+ Subscription是ConsumerPartitionAssignor的内部类，用来表示消费者的订阅信息：
+ 
+ ```
+ final class Subscription {
+     private final List<String> topics;  //消费者订阅的主题
+     // 用户自定义信息，可自行补充，用于计算分配，单需要实现顶层接口ConsumerPartitionAssignor
+     private final ByteBuffer userData;  
+     private final List<TopicPartition> ownedPartitions; // 当前消费者已被分配的分区
+     private Optional<String> groupInstanceId; //组id
+ }
+ ```
 
-* RangeAssignor
+##### RangeAssignor
 
 RangeAssignor是Kafka的默认分区分配策略，原理是使用主题分数区除以消费者数获取跨度，所有消费者按照字典序排列，然后按照跨度进行平均分配，若存在余数，字典序靠前的消费者
-会被多分配一个分区。
+会被多分配一个分区，RangeAssignor#assign()方法实现如下：
+
+```
+ /**
+  * @param partitionsPerTopic  <主题-分区编号>集合
+  * @param subscriptions  <消费者id-订阅信息>集合
+  */
+public Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                    Map<String, Subscription> subscriptions) {
+    
+    //topic-list<consumer>  按照订阅的topic将consumer分组
+    Map<String, List<MemberInfo>> consumersPerTopic = consumersPerTopic(subscriptions);
+
+    Map<String, List<TopicPartition>> assignment = new HashMap<>();
+    //初始化<消费者，获得的分区>容器
+    for (String memberId : subscriptions.keySet())
+        assignment.put(memberId, new ArrayList<>());
+
+    for (Map.Entry<String, List<MemberInfo>> topicEntry : consumersPerTopic.entrySet()) {
+        String topic = topicEntry.getKey();
+        //订阅该主题的所有消费者
+        List<MemberInfo> consumersForTopic = topicEntry.getValue();
+        //主题分区数
+        Integer numPartitionsForTopic = partitionsPerTopic.get(topic);
+        if (numPartitionsForTopic == null)
+            continue;
+        //按消费者id排序
+        Collections.sort(consumersForTopic);
+        //跨度 =  主题分区数 / 订阅主题的消费者数
+        int numPartitionsPerConsumer = numPartitionsForTopic / consumersForTopic.size();
+        //余数
+        int consumersWithExtraPartition = numPartitionsForTopic % consumersForTopic.size();
+
+        List<TopicPartition> partitions = AbstractPartitionAssignor.partitions(topic, numPartitionsForTopic);
+        for (int i = 0, n = consumersForTopic.size(); i < n; i++) {
+            //遍历消费者，依次分配，余数也依次分配
+            int start = numPartitionsPerConsumer * i + Math.min(i, consumersWithExtraPartition);
+            int length = numPartitionsPerConsumer + (i + 1 > consumersWithExtraPartition ? 0 : 1);
+            assignment.get(consumersForTopic.get(i).memberId).addAll(partitions.subList(start, start + length));
+        }
+    }
+    return assignment;
+}
+```
 
 ![RangeAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/RangeAssignor.png)
 
 可以看出，当策略为RangeAssignor时，由于主题分区数多数情况下并非消费者数的整数倍，随着消费者订阅的Topic增加，**容易出现部分消费者过载**。
 
 
-* RoundRobinAssignor
+##### RoundRobinAssignor
 
-RoundRobinAssignor分配策略的原理是将消费组内所有消费者及消费者订阅的所有主题的分区按照字典序排序，然后通过轮询方式逐个将分区分配给每个消费者。
+RoundRobinAssignor分配策略的原理是将消费组内所有消费者及消费者订阅的所有主题的分区按照字典序排序，然后通过轮询方式逐个将分区分配给每个消费者。RoundRobinAssignor#assign()实现如下：
+
+```
+ /**
+  * @param partitionsPerTopic  <主题-分区编号>集合
+  * @param subscriptions  <消费者id-订阅信息>集合
+  */
+public Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                Map<String, Subscription> subscriptions) {
+    Map<String, List<TopicPartition>> assignment = new HashMap<>();
+    List<MemberInfo> memberInfoList = new ArrayList<>();
+    for (Map.Entry<String, Subscription> memberSubscription : subscriptions.entrySet()) {
+        //初始化<消费者id，获得的分区>容器
+        assignment.put(memberSubscription.getKey(), new ArrayList<>());
+        //所有的消费者信息
+        memberInfoList.add(new MemberInfo(memberSubscription.getKey(),
+                                          memberSubscription.getValue().groupInstanceId()));
+    }
+    /**
+     * 所有消费者集合的无限循环迭代器 通过重复获取集合的迭代器实现
+     * private T advance() {
+     *     if (!iterator.hasNext()) {
+     *         iterator = iterable.iterator();
+     *     }
+     *     return iterator.next();
+     * }
+     */
+    CircularIterator<MemberInfo> assigner = new CircularIterator<>(Utils.sorted(memberInfoList));
+    //遍历所有分区 
+    for (TopicPartition partition : allPartitionsSorted(partitionsPerTopic, subscriptions)) {
+        final String topic = partition.topic();
+        //查找订阅该分区的消费者
+        while (!subscriptions.get(assigner.peek().memberId).topics().contains(topic))
+            assigner.next();
+        assignment.get(assigner.next().memberId).add(partition);
+    }
+    return assignment;
+}
+
+
+private List<TopicPartition> allPartitionsSorted(Map<String, Integer> partitionsPerTopic,
+                                                 Map<String, Subscription> subscriptions) {
+    SortedSet<String> topics = new TreeSet<>();
+    for (Subscription subscription : subscriptions.values())
+        topics.addAll(subscription.topics());
+    //按照主题排序所有的主题分区
+    List<TopicPartition> allPartitions = new ArrayList<>();
+    for (String topic : topics) {
+        Integer numPartitionsForTopic = partitionsPerTopic.get(topic);
+        if (numPartitionsForTopic != null)
+            allPartitions.addAll(AbstractPartitionAssignor.partitions(topic, numPartitionsForTopic));
+    }
+    return allPartitions;
+}
+```
 
 ![RoundRobinAssignor](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/RoundRobinAssignor.png)
 
 如上图，轮询分配的策略**在同一个消费者组内的所有消费者都订阅相同Topic时，分配时均匀的。当同一个消费者组内的消费都订阅不同Topic时，则可能导致分配不均匀**，上图所示的第二个例子中，
 完全可以将Topic-B_1的主题分区分给consumer-1处理。减轻consumer-2的压力。
 
-* StickyAssignor
+##### StickyAssignor
 
 StickyAssignor的设计有两个目标：
 
@@ -136,34 +256,8 @@ StickyAssignor的设计有两个目标：
 当以上两者发生冲突时，第一个目标优于第二个目标。StickyAssignor分配策略比另外两者分配策略而言显得更加优异，既能最大程度的保证分配均匀，也能够减少不必要的分区移动。
 
 
-* 自定义策略
 
-用户也可根据自己的业务场景实现自定义的分配策略，只需实现AbstractPartitionAssignor中的assign方法即可:
-
-```
-/**
- * org.apache.kafka.clients.consumer.internals.AbstractPartitionAssignor
- * @param partitionsPerTopic  <主题-分区编号>集合
- * @param subscriptions  <消费者id-订阅信息>集合
- * @return
- */
-public abstract Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
-                                                         Map<String, Subscription> subscriptions);                                                        Map<String, Subscription> subscriptions);
-```
-
-Subscription是ConsumerPartitionAssignor的内部类，用来表示消费者的订阅信息：
-
-```
-final class Subscription {
-    private final List<String> topics;  //消费者订阅的主题
-    // 用户自定义信息，可自行补充，用于计算分配，单需要实现顶层接口ConsumerPartitionAssignor
-    private final ByteBuffer userData;  
-    private final List<TopicPartition> ownedPartitions; // 当前消费者已被分配的分区
-    private Optional<String> groupInstanceId; //组id
-}
-```
-
-#### 消息获取
+### 消息获取
 
 消息的消费一般有两种模式：push和poll模式。push模式是服务端主动将消息推送给消费者，poll模式是消费者主动向服务端发起请求来拉取消息。Kafka中的消费时基于poll模式的。
 通过不断轮询调用KafkaConsumer#poll(java.time.Duration)方法，来获取消费者所分配的主题分区上的一组消息。
@@ -175,7 +269,7 @@ public ConsumerRecords<K, V> poll(final Duration timeout) {
 ```
 
 
-#### 反序列化
+### 反序列化
 
 KafkaProducer发送消息时会将消息序列化，对应的，KafkaConsumer也需要将消息反序列化，反序列化器是org.apache.kafka.common.serialization.Deserializer的实现类，
 Kafka提供以下的实现类供用户使用：
@@ -189,7 +283,7 @@ Kafka提供以下的实现类供用户使用：
 用户也可以实现Deserializer接口创建自定义的反序列化器。
 
 
-#### 消费者拦截器
+### 消费者拦截器
 
 消费者拦截器主要在拉取到消息或在提交消费位移时进行一些定制化的操作。接口为org.apache.kafka.clients.consumer.ConsumerInterceptor：
 
@@ -214,7 +308,7 @@ KafkaConsumer会在poll()方法返回之前调用拦截器的onConsume()方法�
 
 **KafkaConsumer会在提交完消费位移之后调用拦截器的onCommit()方法， 可以使用这个方法来记录跟踪所提交的位移信息**。
 
-#### 位移提交
+### 位移提交
 
 Kafka中的每个主题分区内的消息都有唯一的offset，为了防止消费进度丢失，消费者通过向服务器提交offset来表示当前消费到分区中消息的位置。poll()方法返回的是未被消息过的消息，消费者需要每次将消费进度(消费的消息对应的offset)保存到Kafka
 的内部主题`_consumer_offsets`中，即消费位移提交。若位移提交出现问题，会导致重复消费或消息丢失的现象。**提交的位置为当前已消费的消息offset+1，即下一次需消费的起始位置**。
@@ -225,7 +319,7 @@ consumer.commitSync(Collections.singletonMap(partition,new OffsetAndMetadata(rec
 
 消费者的位移提交可分为自动提交和手动提交两种方式：
 
-##### 自动提交
+#### 自动提交
 
 自动提交是KafkaConsumer默认的消费位移提交方式，通过客户端参数`enable.auto.commit`配置，默认为true,自动提交是指Kafka按照一定的时间周期进行消费位移的提交，通过参数
 `auto.interval.ms`配置，默认5s，即默认情况下，consumer会每隔5s将拉取到的每个分区中的最大消息位移提交到主题`_consumer_offsets`中。
@@ -235,7 +329,7 @@ consumer.commitSync(Collections.singletonMap(partition,new OffsetAndMetadata(rec
 
 综上：自动提交下，无需开发人员额外编码，代码简洁，但可能导致重复消费及消息丢失的问题。即使通过缩短提交周期也无法避免，且会使位移提交更加频繁。
 
-##### 手动提交
+#### 手动提交
 
 手动提交的方式下，开发人员可以控制何时进行消费位移提交，通过`enable.auto.commit=false`开启手动提交方式，手动提交可分为同步提交和异步提交：
 
@@ -270,9 +364,9 @@ void commitAsync(Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCal
 当异步提交的异常时，可进行手动重试，但应注意"ABA"的问题，防止重复请求时将其它位移提交请求覆盖。可通过维护递增的请求id，如已有更大的请求id存在，应放弃重试。考虑到后续也会再次发起同步请求，也可以
 不进行重试，但会增加重复消费的概率。在消费者退出或再均衡前也可采用同步提交的方式确保正确提交。
 
-#### 消费控制
+### 消费控制
 
-##### 指定消费位移
+#### 指定消费位移
 
 * auto.offset.reset
 
@@ -318,7 +412,7 @@ Map<TopicPartition, Long> endOffsets(Collection<TopicPartition> partitions, Dura
 
 调用seek()方法前，必须先完成分区分配。调用流程为`poll()/assign()->seek()->poll()`。
 
-##### pause & resume
+#### pause & resume
 
 KafkaConsumer提供了pause()用于暂停poll()方法返回某些分区的消息而先消费其他分区，且不会导致group rebalance。后续通过调用pause()方法恢复对这些分区的继续消费。
 
@@ -335,7 +429,7 @@ Set<TopicPartition> paused();
 ```
 
 
-##### wakeup & close
+#### wakeup & close
 
 无论使用`while-true`或`while-isRunning.get()`循环调用poll()方法获取消息，都可以通过调用wakeup()方法退出poll逻辑。wakeup()方法是线程安全的，调用后poll方法会抛出WakeupExceptions完成循环跳出。
 退出poll循环后，需要调用close()方法，释放消费者占用的系统资源，若采用自动提交的方式，此时，也会完成消息位移的提交。

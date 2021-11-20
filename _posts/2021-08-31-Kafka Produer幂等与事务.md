@@ -544,35 +544,7 @@ Kafka引入事务可以保证**Producer跨会话跨分区的消息幂等发送�
 * 对于采用日志压缩策略的主题(cleanup.policy=compact)，相同key的消息。后写入的消息会覆盖前面写入的消息；
 * 事务消息可能持久化在同一个分区的不同LogSegment中，当老的日志分段被删除，对应的消息会丢失；
 * Consumer通过seek()方法指定offset进行消费，从而遗漏事务中的部分消息；
-* Consumer可能没有订阅这个事务涉及到的全部Partition。
-
-
-
-### 实现机制
-
-Kafka事务需要确保跨会话多分区的写入保证原子性，实现机制重点如下：
-
-* 2PC 
-
-    核心思想是采用[两阶段提交2PC](https://zh.wikipedia.org/wiki/%E4%BA%8C%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4)来保证所有分区的一致性。Kafka Broker端引入TransactionCoordinator角色，
-作为事务协调者角色来管理事务，指示所有参与分区进行commit或abort。
-
-* TransactionCoordinator高可用
-
-    为应对一个事务的TransactionCoordinator突然宕机，Kafka将事务消息持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
-TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确保事务事务可恢复。
-
-* 跨会话
-
-    幂等性引入的PID机制会在Producer重启后更新为新的PID，无法确保Producer fail后事务继续正确执行，Kafka Producer引入TransactionId参数，**由用户通过txn.id配置**。Kafka保证具有相同TransactionId
-的新Producer被创建后，旧的Producer将不再工作(通过epoch实现)，且新的Producer实例可以保证任何未完成的事务要么被commit，要么被abort。
-
-* 事务状态
-
-    将事务从开始、进行到结束等每一个阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
-    
-    
-    
+* Consumer可能没有订阅这个事务涉及到的全部Partition。    
 
 ### 事务使用
 
@@ -627,6 +599,35 @@ while(true){
     }
 }
 ```
+
+
+### 实现机制
+
+Kafka事务需要确保跨会话多分区的写入保证原子性，实现机制重点如下：
+
+#### 2PC(TransactionCoordinator) 
+
+
+为保证多分区的原子写入，Kafka Broker端引入TransactionCoordinator角色，作为事务协调者角色来管理事务，指示所有参与分区进行commit或abort。核心思想是采用[两阶段提交2PC](https://zh.wikipedia.org/wiki/%E4%BA%8C%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4)来保证所有分区的一致性。
+
+
+ 
+ 
+#### TransactionCoordinator高可用(_transaction_state)
+
+为应对一个事务的TransactionCoordinator突然宕机，Kafka将事务消息持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
+TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确保事务事务可恢复。
+
+#### 跨会话(transactional.id)
+
+幂等性引入的PID机制会在Producer重启后更新为新的PID，无法确保Producer fail后事务继续正确执行，Kafka Producer引入TransactionId参数，**由用户通过txn.id配置**。Kafka保证具有相同TransactionId
+的新Producer被创建后，旧的Producer将不再工作(通过epoch实现)，且新的Producer实例可以保证任何未完成的事务要么被commit，要么被abort。
+
+#### 事务状态
+
+将事务从开始、进行到结束等每一个阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
+    
+    
 
 ### 执行流程
 
