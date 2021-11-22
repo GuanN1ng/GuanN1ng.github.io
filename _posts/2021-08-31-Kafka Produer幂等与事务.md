@@ -653,10 +653,10 @@ def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashC
 
 | 状态枚举 | 说明  |
 |----------|-------|
-| Empty   | Transaction has not existed yet <br> transition: received AddPartitionsToTxnRequest => Ongoing <br>             received AddOffsetsToTxnRequest => Ongoing  |
-| Ongoing    | Transaction has started and ongoing <br> transition: received EndTxnRequest with commit => PrepareCommit<br>            received EndTxnRequest with abort => PrepareAbort<br>            received AddPartitionsToTxnRequest => Ongoing<br>            received AddOffsetsToTxnRequest => Ongoing  |
-| PrepareCommit    | LPOP  |
-| PrepareAbort    | LPOP  |
+| Empty   | Transaction has not existed yet <br> transition: <br> received AddPartitionsToTxnRequest => Ongoing <br>             received AddOffsetsToTxnRequest => Ongoing  |
+| Ongoing    | Transaction has started and ongoing <br> transition:<br> received EndTxnRequest with commit => PrepareCommit<br>            received EndTxnRequest with abort => PrepareAbort<br>            received AddPartitionsToTxnRequest => Ongoing<br>            received AddOffsetsToTxnRequest => Ongoing  |
+| PrepareCommit    | Group is preparing to commit <br> transition: <br>received acks from all partitions => CompleteCommit |
+| PrepareAbort    | Group is preparing to abort <br> transition:<br> received acks from all partitions => CompleteAbort  |
 | CompleteCommit    | LPOP  |
 | CompleteAbort    | LPOP  |
 | Dead    | LPOP  |
