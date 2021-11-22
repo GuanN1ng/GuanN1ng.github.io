@@ -572,7 +572,7 @@ KafkaProducer<String, String> producer = new KafkaProducer<>(getProducerProps())
 KafkaConsumer<String, String> consumer = new KafkaConsumer<>(getConsumerProps());
 // 初始化事务
 producer.initTransactions();
-consumer.subscribe(Arrays.asList("consumer-tran"));
+consumer.subscribe(Arrays.asList("topic"));
 while(true){
     ConsumerRecords<String, String> records = consumer.poll(500);
     if(!records.isEmpty()){
@@ -605,28 +605,108 @@ while(true){
 
 Kafka事务需要确保跨会话多分区的写入保证原子性，实现机制重点如下：
 
-#### 2PC(TransactionCoordinator) 
-
-
-为保证多分区的原子写入，Kafka Broker端引入TransactionCoordinator角色，作为事务协调者角色来管理事务，指示所有参与分区进行commit或abort。核心思想是采用[两阶段提交2PC](https://zh.wikipedia.org/wiki/%E4%BA%8C%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4)来保证所有分区的一致性。
-
-
- 
- 
-#### TransactionCoordinator高可用(_transaction_state)
-
-为应对一个事务的TransactionCoordinator突然宕机，Kafka将事务消息持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
-TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确保事务事务可恢复。
-
 #### 跨会话(transactional.id)
 
-幂等性引入的PID机制会在Producer重启后更新为新的PID，无法确保Producer fail后事务继续正确执行，Kafka Producer引入TransactionId参数，**由用户通过txn.id配置**。Kafka保证具有相同TransactionId
+幂等性引入的PID机制会在Producer重启后更新为新的PID，无法确保Producer fail后事务继续正确执行，Kafka Producer引入TransactionId参数，**由用户通过transactional.id配置**。Kafka保证具有相同TransactionId
 的新Producer被创建后，旧的Producer将不再工作(通过epoch实现)，且新的Producer实例可以保证任何未完成的事务要么被commit，要么被abort。
+
+#### 2PC(TransactionCoordinator) 
+
+Kafka采用[两阶段提交2PC](https://zh.wikipedia.org/wiki/%E4%BA%8C%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4)的思想来保证所有分区的一致性，Broker端引入TransactionCoordinator，
+作为事务协调者角色来管理事务，指示所有参与事务的分区进行commit或abort。每个Kafka Server实例(Broker)启动时都会实例化一个TransactionCoordinator对象，定义如下：
+
+```
+class TransactionCoordinator(brokerId: Int,
+                             txnConfig: TransactionConfig,
+                             scheduler: Scheduler,
+                             createProducerIdGenerator: () => ProducerIdGenerator,  //PID管理
+                             txnManager: TransactionStateManager, // 事务状态管理
+                             txnMarkerChannelManager: TransactionMarkerChannelManager, //通知参与事务的分区事务终结
+                             time: Time,
+                             logContext: LogContext)
+
+```
+
+重要的属性有以下三个：
+
+* ProducerIdGenerator，负责PID的维护与生成；
+* TransactionStateManager，事务状态管理；
+* TransactionMarkerChannelManager，负责通知参与事务的分区leader事务结果。
+
+#### TransactionCoordinator高可用(_transaction_state)
+
+为防止TransactionCoordinator突然宕机，Kafka会将事务数据持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
+TransactionCoordinator在故障恢复时可从这个topic中读取数据，确保事务事务可恢复。
+
+Producer与TransactionCoordinator的对应关系通过`TransactionId`的hash与`_transaction_state`的分区数取模实现：
+
+```
+def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashCode) % transactionTopicPartitionCount
+```
+
+其中transactionTopicPartitionCount为主题`_transaction_state`的分区个数 ，可通过broker端参数transaction.state.log.num.partitions来配置，默认值为50。**获得的分区编号对应的分区Leader副本
+所在Broker实例中的TransactionCoordinator对象即为该Producer从属的TransactionCoordinator**。
+
 
 #### 事务状态
 
-将事务从开始、进行到结束等每一个阶段通过状态标识，若发生TransactionCoordinator重新选举，则新的TransactionCoordinator根据记录的事务状态进行恢复。
+
+| 状态枚举 | 说明  |
+|----------|-------|
+| Empty   | Transaction has not existed yet <br> transition: received AddPartitionsToTxnRequest => Ongoing <br>             received AddOffsetsToTxnRequest => Ongoing  |
+| Ongoing    | Transaction has started and ongoing <br> transition: received EndTxnRequest with commit => PrepareCommit<br>            received EndTxnRequest with abort => PrepareAbort<br>            received AddPartitionsToTxnRequest => Ongoing<br>            received AddOffsetsToTxnRequest => Ongoing  |
+| PrepareCommit    | LPOP  |
+| PrepareAbort    | LPOP  |
+| CompleteCommit    | LPOP  |
+| CompleteAbort    | LPOP  |
+| Dead    | LPOP  |
+| PrepareEpochFence    | LPOP  |
+
+```
+
+/**
+ * Transaction has not existed yet
+ *
+ * transition: received AddPartitionsToTxnRequest => Ongoing
+ *             received AddOffsetsToTxnRequest => Ongoing
+ */
+private[transaction] case object Empty extends TransactionState { val byte: Byte = 0  override def isExpirationAllowed: Boolean = true }
+
+/**
+ * Transaction has started and ongoing
+ *
+ * transition: received EndTxnRequest with commit => PrepareCommit
+ *             received EndTxnRequest with abort => PrepareAbort
+ *             received AddPartitionsToTxnRequest => Ongoing
+ *             received AddOffsetsToTxnRequest => Ongoing
+ */
+private[transaction] case object Ongoing extends TransactionState { val byte: Byte = 1 }
+
+
+// Group is preparing to commit
+// transition: received acks from all partitions => CompleteCommit
+private[transaction] case object PrepareCommit extends TransactionState { val byte: Byte = 2}
+
+// Group is preparing to abort
+// transition: received acks from all partitions => CompleteAbort
+private[transaction] case object PrepareAbort extends TransactionState { val byte: Byte = 3 }
+
+//Group has completed commit 
+//Will soon be removed from the ongoing transaction cache
+private[transaction] case object CompleteCommit extends TransactionState { val byte: Byte = 4 override def isExpirationAllowed: Boolean = true }
+
+//Group has completed abort .Will soon be removed from the ongoing transaction cache
+private[transaction] case object CompleteAbort extends TransactionState { val byte: Byte = 5  override def isExpirationAllowed: Boolean = true }
+
+//TransactionalId has expired and is about to be removed from the transaction cache
+private[transaction] case object Dead extends TransactionState { val byte: Byte = 6 }
+
+ //We are in the middle of bumping the epoch and fencing out older producers.
+private[transaction] case object PrepareEpochFence extends TransactionState { val byte: Byte = 7}
+
+```
     
+ 
     
 
 ### 执行流程
@@ -642,10 +722,6 @@ TransactionCoordinator在做故障恢复时从这个topic中恢复数据，确�
 TransactionCoordinator负责分配PID和事务管理，因此Producer发送事务消息时的第一步就是找出对应的TransactionCoordinator，Producer会向LeastLoadedNode(inflightRequests.size对应的Broker)发送FindCoordinatorRequest，
 Broker收到请求后，**根据transactionalId的哈希值计算主题_transaction_state中的分区编号，再找出分区Leader所在的Broker节点**，该Broker节点即为这个transactionalId对应的TransactionCoordinator节点。
 
-```
-def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashCode) % transactionTopicPartitionCount
-```
-其中transactionTopicPartitionCount为主题_transaction_state的分区个数 ，可通过broker端参数transaction.state.log.num.partitions来配置，默认值为50。
 
 #### Getting a producer Id -- the InitPidRequest
 
