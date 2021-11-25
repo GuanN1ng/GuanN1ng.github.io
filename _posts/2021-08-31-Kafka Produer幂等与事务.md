@@ -681,7 +681,7 @@ Client端事务状态定义(org.apache.kafka.clients.producer.internals.Transact
  
 #### ControlRecord
 
-在Kafka的事务实现中，**无论最终事务状态是Commit或Abort，事物执行期间发送的消息都会持久化到对应分区的消息日志**中，当事务结束时，会**将事务的最终结果以消息的形式也追加到消息日志**中。这个表征事务结果的
+在Kafka的事务实现中，**无论最终事务状态是Commit或Abort，事务执行期间发送的消息都会持久化到对应分区的消息日志**中，当事务结束时，会**将事务的最终结果以消息的形式也追加到消息日志**中。这个表征事务结果的
 消息就是ControlRecord，即控制消息，事务控制消息有两种类型：COMMIT和ABORT，分别表示事务成功提交和事务失败中止。
 
 ```
