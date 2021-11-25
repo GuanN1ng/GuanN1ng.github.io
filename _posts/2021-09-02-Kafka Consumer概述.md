@@ -117,9 +117,9 @@ public final class TopicPartition implements Serializable {
  ```
  final class Subscription {
      private final List<String> topics;  //消费者订阅的主题
-     // 用户自定义信息，可自行补充，用于计算分配，单需要实现顶层接口ConsumerPartitionAssignor
+     // 用户自定义信息，可自行补充，用于计算分配，需要实现顶层接口ConsumerPartitionAssignor
      private final ByteBuffer userData;  
-     private final List<TopicPartition> ownedPartitions; // 当前消费者已被分配的分区
+     private final List<TopicPartition> ownedPartitions; // 当前消费者可消费的分区
      private Optional<String> groupInstanceId; //组id
  }
  ```

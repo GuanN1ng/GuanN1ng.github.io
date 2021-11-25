@@ -16,7 +16,7 @@ Kafka多副本机制确保消息一旦提交成功写入日志文件，这条消
 
 Kafka为实现exactly once，引入了幂等和事务特性。
 
-## 幂等
+# 幂等
 
 Kafka引入**幂等特性来解决异常重试机制导致的消息重复问题**，开启幂等后，当发送同一条消息时，数据在Broker端只会被持久化一次，避免生产者重试导致的消息重复写入。通过将参数**enable.idempotence设置为true即可开启幂等**功能，
 此时retries参数默认为Integer.MAX_VALUE，acks默认为all，并确保max.in.flight.requests.per.connection(指定了Producer在收到Broker晌应之前单连接可以发送多少个Batch)不能大于5。
@@ -534,7 +534,7 @@ if (firstInFlightSequence != RecordBatch.NO_SEQUENCE && first.hasSequence()
 
 
 
-## 事务
+# 事务
 
 Kafka通过引入幂等实现了单会话单TopicPartition的Exactly-Once语义，但幂等无法提供跨多个TopicPartition和跨会话场景下的Exactly-Once保证,Kafka引入事务来弥补这个缺陷，
 **通过事务可以保证对多个分区写入操作的原子性**。
@@ -633,9 +633,9 @@ class TransactionCoordinator(brokerId: Int,
 * TransactionStateManager，事务状态管理；
 * TransactionMarkerChannelManager，负责通知参与事务的分区leader事务结果。
 
-#### TransactionCoordinator高可用(_transaction_state)
+#### 高可用(_transaction_state)
 
-为防止TransactionCoordinator突然宕机，Kafka会将事务数据持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务状态不丢失，
+为防止TransactionCoordinator突然宕机导致事务丢失，Kafka会将事务数据持久化到一个内部Topic **"_transaction_state"**内，通过消息的多副本机制，即**min.isr + acks**确保事务数据不丢失，
 TransactionCoordinator在故障恢复时可从这个topic中读取数据，确保事务事务可恢复。
 
 Producer与TransactionCoordinator的对应关系通过`TransactionId`的hash与`_transaction_state`的分区数取模实现：
@@ -645,242 +645,872 @@ def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashC
 ```
 
 其中transactionTopicPartitionCount为主题`_transaction_state`的分区个数 ，可通过broker端参数transaction.state.log.num.partitions来配置，默认值为50。**获得的分区编号对应的分区Leader副本
-所在Broker实例中的TransactionCoordinator对象即为该Producer从属的TransactionCoordinator**。
+所在Broker实例中的TransactionCoordinator对象即为该Producer从属的TransactionCoordinator**。当Leader副本宕机后，从follower副本中重新选举出的新的leader副本继续承担TransactionCoordinator角色
+确保事务的正常进行。
 
 
 #### 事务状态
 
+Server端事务状态定义(kafka.coordinator.transaction.TransactionState)：
 
 | 状态枚举 | 说明  |
 |----------|-------|
-| Empty   | Transaction has not existed yet <br> transition: <br> received AddPartitionsToTxnRequest => Ongoing <br>             received AddOffsetsToTxnRequest => Ongoing  |
-| Ongoing    | Transaction has started and ongoing <br> transition:<br> received EndTxnRequest with commit => PrepareCommit<br>            received EndTxnRequest with abort => PrepareAbort<br>            received AddPartitionsToTxnRequest => Ongoing<br>            received AddOffsetsToTxnRequest => Ongoing  |
-| PrepareCommit    | Group is preparing to commit <br> transition: <br>received acks from all partitions => CompleteCommit |
-| PrepareAbort    | Group is preparing to abort <br> transition:<br> received acks from all partitions => CompleteAbort  |
-| CompleteCommit    | LPOP  |
-| CompleteAbort    | LPOP  |
-| Dead    | LPOP  |
-| PrepareEpochFence    | LPOP  |
-
-```
-
-/**
- * Transaction has not existed yet
- *
- * transition: received AddPartitionsToTxnRequest => Ongoing
- *             received AddOffsetsToTxnRequest => Ongoing
- */
-private[transaction] case object Empty extends TransactionState { val byte: Byte = 0  override def isExpirationAllowed: Boolean = true }
-
-/**
- * Transaction has started and ongoing
- *
- * transition: received EndTxnRequest with commit => PrepareCommit
- *             received EndTxnRequest with abort => PrepareAbort
- *             received AddPartitionsToTxnRequest => Ongoing
- *             received AddOffsetsToTxnRequest => Ongoing
- */
-private[transaction] case object Ongoing extends TransactionState { val byte: Byte = 1 }
+| Empty   | Producer刚完成事务初始化，还未进行事务消息发送 <br> 转移条件: <br> received AddPartitionsToTxnRequest => Ongoing <br>             received AddOffsetsToTxnRequest => Ongoing  |
+| Ongoing    | 正在进行事务消息的发送 <br> 转移条件:<br> received EndTxnRequest with commit => PrepareCommit<br>            received EndTxnRequest with abort => PrepareAbort<br>            received AddPartitionsToTxnRequest => Ongoing<br>            received AddOffsetsToTxnRequest => Ongoing  |
+| PrepareCommit    | Producer发起 <br> 转移条件: <br>received acks from all partitions => CompleteCommit |
+| PrepareAbort    | Group is preparing to abort <br> 转移条件:<br> received acks from all partitions => CompleteAbort  |
+| CompleteCommit    | Group has completed commit <br>  Will soon be removed from the ongoing transaction cache |
+| CompleteAbort    | Group has completed abort <br> Will soon be removed from the ongoing transaction cache|
+| Dead    | TransactionalId has expired and is about to be removed from the transaction cache  |
+| PrepareEpochFence    | We are in the middle of bumping the epoch and fencing out older producers.  |
 
 
-// Group is preparing to commit
-// transition: received acks from all partitions => CompleteCommit
-private[transaction] case object PrepareCommit extends TransactionState { val byte: Byte = 2}
+Client端事务状态定义(org.apache.kafka.clients.producer.internals.TransactionManager.State)：
 
-// Group is preparing to abort
-// transition: received acks from all partitions => CompleteAbort
-private[transaction] case object PrepareAbort extends TransactionState { val byte: Byte = 3 }
-
-//Group has completed commit 
-//Will soon be removed from the ongoing transaction cache
-private[transaction] case object CompleteCommit extends TransactionState { val byte: Byte = 4 override def isExpirationAllowed: Boolean = true }
-
-//Group has completed abort .Will soon be removed from the ongoing transaction cache
-private[transaction] case object CompleteAbort extends TransactionState { val byte: Byte = 5  override def isExpirationAllowed: Boolean = true }
-
-//TransactionalId has expired and is about to be removed from the transaction cache
-private[transaction] case object Dead extends TransactionState { val byte: Byte = 6 }
-
- //We are in the middle of bumping the epoch and fencing out older producers.
-private[transaction] case object PrepareEpochFence extends TransactionState { val byte: Byte = 7}
-
-```
-    
+| 状态枚举 | 说明  |
+|----------|-------|
+| UNINITIALIZED   |  未开始事务 |
+| INITIALIZING    | Producer调用initTransactions()方法初始化事务相关的内容  |
+| READY    | Producer收到来自TransactionCoordinator的InitProducerIdResponse后，其状态会置为READY（对于已有的事务而言，是当前事务完成后Producer的状态会转移为 READY) |
+| IN_TRANSACTION    |  Producer调用beginTransaction()方法，状态置为IN_TRANSACTION |
+| COMMITTING_TRANSACTION    | Producer调用commitTransaction()，状态置为COMMITTING_TRANSACTION |
+| ABORTING_TRANSACTION    | Producer调用abortTransaction()，状态置为ABORTING_TRANSACTION |
+| ABORTABLE_ERROR    |  消息发送异常，本地事务状态置为ABORTABLE_ERROR，之后进行Abort操作 |
+| FATAL_ERROR    | 无法修复的异常，事务可由任一状态转移至FATAL_ERROR，且无法再转移至其它任一状态。Producer只能关闭或生产非事务消息  | 
  
+ 
+#### ControlBatch 
+
+
+
+在Kafka的事务实现中，即使事务Abort，也不会对已写入各分区的消息日志进行删除(**避免频繁的无序的磁盘读写**)，而是通过在消息日志中追加ControlBatch标识事务的终结及结果。
+
+TransactionCoordinator收到Producer结束事务(commit或abort)的请求EndTxnRequest后，会发送WriteTxnMarkersRequest给所有参与事务的分区leader所在Broker，告知事务最终状态（commit或abort），收到这个请求后，
     
 
 ### 执行流程
 
-流程图如下：
-
-![Kafka Transaction](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/kafka%20transaction.png)
-
-官网详解可见[Exactly Once Delivery and Transactional Messaging](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging#KIP98ExactlyOnceDeliveryandTransactionalMessaging-DataFlow)
-
-#### Finding a transaction coordinator -- the FindCoordinatorRequest
-
-TransactionCoordinator负责分配PID和事务管理，因此Producer发送事务消息时的第一步就是找出对应的TransactionCoordinator，Producer会向LeastLoadedNode(inflightRequests.size对应的Broker)发送FindCoordinatorRequest，
-Broker收到请求后，**根据transactionalId的哈希值计算主题_transaction_state中的分区编号，再找出分区Leader所在的Broker节点**，该Broker节点即为这个transactionalId对应的TransactionCoordinator节点。
-
-
-#### Getting a producer Id -- the InitPidRequest
-
-找到TransactionCoordinator后，当前Producer就可以向TransactionCoordinator发送InitPidRequest获取PID（只开启幂等未开启事务的Producer,可以向任意Broker节点发送请求），PID的分配同幂等部分处理，
-事务相关的TransactionCoordinator处理流程如下：
-
-* 1.判断transactionId是否有对应的事务状态，如果没有，初始化其事务meta信息 TransactionMetadata（会给其分配一个PID，初始的epoch为-1），如果有事务状态，获取之前的状态；
+KafkaProducer开启事务调用的第一个API是initTransactions()方法，作用是从TransactionCoordinator获取ProducerId、Epoch，完成事务初始化。
 
 ```
-val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).flatMap {
-        case None =>
-          val producerId = producerIdManager.generateProducerId()
-          val createdMetadata = new TransactionMetadata(...）
-          txnManager.putTransactionStateIfNotExists(createdMetadata)
-        case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
-}
-```
-* 2.若之前存在事务状态信息，校验其TransactionMetadata的状态信息，进行事务恢复:
-    见kafka.coordinator.transaction.TransactionCoordinator#prepareInitProducerIdTransit
-```
-txnMetadata.state match {
-    case PrepareAbort | PrepareCommit =>
-      Left(Errors.CONCURRENT_TRANSACTIONS)
-    case CompleteAbort | CompleteCommit | Empty =>
-      val transitMetadataResult =
-        // If the epoch is exhausted and the expected epoch (if provided) matches it, generate a new producer ID
-        if (txnMetadata.isProducerEpochExhausted &&
-            expectedProducerIdAndEpoch.forall(_.epoch == txnMetadata.producerEpoch)) {
-          val newProducerId = producerIdManager.generateProducerId()
-          Right(txnMetadata.prepareProducerIdRotation(newProducerId, transactionTimeoutMs, time.milliseconds(),
-            expectedProducerIdAndEpoch.isDefined))
-        } else {
-          txnMetadata.prepareIncrementProducerEpoch(transactionTimeoutMs, expectedProducerIdAndEpoch.map(_.epoch),
-            time.milliseconds())
-        }
-      transitMetadataResult match {
-        case Right(transitMetadata) => Right((coordinatorEpoch, transitMetadata))
-        case Left(err) => Left(err)
-      }
-    case Ongoing =>
-      // indicate to abort the current ongoing txn first. Note that this epoch is never returned to the
-      // user. We will abort the ongoing transaction and return CONCURRENT_TRANSACTIONS to the client.
-      // This forces the client to retry, which will ensure that the epoch is bumped a second time. In
-      // particular, if fencing the current producer exhausts the available epochs for the current producerId,
-      // then when the client retries, we will generate a new producerId.
-      Right(coordinatorEpoch, txnMetadata.prepareFenceProducerEpoch())
-
-    case Dead | PrepareEpochFence =>
-      val errorMsg = s"Found transactionalId $transactionalId with state ${txnMetadata.state}. " +
-        s"This is illegal as we should never have transitioned to this state."
-      fatal(errorMsg)
-      throw new IllegalStateException(errorMsg)
-}
-```
-
-* 3.将transactionId与相应的TransactionMetadata持久化到事务日志中，对于新的transactionId，这个持久化的数据主要是保存transactionId与PID关系信息
-
-#### Starting a Transaction – The beginTransaction() API
-
-调用org.apache.kafka.clients.producer.KafkaProducer#beginTransaction即可，Producer端将本地事务状态标记为INITIALIZING状态，表明开启一个事务。
-
-#### The consume-transform-produce loop
-
-这个阶段囊括了整个事务的数据处理过程，如拉取数据，处理业务，写入下游等过程。
-
-具体实现可分为以下几步：
-
-##### AddPartitionsToTxnRequest
-
-当Producer向一个TopicPartition发送数据前，需要先向TransactionCoordinator发送AddPartitionsToTxnRequest请求，TransactionCoordinator会将这个TopicPartition更新
-到TransactionId对应的TransactionMetadata中，并将<transactionId, TopicPartition>的对应关系存储在主题_transaction_state中。
-
-如果该分区是对应事务中的第一个分区， 那么此时TransactionCoordinator还会启动对该事务的计时。
-
-##### ProduceRequest
-
-生产者通过ProduceRequest请求发送消息到用户自定义主题中， 这一点和发送普通消息时相同，和普通的消息不同的是， 事务消息内的ProducerBatch中会包含实质的PID、 producerEpoch和sequence number参数。源码详见
-org.apache.kafka.clients.producer.internals.RecordAccumulator#drainBatchesForOneNode，Sender方法获取消息批次时完成事务参数设置。
-
-```
-// org.apache.kafka.clients.producer.internals.ProducerBatch#setProducerState
-public void setProducerState(ProducerIdAndEpoch producerIdAndEpoch, int baseSequence, boolean isTransactional) {
-    recordsBuilder.setProducerState(producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, baseSequence, isTransactional);
-}
-```
-
-##### AddOffsetsToTxnRequest
-
-调用`sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets,ConsumerGroupMetadata groupMetadata)`方法可以在一个事务批次里处理consume-transform-produce，这个方法会向TransactionCoordinator发送
-AddOffsetsToTxnRequest请求，将group对应的_consumer_offsets的Partition（与写入涉及的TopicPartition一样）保存到事务对应的meta中，并持久化到主题_transaction_state中。
-
-```
-public void sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets,
-                                         ConsumerGroupMetadata groupMetadata) throws ProducerFencedException {
-    throwIfInvalidGroupMetadata(groupMetadata);
+public void initTransactions() {
     throwIfNoTransactionManager();
     throwIfProducerClosed();
-    TransactionalRequestResult result = transactionManager.sendOffsetsToTransaction(offsets, groupMetadata);
+    //进行初始化
+    TransactionalRequestResult result = transactionManager.initializeTransactions();
+    唤醒Sender
     sender.wakeup();
     result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
 }
 ```
 
-##### TxnOffsetsCommitRequest
+TransactionManager#initializeTransactions()方法的作用是构建InitProducerIdRequest，并将请求加入待发送队列，而后由Sender进行发送。
 
-Producer在收到TransactionCoordinator关于AddOffsetsToTxnRequest请求的结果后，后再次发送TxnOffsetsCommitRequest请求给对应的GroupCoordinator，从而将本次事务
-中包含的消费位移信息offsets存储到主题_consumer_offsets中。
+```
+public synchronized TransactionalRequestResult initializeTransactions() {
+    return initializeTransactions(ProducerIdAndEpoch.NONE);
+}
 
-#### Committing or Aborting a Transaction
+synchronized TransactionalRequestResult initializeTransactions(ProducerIdAndEpoch producerIdAndEpoch) {
+    boolean isEpochBump = producerIdAndEpoch != ProducerIdAndEpoch.NONE;
+    return handleCachedTransactionRequestResult(() -> {
+        if (!isEpochBump) {
+            transitionTo(State.INITIALIZING); //本地事务状态更新为INITIALIZING
+            log.info("Invoking InitProducerId for the first time in order to acquire a producer ID");
+        } else {
+            log.info("Invoking InitProducerId with current producer ID and epoch {} in order to bump the epoch", producerIdAndEpoch);
+        }
+        InitProducerIdRequestData requestData = new InitProducerIdRequestData().setTransactionalId(transactionalId).setTransactionTimeoutMs(transactionTimeoutMs).setProducerId(producerIdAndEpoch.producerId).setProducerEpoch(producerIdAndEpoch.epoch);
+        //响应处理器，更新本地ProducerId 和 Epoch
+        InitProducerIdHandler handler = new InitProducerIdHandler(new InitProducerIdRequest.Builder(requestData),isEpochBump);
+        //加入待发送队列
+        enqueueRequest(handler);
+        return handler.result;
+    }, State.INITIALIZING);
+}
+```
+
+幂等部分的内容已经分析过，Sender#runOnce()方法会调用`maybeSendAndPollTransactionalRequest()`方法先将事务相关的请求发送，实现如下：
+
+```
+private boolean maybeSendAndPollTransactionalRequest() {
+    ... //省略其余源码
+    //从队列中获取请求
+    TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.nextRequest(accumulator.hasIncomplete());
+    if (nextRequestHandler == null)
+        return false;
+    AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
+    Node targetNode = null;
+    try {
+        FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
+        //事务请求 coordinatorType == FindCoordinatorRequest.CoordinatorType.TRANSACTION
+        targetNode = coordinatorType != null ? transactionManager.coordinator(coordinatorType) : client.leastLoadedNode(time.milliseconds());
+        if (targetNode != null) {
+            ...// 第一次初始化 transactionCoordinator == null
+        } else if (coordinatorType != null) {
+            //查找对应的transactionCoordinator
+            maybeFindCoordinatorAndRetry(nextRequestHandler);
+            return true;
+        } else {
+        ... //请求发送 省略
+    } catch (IOException e) {
+        maybeFindCoordinatorAndRetry(nextRequestHandler);
+        return true;
+    }
+}
+```
+当发送事务消息时，目标节点为对应的TransactionCoordinator所在节点，此时，事务执行的第一步转化为对`TransactionCoordinator`的获取，入口方法为maybeFindCoordinatorAndRetry()。
+
+#### FindCoordinatorRequest
+
+TransactionCoordinator负责分配PID和事务管理，因此KafkaProducer完成事务初始化的第一步就是找出对应的TransactionCoordinator。Producer通过发送构建FindCoordinatorRequest请求获取对应的TransactionCoordinator节点。
+请求发送源码如下：
+
+```
+private void maybeFindCoordinatorAndRetry(TransactionManager.TxnRequestHandler nextRequestHandler) {
+    if (nextRequestHandler.needsCoordinator()) {
+        //事务消息，需要获取TransactionCoordinator
+        transactionManager.lookupCoordinator(nextRequestHandler);
+    } else {
+        time.sleep(retryBackoffMs);
+        metadata.requestUpdate();
+    }
+    //获取到对应的TransactionCoordinator后，重试未发送InitProducerIdRequest
+    transactionManager.retry(nextRequestHandler);
+}
+
+private void lookupCoordinator(FindCoordinatorRequest.CoordinatorType type, String coordinatorKey) {
+    switch (type) {
+        case GROUP:
+            //消费者组相关，后续介绍
+            consumerGroupCoordinator = null; break;
+        case TRANSACTION:
+            transactionCoordinator = null; break;
+        default:
+            throw new IllegalStateException("Invalid coordinator type: " + type);
+    }
+    //构建FindCoordinatorRequest，加入待发送队列，由sender线程发送
+    FindCoordinatorRequest.Builder builder = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData().setKeyType(type.id()).setKey(coordinatorKey));
+    enqueueRequest(new FindCoordinatorHandler(builder));
+}
+```
+
+Broker端收到FindCoordinatorRequest请求后，由KafkaApis#handleFindCoordinatorRequest()方法进行处理：
+
+```
+  def handleFindCoordinatorRequest(request: RequestChannel.Request): Unit = {
+    val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+    ...//验证
+    val (partition, internalTopicName) = CoordinatorType.forId(findCoordinatorRequest.data.keyType) match {
+      case CoordinatorType.GROUP =>
+         (groupCoordinator.partitionFor(findCoordinatorRequest.data.key), GROUP_METADATA_TOPIC_NAME)
+      case CoordinatorType.TRANSACTION =>
+         //根据transactionId获取对应分区   Utils.abs(transactionalId.hashCode) % transactionTopicPartitionCount
+         (txnCoordinator.partitionFor(findCoordinatorRequest.data.key), TRANSACTION_STATE_TOPIC_NAME)
+      //获取内部主题_transaction_state的元数据
+      val topicMetadata = metadataCache.getTopicMetadata(Set(internalTopicName), request.context.listenerName)
+
+      ...// createFindCoordinatorResponse()定义
+
+      if (topicMetadata.headOption.isEmpty) {
+        //元数据为空
+        val controllerMutationQuota = quotas.controllerMutation.newPermissiveQuotaFor(request)
+        //自动创建_transaction_state 内部主题，
+        autoTopicCreationManager.createTopics(Seq(internalTopicName).toSet, controllerMutationQuota)
+        //返回Errors.COORDINATOR_NOT_AVAILABLE ，Producer进行重试
+        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs => createFindCoordinatorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode, requestThrottleMs))
+      } else {
+        //存在元数据
+        def createResponse(requestThrottleMs: Int): AbstractResponse = {
+          val responseBody = if (topicMetadata.head.errorCode != Errors.NONE.code) {
+            createFindCoordinatorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode, requestThrottleMs)
+          } else {
+            val coordinatorEndpoint = topicMetadata.head.partitions.asScala
+              //获取目标分区的leader副本所在节点返回
+              .find(_.partitionIndex == partition)
+              .filter(_.leaderId != MetadataResponse.NO_LEADER_ID)
+              .flatMap(metadata => metadataCache.getAliveBroker(metadata.leaderId))
+              .flatMap(_.endpoints.get(request.context.listenerName.value()))
+              .filterNot(_.isEmpty)
+            coordinatorEndpoint match {
+              case Some(endpoint) =>
+                //返回目标节点
+                createFindCoordinatorResponse(Errors.NONE, endpoint, requestThrottleMs)
+              case _ =>
+                createFindCoordinatorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode, requestThrottleMs)
+            }
+          }
+          responseBody
+        }
+        requestHelper.sendResponseMaybeThrottle(request, createResponse)
+      }
+    }
+  }
+
+```
+
+Broker收到请求后，**根据transactionalId的哈希值与主题_transaction_state的分区数取模获取分区编号，若_transaction_state不存在，则先进行主题的创建，若存在则找出分区Leader副本所在的Broker节点并返回**，
+该Broker节点即为这个transactionalId对应的TransactionCoordinator节点。
+
+#### InitProducerIdRequest
+
+找到TransactionCoordinator后，Producer即可向TransactionCoordinator发送InitProducerIdRequest获取PID。Broker端处理请求的是TransactionCoordinator#handleInitProducerId()方法，实现如下：
+
+```
+  def handleInitProducerId(transactionalId: String, transactionTimeoutMs: Int, expectedProducerIdAndEpoch: Option[ProducerIdAndEpoch], responseCallback: InitProducerIdCallback): Unit = {
+
+    if (transactionalId == null) {
+      //幂等PID生成
+      val producerId = producerIdGenerator.generateProducerId()
+      responseCallback(InitProducerIdResult(producerId, producerEpoch = 0, Errors.NONE))
+    } else if (transactionalId.isEmpty) {
+      responseCallback(initTransactionError(Errors.INVALID_REQUEST))
+    } else if (!txnManager.validateTransactionTimeoutMs(transactionTimeoutMs)) {
+      responseCallback(initTransactionError(Errors.INVALID_TRANSACTION_TIMEOUT))
+    } else {
+      //获取transactionalId的事务元数据TransactionMetadata
+      val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).flatMap {
+        case None =>
+          //Broker本地缓存中不存在transactionalId对应的TransactionMetadata,创建一个新的并放入缓存
+          val producerId = producerIdGenerator.generateProducerId()
+          val createdMetadata = new TransactionMetadata(...)
+          txnManager.putTransactionStateIfNotExists(createdMetadata)
+          //否则直接从本地缓存中取出
+        case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
+      }
+
+      val result: ApiResult[(Int, TxnTransitMetadata)] = coordinatorEpochAndMetadata.flatMap {
+        existingEpochAndMetadata =>
+          val coordinatorEpoch = existingEpochAndMetadata.coordinatorEpoch
+          val txnMetadata = existingEpochAndMetadata.transactionMetadata
+          txnMetadata.inLock {
+            //校验事务元数据，以及该transactionId对应的事务状态
+            prepareInitProducerIdTransit(transactionalId, transactionTimeoutMs, coordinatorEpoch, txnMetadata,expectedProducerIdAndEpoch)
+          }
+      }
+      //根据返回结果构建响应
+      result match {
+        case Left(error) =>
+          //异常
+          responseCallback(initTransactionError(error))
+        case Right((coordinatorEpoch, newMetadata)) =>
+          if (newMetadata.txnState == PrepareEpochFence) {
+            //元数据中事务状态为PrepareEpochFence
+            def sendRetriableErrorCallback(error: Errors): Unit = {
+              if (error != Errors.NONE) {
+                responseCallback(initTransactionError(error))
+              } else {
+                responseCallback(initTransactionError(Errors.CONCURRENT_TRANSACTIONS))
+              }
+            }
+            //abort未完成的事务
+            endTransaction(transactionalId, newMetadata.producerId, newMetadata.producerEpoch, TransactionResult.ABORT, isFromClient = false, sendRetriableErrorCallback)
+          } else {
+            def sendPidResponseCallback(error: Errors): Unit = {
+              if (error == Errors.NONE) {
+                //不存在异常，正常返回
+                responseCallback(initTransactionMetadata(newMetadata))
+              } else {
+                responseCallback(initTransactionError(error))
+              }
+            }
+            //将transactionalId与最新的TransactionMetadata持久化到事务日志中，主要目的是保存<transactionId,pid>的关系信息
+            txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendPidResponseCallback)
+          }
+      }
+    }
+  }
+```
+
+prepareInitProducerIdTransit()源码如下：
+
+```
+  private def prepareInitProducerIdTransit(transactionalId: String,transactionTimeoutMs: Int,coordinatorEpoch: Int,txnMetadata: TransactionMetadata,expectedProducerIdAndEpoch: Option[ProducerIdAndEpoch]): ApiResult[(Int, TxnTransitMetadata)] = {
+
+    def isValidProducerId(producerIdAndEpoch: ProducerIdAndEpoch): Boolean = {
+      txnMetadata.producerEpoch == RecordBatch.NO_PRODUCER_EPOCH ||producerIdAndEpoch.producerId == txnMetadata.producerId ||
+        (producerIdAndEpoch.producerId == txnMetadata.lastProducerId && TransactionMetadata.isEpochExhausted(producerIdAndEpoch.epoch))
+    }
+    //正在进行事务状态转换
+    if (txnMetadata.pendingTransitionInProgress) {
+      // return a retriable exception to let the client backoff and retry
+      Left(Errors.CONCURRENT_TRANSACTIONS)
+    }
+    else if (!expectedProducerIdAndEpoch.forall(isValidProducerId)) {
+      Left(Errors.PRODUCER_FENCED)
+    } else {
+      txnMetadata.state match {
+        //上一个事务正在提交或终止，返回 Errors.CONCURRENT_TRANSACTIONS，让producer后续重试
+        case PrepareAbort | PrepareCommit =>
+          Left(Errors.CONCURRENT_TRANSACTIONS)
+        //上一个事务已完结或不存在事务
+        case CompleteAbort | CompleteCommit | Empty =>
+          val transitMetadataResult =
+            if (txnMetadata.isProducerEpochExhausted && expectedProducerIdAndEpoch.forall(_.epoch == txnMetadata.producerEpoch)) {
+              epoch为short类型，耗尽后，重新申请新的PID epoch从0开始递增
+              val newProducerId = producerIdGenerator.generateProducerId()
+              Right(txnMetadata.prepareProducerIdRotation(newProducerId, transactionTimeoutMs, time.milliseconds(),expectedProducerIdAndEpoch.isDefined))
+            } else {
+              //否则根据沿用同一个producerId，但epoch自增1
+              txnMetadata.prepareIncrementProducerEpoch(transactionTimeoutMs, expectedProducerIdAndEpoch.map(_.epoch),time.milliseconds())
+            }
+          transitMetadataResult match {
+            case Right(transitMetadata) => Right((coordinatorEpoch, transitMetadata))
+            case Left(err) => Left(err)
+          }
+        //上一个事务正在进行，赋值pendingState，后续进行事务abort
+        case Ongoing =>
+          Right(coordinatorEpoch, txnMetadata.prepareFenceProducerEpoch())
+        //异常，无法继续进行事务，抛出异常
+        case Dead | PrepareEpochFence =>
+          fatal(errorMsg)
+          throw new IllegalStateException(errorMsg)
+      }
+    }
+  }
+```
+Broker端的处理流程可概括为：
+
+* 1、获取transactionalId对应的事务元数据TransactionMetadata，若不存在，完成PID的申请，创建新的TransactionMetadata并放入缓存；**若存在则直接返回，说明配置该transactionId的Producer发生了重启，才会再次申请PID**；
+* 2、对TransactionMetadata进行校验，若存在事务状态，需要根据其事务状态TransactionState进行相应的事务恢复操作：
+    * `PrepareAbort | PrepareCommit`，Producer崩溃时，上一个事务未完成，TransactionCoordinator正在等待所有参与事务的分区全部返回响应，将Errors.CONCURRENT_TRANSACTIONS异常返回Producer，让其进行重试；
+    * `CompleteAbort | CompleteCommit | Empty`，将事务状态置为Empty(CompleteAbort或CompleteCommit时),判断ProducerEpoch是否达到**Short.MAX_VALUE**，若达到，则**需重新申请PID，epoch恢复为0，否则epoch自增**；
+    * `Ongoing`，Producer崩溃时，上一个事务正在进行中，事务状态转移为PrepareEpochFence，并中止(Abort)当前事务，返回客户端Errors.CONCURRENT_TRANSACTIONS，让其重试；
+    * `Dead | PrepareEpochFence`，返回FATAL_ERROR，Producer无法再进行事务请求。
+* 3、将结果<transactionId,PID>持久化到事务日志中。
+
+KafkaProducer收到到响应后，会更新ProducerIdAndEpoch对象，至此，Producer端的事务状态由INITIALIZING转为READY，事务初始化完成。
+
+#### BeginTransaction
+
+KafkaProducer#beginTransaction()方法无需与TransactionCoordinator进行交互，只是将本地事务状态由READY转为INITIALIZING，表明本地开启一个事务。
+
+```
+public synchronized void beginTransaction() {
+    ensureTransactional();
+    maybeFailWithError();
+    transitionTo(State.IN_TRANSACTION); READY => IN_TRANSACTION
+}
+```
+
+#### Send
+
+开启事务后，即可调用KafkaProducer#send进行事务消息的发送，具体实现可分为以下几步：
+
+##### AddPartitionsToTxnRequest
+
+KafkaProducer调用doSend()向一个TopicPartition发送事务消息前，需要先向TransactionCoordinator发送AddPartitionsToTxnRequest请求，通知TransactionCoordinator此分区将会参与本次事务。
+doSend()方法中，消息追加入RecordAccumulator后，会调用`maybeAddPartitionToTransaction()`方法添加分区，doSend()的详细分析请见[Kafka Producer 概述](https://guann1ng.github.io/kafka/2021/08/03/Kafka-Producer-%E6%A6%82%E8%BF%B0/)。
+
+```
+private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback callback) {
+    TopicPartition tp = null;
+    try {
+        ...//消息处理流程
+        
+        //RecordAccumulator消息追加
+        RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,serializedValue, headers, interceptCallback, remainingWaitMs, true, nowMs);
+        if (transactionManager != null && transactionManager.isTransactional())
+            //事务消息，添加分区
+            transactionManager.maybeAddPartitionToTransaction(tp);
+
+        if (result.batchIsFull || result.newBatchCreated) {
+            //唤醒Sender
+            this.sender.wakeup();
+        }
+        return result.future;
+    } catch (){
+    ...//省略异常处理
+    }
+}
+
+```
+
+maybeAddPartitionToTransaction()方法实现如下，会将新的TopicPartition添加到newPartitionsInTransaction中，后续由Sender线程将newPartitionsInTransaction中
+的Tp发送至TransactionCoordinator.
+
+```
+public synchronized void maybeAddPartitionToTransaction(TopicPartition topicPartition) {
+    if (isPartitionAdded(topicPartition) || isPartitionPendingAdd(topicPartition))
+        //已添加过
+        return;
+    topicPartitionBookkeeper.addPartition(topicPartition);
+    //添加入待同步List
+    newPartitionsInTransaction.add(topicPartition);
+}
+```
+Sender线程每次调用runOnce()发送事务消息前，都会判断newPartitionsInTransaction中是否有待发送的分区，若有则构建AddPartitionsToTxnRequest优先发送。
+
+```
+synchronized TxnRequestHandler nextRequest(boolean hasIncompleteBatches) {
+    if (!newPartitionsInTransaction.isEmpty())
+        enqueueRequest(addPartitionsToTransactionHandler());
+    ... // 其他事务消息    
+}
+
+private TxnRequestHandler addPartitionsToTransactionHandler() {
+    pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
+    newPartitionsInTransaction.clear();
+    AddPartitionsToTxnRequest.Builder builder = new AddPartitionsToTxnRequest.Builder(transactionalId, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, new ArrayList<>(pendingPartitionsInTransaction));
+    return new AddPartitionsToTxnHandler(builder);
+}
+```
+
+TransactionCoordinator收到请求后，会将TopicPartitionList更新到TransactionId对应的TransactionMetadata中，并将新的metadata持久化到_transaction_state对应分区的事务日志中，具体实现在
+`TransactionCoordinator#handleAddPartitionsToTransaction()`方法中。
+
+
+##### ProduceRequest
+
+ProduceRequest请求的发送和普通消息相同，但在消息内容上，事务消息的ProducerBatch中会包PID、producerEpoch和sequence number参数。Sender线程从RecordAccumulator中拉取消息时完成设置，源码详见
+RecordAccumulator#drainBatchesForOneNode。
+
+##### AddOffsetsToTxnRequest & TxnOffsetsCommitRequest
+
+`sendOffsetsToTransaction()`方法**主要用于consume-transform-produce loop模式中**，用于保存当前消费进度，主要分2步：
+
+* 1、AddOffsetsToTxnRequest
+       
+    `sendOffsetsToTransaction()`方法会向TransactionCoordinator发送AddOffsetsToTxnRequest请求，将groupId所属GroupCoordinator分区更新到事务对应的meta中，
+    并持久化到主题_transaction_state中。
+   
+* 2、TxnOffsetsCommitRequest
+    
+    Producer在收到TransactionCoordinator关于AddOffsetsToTxnRequest请求的结果后，后再次发送TxnOffsetsCommitRequest请求给对应的GroupCoordinator，从而将本次事务
+    中包含的消费位移信息offsets存储到主题_consumer_offsets中。
+    
+
+示意图如下：
+
+![sendOffsetsToTransaction](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/sendOffsetsToTransaction.png)
+
+#### Committing or Aborting
 
 上述事务流程处理完成后，Producer需要调用commitTransaction()或者abortTransaction()方法来commit或者abort这个事务操作。
 
+* commitTransaction()
+
+```
+//KafkaProducer#commitTransaction
+public void commitTransaction() throws ProducerFencedException {
+    throwIfNoTransactionManager();
+    throwIfProducerClosed();
+    TransactionalRequestResult result = transactionManager.beginCommit();
+    sender.wakeup();
+    result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+}
+
+//TransactionManager#beginCommit
+public synchronized TransactionalRequestResult beginCommit() {
+    return handleCachedTransactionRequestResult(() -> {
+        maybeFailWithError();
+        transitionTo(State.COMMITTING_TRANSACTION); //IN_TRANSACTION => COMMITTING_TRANSACTION
+        return beginCompletingTransaction(TransactionResult.COMMIT);
+    }, State.COMMITTING_TRANSACTION);
+}
+```
+
+* abortTransaction()
+
+```
+//KafkaProducer#abortTransaction
+public void abortTransaction() throws ProducerFencedException {
+    throwIfNoTransactionManager();
+    throwIfProducerClosed();
+    TransactionalRequestResult result = transactionManager.beginAbort();
+    sender.wakeup();
+    result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+}
+
+//TransactionManager#beginAbort
+public synchronized TransactionalRequestResult beginAbort() {
+    return handleCachedTransactionRequestResult(() -> {
+        if (currentState != State.ABORTABLE_ERROR) maybeFailWithError();
+        transitionTo(State.ABORTING_TRANSACTION); //IN_TRANSACTION => ABORTING_TRANSACTION
+        newPartitionsInTransaction.clear(); //清理待发送的分区
+        return beginCompletingTransaction(TransactionResult.ABORT);
+    }, State.ABORTING_TRANSACTION);
+}
+```
+
+上述两个方法完成本地事务状态修改后，均调用了TransactionManager#beginCompletingTransaction()方法进行最后的事务操作。
+
 ##### EndTxnRequest
 
-无论调用commitTransaction()方法还是abortTransaction()方法，Producer都会向Transaction Coordinator发送EndTxnRequest请求，以此来通知它提交(Commit)事务还是中止(Abort)事务。
+###### SendEndTxnRequest
 
-TransactionCoordinator在收到EndTxnRequest请求后会执行如下操作:
+beginCompletingTransaction()方法的作用是向TransactionCoordinator发送EndTxnRequest请求，以此来通知它提交(Commit)事务还是中止(Abort)事务。实现如下：
 
-* 更新事务meta信息，进行事务状态转移，将PREPARE_COMMIT或PREPARE_ABORT消息写入主题_transaction_state;
-* 根据事务meta信息，向事务涉及到的所有TopicPartition的leader发送WriteTxnMarkerRequest请求，将COMMIT或ABORT信息写入用户所使用的普通主题和_consumer_offsets;
-* 完成事务，将COMPLETE_COMMIT或COMPLETE_ABORT信息写入内部主题_transaction_state
+```
+private TransactionalRequestResult beginCompletingTransaction(TransactionResult transactionResult) {
+    if (!newPartitionsInTransaction.isEmpty())
+        //最后判断是否需要发送AddPartitionsToTxnRequest
+        enqueueRequest(addPartitionsToTransactionHandler());
+    if (!(lastError instanceof InvalidPidMappingException)) {
+        //发送EndTxnRequest
+        EndTxnRequest.Builder builder = new EndTxnRequest.Builder(new EndTxnRequestData().setTransactionalId(transactionalId).setProducerId(producerIdAndEpoch.producerId).setProducerEpoch(producerIdAndEpoch.epoch).setCommitted(transactionResult.id));
+        EndTxnHandler handler = new EndTxnHandler(builder);
+        //加入待发送队列，由Sender发送
+        enqueueRequest(handler);
+        if (!epochBumpRequired) {
+            return handler.result;
+        }
+    }
+    return initializeTransactions(this.producerIdAndEpoch);
+}
+```
 
+###### HandleEndTxnRequest
+
+Broker端处理EndTxnRequest的核心方法为TransactionCoordinator#endTransaction():
+
+```
+  private def endTransaction(transactionalId: String, producerId: Long, producerEpoch: Short, txnMarkerResult: TransactionResult, isFromClient: Boolean, responseCallback: EndTxnCallback): Unit = {
+
+    ...//参数校验及异常处理
+
+    val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+        txnMetadata.state match {
+          //正常状态下，发送EndTxnRequest前，TransactionCoordinator的事务状态为Ongoing
+          case Ongoing =>
+            //根据传入的TransactionResult决定下一个状态为PrepareCommit 或 PrepareAbort
+            val nextState = if (txnMarkerResult == TransactionResult.COMMIT)
+              PrepareCommit
+            else
+              PrepareAbort
+            if (nextState == PrepareAbort && txnMetadata.pendingState.contains(PrepareEpochFence)) {
+              //
+              isEpochFence = true
+              txnMetadata.pendingState = None
+              txnMetadata.producerEpoch = producerEpoch
+              txnMetadata.lastProducerEpoch = RecordBatch.NO_PRODUCER_EPOCH
+            }
+            //更新metadata
+            Right(coordinatorEpoch, txnMetadata.prepareAbortOrCommit(nextState, time.milliseconds()))
+
+          ... // case mmore   
+        }
+     }    
+
+      preAppendResult match {
+        case Left(err) => ... //异常返回
+        case Right((coordinatorEpoch, newMetadata)) =>
+          //定义事务成功写入日志后的回调的方法 该回调方法用于发送事务Marker
+          def sendTxnMarkersCallback(error: Errors): Unit = {
+            if (error == Errors.NONE) {
+              val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {
+                ...
+                //修改事务状态
+                case Some(epochAndMetadata) =>
+                  if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
+                      ...// 异常处理
+                        case PrepareCommit =>
+                          if (txnMarkerResult != TransactionResult.COMMIT)
+                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
+                          else
+                            //prepareComplete事务状态修改 CompleteCommit
+                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                        case PrepareAbort =>
+                          if (txnMarkerResult != TransactionResult.ABORT)
+                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
+                          else
+                            //prepareComplete事务状态修改  CompleteAbort
+                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                        ...// other code
+              }
+
+              preSendResult match {
+                case Left(err) => responseCallback(err)
+                //响应Producer
+                case Right((txnMetadata, newPreSendMetadata)) => responseCallback(Errors.NONE)
+                //发送
+                txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
+              }
+            } else {
+             ...//异常处理
+            }
+          }
+          //记录事务日志
+          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendTxnMarkersCallback)
+      }
+    }
+  }
+```
+
+上面省略了较多源码，只保留了关键步骤，可概括为以下三步：
+
+* 1、更新事务meta信息，将事务状态由Ongoing转为PREPARE_COMMIT或PREPARE_ABORT；
+* 2、将更新后的metadata持久化到_transaction_state日志中，**目标分区的所有副本均完成写入后，执行回调函数sendTxnMarkersCallback()**;
+* 3、sendTxnMarkersCallback方法的内容如下：
+    * 将事务状态更新为CompleteCommit或CompleteAbort；
+    * 响应结果给Producer;
+    * 进入发送WriteTxnMarkerRequest流程。
+    
+###### HandleEndTxnResponse
+
+收到EndTxnResponse后，由TransactionManager.EndTxnHandler#handleResponse()进行处理，如果没有任何错误则设置本地状态及清空相关的缓存队列用于下一次事务提交准备，
+如果有错误则根据不同的错误类型有不同的处理方法
+
+```
+public void handleResponse(AbstractResponse response) {
+    EndTxnResponse endTxnResponse = (EndTxnResponse) response;
+    Errors error = endTxnResponse.error();
+    if (error == Errors.NONE) {
+        //事务结束
+        completeTransaction();
+        result.done();
+    } else if (error == Errors.COORDINATOR_NOT_AVAILABLE || error == Errors.NOT_COORDINATOR) {
+        lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);
+        reenqueue();
+    } else if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS || error == Errors.CONCURRENT_TRANSACTIONS) {
+        reenqueue();
+    } else if (error == Errors.INVALID_PRODUCER_EPOCH || error == Errors.PRODUCER_FENCED) {
+        fatalError(Errors.PRODUCER_FENCED.exception());
+    } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) {
+        fatalError(error.exception());
+    } else if (error == Errors.INVALID_TXN_STATE) {
+        fatalError(error.exception());
+    } else if (error == Errors.UNKNOWN_PRODUCER_ID || error == Errors.INVALID_PRODUCER_ID_MAPPING) {
+        abortableErrorIfPossible(error.exception());
+    } else {
+        fatalError(new KafkaException("Unhandled error in EndTxnResponse: " + error.message()));
+    }
+}
+
+private void completeTransaction() {
+    if (epochBumpRequired) {
+        transitionTo(State.INITIALIZING);
+    } else {
+        transitionTo(State.READY); //状态置为Ready
+    }
+    //清理事务缓存
+    lastError = null;
+    epochBumpRequired = false;
+    transactionStarted = false;
+    newPartitionsInTransaction.clear();
+    pendingPartitionsInTransaction.clear();
+    partitionsInTransaction.clear();
+}
+```    
+    
 ##### WriteTxnMarkerRequest
 
-WriteTxnMarkersRequest请求是由TransactionCoordinator发向事务中各个分区的leader节点的，Transaction Marker也叫做控制消息(ControlBatch)，它的作用主要是告诉这个事务操作涉
-及的TopicPartitions当前的事务操作已经完成，可以执行commit或者abort。
+EndTxnRequest请求处理的最后一步是开始WriteTxnMarkerRequest的发送，**WriteTxnMarkerRequest是TransactionCoordinator收到Producer的EndTxnRequest请求后
+向其它Broker(参与事务分区的leader副本所在Broker)发送的请求，作用是通知参与事务的主题分区最终的事务结果，commit或abort**。
 
-ControlBatch和普通的消息一样存储在对应日志文件中，但控制消息不会被返回给consumer客户端。主要通过扩展RecordBatch中的attribute字段实现，来标识消息是否是控制消息，是否在事务中等。
+###### SendWriteTxnMarkerRequest
 
-* org.apache.kafka.common.record.RecordBatch
-```
-boolean isTransactional();
-
-int partitionLeaderEpoch();
-
-boolean isControlBatch();
+入口方法为TransactionMarkerChannelManager#addTxnMarkersToSend()，实现如下：
 
 ```
-* org.apache.kafka.common.record.ControlRecordType
+  def addTxnMarkersToSend(coordinatorEpoch: Int, txnResult: TransactionResult, txnMetadata: TransactionMetadata, newMetadata: TxnTransitMetadata): Unit = {
+    val transactionalId = txnMetadata.transactionalId
+    val pendingCompleteTxn = PendingCompleteTxn( transactionalId, coordinatorEpoch, txnMetadata,newMetadata)
+    //缓存等待WriteTxnMarkerRequest响应的事务id
+    transactionsWithPendingMarkers.put(transactionalId, pendingCompleteTxn)
+    //添加通知参与事务分区事务结果的任务
+    addTxnMarkersToBrokerQueue(transactionalId, txnMetadata.producerId, txnMetadata.producerEpoch, 
+                    txnResult,  //事务结果 
+                    coordinatorEpoch, 
+                    txnMetadata.topicPartitions.toSet)  //待通知的分区
+
+    //通知完毕后执行
+    maybeWriteTxnCompletion(transactionalId)
+  }
+```
+
+addTxnMarkersToBrokerQueue实现如下：
 
 ```
-public enum ControlRecordType {
-    ABORT((short) 0),
-    COMMIT((short) 1),
+  def addTxnMarkersToBrokerQueue(transactionalId: String,producerId: Long,producerEpoch: Short,result: TransactionResult,coordinatorEpoch: Int,topicPartitions: immutable.Set[TopicPartition]): Unit = {
+    val txnTopicPartition = txnStateManager.partitionFor(transactionalId)
+    //遍历获取分区leader副本所在节点
+    val partitionsByDestination: immutable.Map[Option[Node], immutable.Set[TopicPartition]] = topicPartitions.groupBy { topicPartition: TopicPartition =>
+      metadataCache.getPartitionLeaderEndpoint(topicPartition.topic, topicPartition.partition, interBrokerListenerName)
+    }
 
-    // Raft quorum related control messages.
-    LEADER_CHANGE((short) 2),
-    SNAPSHOT_HEADER((short) 3),
-    SNAPSHOT_FOOTER((short) 4),
+    for ((broker: Option[Node], topicPartitions: immutable.Set[TopicPartition]) <- partitionsByDestination) {
+      broker match {
+        case Some(brokerNode) =>
+          //构建marker
+          val marker = new TxnMarkerEntry(producerId, producerEpoch, coordinatorEpoch, result, topicPartitions.toList.asJava)
+          val txnIdAndMarker = TxnIdAndMarkerEntry(transactionalId, marker)
 
-    // UNKNOWN is used to indicate a control type which the client is not aware of and should be ignored
-    UNKNOWN((short) -1);
+          if (brokerNode == Node.noNode) {
+            //broker未知的topicpartition的marker,sender线程会查找对应的broker
+            markersQueueForUnknownBroker.addMarkers(txnTopicPartition, txnIdAndMarker)
+          } else {
+            //添加入目标broker对应的brokerRequestQueue中
+            addMarkersForBroker(brokerNode, txnTopicPartition, txnIdAndMarker)
+          }
+        case None =>
+          ... //异常情况处理
+      }
+    }
+    //唤醒发送线程 InterBrokerSendThread
+    wakeup()
+  }
 ```
+
+后续请求的发送与Producer请求的发送类似，Broker端也有一个单独的线程负责Broker间的请求发送，该线程类为**InterBrokerSendThread**，WriteTxnMarkerRequest封装的调用链为：
+
+```
+InterBrokerSendThread#pollOnce() =>  InterBrokerSendThread#drainGeneratedRequests() => TransactionMarkerChannelManager#generateRequests()
+```
+
+网络IO的部分与KafkaProducer完全一致，均是使用基于Java NIO封装的NetworkClient发送，这里不再展开。
+
+###### handleWriteTxnMarkerRequest
+
+事务分区的leader副本所在Broker收到WriteTxnMarkerRequest请求后，由KafkaApis#handleWriteTxnMarkersRequest()进行处理，主要是遍历请求内的marker，封装为ControlRecord写入对应的分区消息日志中，后续Consumer消费时，
+可根据ControlRecord判断事务是被提交或被中止。Broker完成所有marker的持久化后，返回响应给TransactionCoordinator。源码如下：
+
+```
+ def handleWriteTxnMarkersRequest(request: RequestChannel.Request): Unit = {
+    ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
+    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
+    val writeTxnMarkersRequest = request.body[WriteTxnMarkersRequest]
+    val errors = new ConcurrentHashMap[java.lang.Long, util.Map[TopicPartition, Errors]]()
+    val markers = writeTxnMarkersRequest.markers
+    //marker数量  任务合并，且可能有多个分区的leader副本在这个broker上
+    val numAppends = new AtomicInteger(markers.size)
+
+    ...//参数校验
+
+    //controlRecord写入回调 会被调用多次，原因同上，任务合并，可能多个分区的leader副本在这个broker上
+    def maybeSendResponseCallback(producerId: Long, result: TransactionResult)(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
+        if (successfulOffsetsPartitions.nonEmpty) {
+           ...
+            if (successfulOffsetsPartitions.nonEmpty) {
+            // as soon as the end transaction marker has been written for a transactional offset commit,
+            // call to the group coordinator to materialize the offsets into the cache
+            try {
+                groupCoordinator.scheduleHandleTxnCompletion(producerId, successfulOffsetsPartitions, result)
+            } catch {
+                case e: Exception =>
+            }
+        }
+      //所有分区已全部完成controlRecords写入，返回响应给TransactionCoordinator
+      if (numAppends.decrementAndGet() == 0)
+        requestHelper.sendResponseExemptThrottle(request, new WriteTxnMarkersResponse(errors))
+    }
+
+    var skippedMarkers = 0
+    for (marker <- markers.asScala) {
+      //遍历所有的marker
+      val producerId = marker.producerId
+      val partitionsWithCompatibleMessageFormat = new mutable.ArrayBuffer[TopicPartition]
+        //构建controlRecord
+        val controlRecords = partitionsWithCompatibleMessageFormat.map { partition =>
+          val controlRecordType = marker.transactionResult match {
+            case TransactionResult.COMMIT => ControlRecordType.COMMIT
+            case TransactionResult.ABORT => ControlRecordType.ABORT
+          }
+          val endTxnMarker = new EndTransactionMarker(controlRecordType, marker.coordinatorEpoch)
+          partition -> MemoryRecords.withEndTransactionMarker(producerId, marker.producerEpoch, endTxnMarker)
+        }.toMap
+        //将controlRecord写入消息日志中
+        replicaManager.appendRecords(
+          timeout = config.requestTimeoutMs.toLong,
+          requiredAcks = -1,
+          internalTopicsAllowed = true,
+          origin = AppendOrigin.Coordinator,
+          entriesPerPartition = controlRecords,
+          responseCallback = maybeSendResponseCallback(producerId, marker.transactionResult))
+        }
+    }
+    ...
+  }
+```
+
+###### handleWriteTxnMarkersResponse
+
+构建WriteTxnMarkerRequest时，也完成了TransactionMarkerRequestCompletionHandler的构建，负责处理WriteTxnMarkersResponse，onComplete()实现如下：
+
+```
+  override def onComplete(response: ClientResponse): Unit = {
+    val requestHeader = response.requestHeader
+    val correlationId = requestHeader.correlationId
+    if (response.wasDisconnected) {
+      ... //网络连接失败  异常处理及判断是否进行重试
+    } else {
+      debug(s"Received WriteTxnMarker response $response from node ${response.destination} with correlation id $correlationId")
+
+      val writeTxnMarkerResponse = response.responseBody.asInstanceOf[WriteTxnMarkersResponse]
+
+      val responseErrors = writeTxnMarkerResponse.errorsByProducerId;
+      for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
+        val transactionalId = txnIdAndMarker.txnId
+        val txnMarker = txnIdAndMarker.txnMarkerEntry
+        val errors = responseErrors.get(txnMarker.producerId)
+        if (errors == null)
+          throw new IllegalStateException(s"WriteTxnMarkerResponse does not contain expected error map for producer id ${txnMarker.producerId}")
+        
+        txnStateManager.getTransactionState(transactionalId) match {
+          ...//异常处理
+          case Right(Some(epochAndMetadata)) =>
+            val txnMetadata = epochAndMetadata.transactionMetadata
+            val retryPartitions: mutable.Set[TopicPartition] = mutable.Set.empty[TopicPartition]
+            var abortSending: Boolean = false
+
+            if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
+              // coordinator epoch has changed, just cancel it from the purgatory
+              //epoch 过期 停止发送
+              abortSending = true
+            } else {
+              txnMetadata.inLock {
+                for ((topicPartition, error) <- errors.asScala) {
+                  error match {
+                    case Errors.NONE =>
+                      //将topicpartiton从txnMetadata缓存中移除  
+                      txnMetadata.removePartition(topicPartition)
+                    case Errors.UNKNOWN_TOPIC_OR_PARTITION | Errors.NOT_LEADER_OR_FOLLOWER | Errors.NOT_ENOUGH_REPLICAS | Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND | Errors.REQUEST_TIMED_OUT | Errors.KAFKA_STORAGE_ERROR =>
+                      //可重试异常 
+                      retryPartitions += topicPartition
+
+                    ... // other condition
+                    
+                  }
+                }
+              }
+            }
+            if (!abortSending) {
+              if (retryPartitions.nonEmpty) {
+                // 进行重试
+                txnMarkerChannelManager.addTxnMarkersToBrokerQueue(transactionalId,txnMarker.producerId,txnMarker.producerEpoch,txnMarker.transactionResult,txnMarker.coordinatorEpoch,retryPartitions.toSet)
+              } else {
+                //判断transactionalId对应的WriteTxnMarkerRequest是否已结束
+                txnMarkerChannelManager.maybeWriteTxnCompletion(transactionalId)
+              }
+            }
+        }
+      }
+    }
+  }
+```
+
 
 
 ##### Writing the final Commit or Abort Message
 
-当这个事务涉及到所有TopicPartition都已经把WriteTxnMarkerRequest信息持久化到日志文件之后，TransactionCoordinator将最终的COMPLETE_COMMIT 或COMPLETE_ABORT信息写入主题_transaction_state以表明当前事务已经结束，
+
+TransactionCoordinator收到所有Broker返回的WriteTxnMarkersResponse且不存在异常后，TransactionCoordinator将最终的COMPLETE_COMMIT或COMPLETE_ABORT信息持久化到事务日志中，表明当前事务已全部结束，
 此时TransactionCoordinator缓存的很多关于这个事务的数据可以被清除,且主题_transaction_state中所有关于该事务的消息也可以被设置为墓碑消息，等到日志压缩处理。
+
+方法调用链为：
+
+```
+TransactionMarkerChannelManager#maybeWriteTxnCompletion() => TransactionMarkerChannelManager#writeTxnCompletion() => TransactionMarkerChannelManager#tryAppendToLog => TransactionStateManager#appendTransactionToLog()
+```
+
+
+#### 执行流程图
+
+事务执行的流程图如下：
+
+![Kafka Transaction](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/kafka%20transaction.png)
+
+官网详解可见[Exactly Once Delivery and Transactional Messaging](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging#KIP98ExactlyOnceDeliveryandTransactionalMessaging-DataFlow)
 
 
 ### 事务成功保证
@@ -895,9 +1525,9 @@ Producer调用完commit接口后，TransactionCoordinator将事务状态转化�
 ### Kafka Fencing机制
 
 在分布式系统中，一个instance的宕机或失联，集群往往会自动启动或选举一个新的实例来代替它的工作。此时若原实例恢复了，那么集群中就产生了两个具有相同职责的实例，最终使得整个集群处于混乱状态,这就是脑裂问题，
-此时前一个instance就被称为“僵尸实例（Zombie Instance）”。
+前一个instance就被称为“僵尸实例（Zombie Instance）”。
 
-在Kafka的事务场景下，用到Fencing机制有两个地方：
+在Kafka的事务场景下，使用Fencing机制来解决上述问题，分别是：
 
 * TransactionCoordinator Fencing
 * Producer Fencing
