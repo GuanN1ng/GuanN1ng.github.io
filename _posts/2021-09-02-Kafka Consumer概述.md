@@ -9,7 +9,7 @@ Producer会在分区日志的尾部追加数据，而Consumer负责订阅Topic�
 
 ## 消费者组
 
-Kafka引入consumer group的概念来表示一组消费者实例的集合，每个消费者只属于一个消费者组，消费者组内订阅同一topic的消费者按照一定的分区分配策略进行消费，一个TopicPartition只能被同一消费者组
+Kafka引入consumer group的概念来表示一组消费者实例的集合，`group.id`配置一致的消费者即属于同一个组，每个消费者只属于一个消费者组，消费者组内订阅同一topic的消费者按照一定的分区分配策略进行消费，一个TopicPartition只能被同一消费者组
 内的一个消费者消费，消费者组之间不受影响，如下图。
 
 ![consumer group](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/consumer%20group.png)
@@ -20,13 +20,12 @@ Kafka引入consumer group的概念来表示一组消费者实例的集合，每�
 
 ![消费者数量多于主题分区数](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/too%20many%20consumer.png)
 
-以上分配逻辑基于Kafka提供的默认分区分配策略**RangeAssignor**进行分析，根据不同Topic的Producer生产速率及TopicPartition数量，应合理的调整消费者组内订阅该Topic的消费者实例数量，来解决消息堆积或资源浪费的问题。
+以上分配逻辑基于Kafka提供的默认分区分配策略**RangeAssignor**进行分析，根据不同Topic的Producer生产速率及TopicPartition数量，应合理的调整消费者组内订阅该Topic的消费者实例数量，来避免消息堆积或资源浪费的问题。
 
 消息中间件的消息投递模式可分为两类：点对点(P2P)模式和发布订阅(Pub/Sub)模式。得益于消费者与消费者组的模型，Kafka同时支持两种消息投递模式：
 
-* 所有的Consumer实例都属于同一个consumer group，则所有的消息都会被均衡的投递给每一个Consumer，即每条消息只会被一个consumer处理，此时为P2P模式；
-* 所有的Consumer实例都属于不同的consumer group，则所有的消息都会被广播给每一个消费者，即每条消息会被所有的Consumer处理，此时为发布订阅模式。
-
+* 所有的Consumer实例都属于同一个consumer group，每个consumer只负责消费自己分配到得主题分区内的消息，即每条消息只会被一个consumer处理，此时为P2P模式；
+* 所有的Consumer实例都属于不同的consumer group，每个consumer需要负责所有主题分区的消息消费，即每条消息会被所有的Consumer处理，此时为发布订阅模式。
 
 ## Consumer Client
 
@@ -48,7 +47,7 @@ void subscribe(Pattern pattern);
 
 subscribe API可分为两类：使用topic集合的方式订阅以及通过正则表达式的方式订阅。但subscribe方法的**多次调用并非增加主题，而是以最后一次调用subscribe方法时提供的主题列表为准**。
 
-ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消费者的主题分区发生变化时触发回调该Listener，后续分析消费者再均衡时再详解。
+ConsumerRebalanceListener参数为消费者再均衡监听器，当分配给消费者的主题分区发生变化时触发回调该Listener。
 
 
 ### 分配主题分区
@@ -739,9 +738,9 @@ consumer.commitSync(Collections.singletonMap(partition,new OffsetAndMetadata(rec
 `auto.interval.ms`配置，默认5s，即默认情况下，consumer会每隔5s将拉取到的每个分区中的最大消息位移提交到主题`_consumer_offsets`中。
 
 自动提交是延时提交，当consumer实例突然崩溃时，可能会导致已消费的消息位移尚未提交，consumer group发生rebalance，导致消息被**重复消费**。当消费者处理业务逻辑为先缓存消息，
-再进行消费时，可能发生消息位移已提交，但消息还在缓存队列内，未被消费，导致**消息丢失**情况的出现。
+再进行消费时，可能发生消息位移已提交，但消息还在缓存队列内，未被消费，若此时应用崩溃，会导致**消息丢失**情况的出现。
 
-综上：自动提交下，无需开发人员额外编码，代码简洁，但可能导致重复消费及消息丢失的问题。即使通过缩短提交周期也无法避免，且会使位移提交更加频繁。
+综上：自动提交下，无需开发人员额外编码，代码简洁，但可能导致重复消费及消息丢失的问题。即使通过缩短提交周期也无法避免，且会使位移提交更加频繁，降低性能。
 
 #### 手动提交
 

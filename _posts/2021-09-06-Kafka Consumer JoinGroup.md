@@ -5,14 +5,34 @@ date:   2021-09-06 14:41:42
 categories: Kafka
 ---
 
-KafkaConsumer通过poll方法执行消息拉取，但poll方法拉取消息前，还有JoinGroup、TopicPartition分区计算、ConsumerRebalance、心跳等逻辑需要完成，而这些均在poll方法内完成。
-本篇内容主要介绍一个consumer如何加入消费组并分配到分区进行消息。这些逻辑涉及到两个角色：ConsumerCoordinator与GroupCoordinator。
+[KafkaConsumer 概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/)中介绍了消费者组及消费位移的概念以及分区分配的算法，KafkaConsumer需要完成JoinGroup、TopicPartition分区分配等工作，才可进行消息的拉取及消费，那么组内不同消费者间
+是如何相互协同完成这些工作的呢？这一切都在两个角色：ConsumerCoordinator和GroupCoordinator间完成。下面将从源码来分析ConsumerCoordinator和GroupCoordinator的作用，以及一个KafkaConsumer如何完成JoinGroup。
 
 
 ## GroupCoordinator简介
 
-GroupCoordinator是Kafka Broker上的一个服务，每个Broker实例在运行时都会启动一个这样的服务。[KafkaConsumer概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/)中提到在Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，
-默认情况下该主题有50个partition，每个partition3个副本，Consumer通过groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
+GroupCoordinator是Kafka Server端的一个实例对象，该类的注释为：
+```
+GroupCoordinator handles general group membership and offset management
+Each Kafka server instantiates a coordinator which is responsible for a set of groups. 
+Groups are assigned to coordinators based on their group names.
+```
+
+可以看出，GroupCoordinator负责消费者组的成员及消费位移管理，每个Broker实例在运行时都会初始化该对象负责管理多个消费者组。那么，consumer如何确定与哪个Broker实例的GroupCoordinator进行交互呢？上一篇内容介绍消费位移时说到
+Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，该主题默认情况下有50个partition，每个partition3个副本：
+
+```
+bin/kafka-topics.sh  --zookeeper localhost:2181  --topic  __consumer_offsets  --describe
+Topic:__consumer_offsets	PartitionCount:50	ReplicationFactor:3	Configs:segment.bytes=104857600,cleanup.policy=compact,compression.type=producer
+	Topic: __consumer_offsets	Partition: 0	Leader: 5	Replicas: 4,6,5	Isr: 5
+	Topic: __consumer_offsets	Partition: 1	Leader: 5	Replicas: 5,4,6	Isr: 5
+	Topic: __consumer_offsets	Partition: 2	Leader: 5	Replicas: 6,5,4	Isr: 5
+	Topic: __consumer_offsets	Partition: 3	Leader: 5	Replicas: 4,5,6	Isr: 5
+    ...
+    Topic: __consumer_offsets	Partition: 49	Leader: 5	Replicas: 5,4,6	Isr: 5
+```
+
+Consumer通过配置groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
 
 ```
 def partitionFor(groupId: String): Int = Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount
@@ -22,14 +42,7 @@ def partitionFor(groupId: String): Int = Utils.abs(groupId.hashCode) % groupMeta
 
 ## KafkaConsumer#poll
 
-首先来看KafkaConsumer#poll方法，主要可分为以下几步：
-
-* 通过记录当前线程id抢占锁，确保KafkaConsumer实例不会被多线程并发访问，保证线程安全。
-* 调用`updateAssignmentMetadataIfNeeded()`方法完成消费者拉取消息前的元数据获取。
-* 调用pollForFetches(timer)拉取消息。
-* 将经过Consumer#Interceptors处理过后的消息返回给消费者或拉取超时返回空集合。最后释放锁。
-
-其中第二步的方法主要内容为Consumer的JoinGroup及Rebalance。接下来我们以updateAssignmentMetadataIfNeeded方法为入口来分析KafkaConsumer如何实现JoinGroup及Rebalance。
+KafkaConsumer#poll方法是消费者拉取消息的入口方法，实现如下：
 
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
@@ -75,13 +88,14 @@ private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetad
 }
 ```
 
-## ConsumerCoordinator#poll
+poll()方法主要包含以下内容：
 
-KafkaConsumer的poll方法内调用updateAssignmentMetadataIfNeeded完成消息拉取前的元数据获取，updateAssignmentMetadataIfNeeded方法非常简单，主要是两个方法的调用：
+* 通过记录当前线程id抢占锁，确保KafkaConsumer实例不会被多线程并发访问，保证线程安全。
+* 调用`updateAssignmentMetadataIfNeeded()`方法完成消费者拉取消息前的元数据准备。
+* 调用pollForFetches(timer)拉取消息。
+* 将经过Consumer#Interceptors处理过后的消息返回给消费者或拉取超时返回空集合，最后释放锁。
 
-* ConsumerCoordinator#poll：JoinGroup及Rebalance的核心方法。
-
-* updateFetchPositions：更新消费进度
+updateAssignmentMetadataIfNeeded()方法中将会完成consumer拉取消息前所有的准备工作，源码如下：
 
 ```
 boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitForJoinGroup) {
@@ -92,7 +106,17 @@ boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitFo
 }
 ```
 
-本篇主要关注ConsumerCoordinator#poll方法的实现：
+源码比较简单，主要是两个方法的调用：
+
+* ConsumerCoordinator#poll：Kafka Consumer完成JoinGroup、Rebalance的核心方法。
+* updateFetchPositions：更新消费进度
+
+这里出现了Consumer完成JoinGroup的核心角色之一：ConsumerCoordinator，接下来从ConsumerCoordinator#poll()方法继续分析。
+
+
+## ConsumerCoordinator#poll
+
+ConsumerCoordinator#poll方法的实现：
 
 ```
 public boolean poll(Timer timer, boolean waitForJoinGroup) {
@@ -100,8 +124,8 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
     maybeUpdateSubscriptionMetadata();
     //执行队列中位移提交的回调任务
     invokeCompletedOffsetCommitCallbacks();
-    //判断是否采用自动分区策略 即采用subscribe方法订阅主题，而非assign手动指定主题分区
     if (subscriptions.hasAutoAssignedPartitions()) {
+        ////采用自动分区策略 即采用subscribe方法订阅主题，
         if (protocol == null) {
             throw new IllegalStateException("User configured " + ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG + " to empty while trying to subscribe for group protocol to auto assign partitions");
         }
@@ -112,9 +136,8 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
             return false;
         }
         if (rejoinNeededOrPending()) {  
-            //通过pattern 正则订阅
             if (subscriptions.hasPatternSubscription()) {
-                ...
+                ... //通过pattern 正则订阅
             }
             //通过JoinGroup和SyncGroup进行rebalance，来保证达到STABLE状态
             if (!ensureActiveGroup(waitForJoinGroup ? timer : time.timer(0L))) {
@@ -123,7 +146,7 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
             }
         }
     } else {
-        //通过assign方式制定消费分区，不存在组和再平衡
+        //通过assign方式制定消费分区
         if (metadata.updateRequested() && !client.hasReadyNodes(timer.currentTimeMs())) {
             client.awaitMetadataUpdate(timer);
         }
@@ -135,16 +158,13 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
 
 ```
 
-其中主要包含以下部分内容：
+其中主要包含以下几部分内容：
 
-* 1、消费位移自动提交及提交完成的回调处理，方法invokeCompletedOffsetCommitCallbacks()及maybeAutoCommitOffsetsAsync()。
+* 1、消费位移自动提交及提交完成的回调处理，方法invokeCompletedOffsetCommitCallbacks()及maybeAutoCommitOffsetsAsync()；
+* 2、心跳任务，通过pollHeartbeat()唤醒心跳线程，发送心跳并记录pollTimer；
+* 3、消费者入组及再平衡：ensureCoordinatorReady()及ensureActiveGroup()。
 
-* 2、心跳任务，通过pollHeartbeat()唤醒心跳线程，发送心跳并记录pollTimer。
-
-* 3、消费者入组及再平衡，我们通过以下几个阶段来进行分析：
-
-
-### 1、FIND_COORDINATOR
+### FIND_COORDINATOR
 
 ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size最小)发送FindCoordinatorRequest，查找GroupCoordinator所在的Broker，
 并在请求回调方法中建立连接。
@@ -153,7 +173,7 @@ ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size
 ![Find GroupCoordinator](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/find%20groupcoordinator.png)
 
 
-#### 1.1、SendFindCoordinatorRequest
+#### SendFindCoordinatorRequest
 
 请求发送的方法调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendFindCoordinatorRequest()，这一步完成请求的发送及回调函数注册。
 
@@ -201,15 +221,10 @@ private RequestFuture<Void> sendFindCoordinatorRequest(Node node) {
 
 ```
 
-#### 1.2、handleFindCoordinatorRequest
+#### handleFindCoordinatorRequest
 
-Broker端处理请求方法入口为handleFindCoordinatorRequest()，其中的业务逻辑可分为3步：
+Broker端处理请求方法入口为handleFindCoordinatorRequest()，业务核心方法是getCoordinator()，实现如下：
 
-* 获取groupId所属的_consumer_offsets分区，Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount 
-* 获取_consumer_offsets所有的分区元数据
-* 从所有的分区元数据中过滤出第一步计算出的分区Leader副本节点信息返回
-
-为节省篇幅，这里不再将代码全部贴出，我们主要看下核心方法getCoordinator()的实现。
 
 ```
 private def getCoordinator(request: RequestChannel.Request, keyType: Byte, key: String): (Errors, Node) = {
@@ -255,7 +270,13 @@ private def getCoordinator(request: RequestChannel.Request, keyType: Byte, key: 
   }
 ```
 
-### 2、JOIN_GROUP
+可概括为3步：
+
+* 获取groupId所属的_consumer_offsets分区，Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount 
+* 获取_consumer_offsets所有的分区元数据
+* 从所有的分区元数据中过滤出第一步计算出的分区Leader副本节点信息返回
+
+### JOIN_GROUP
 
 成功找到GroupCoordinator后，Consumer进入JoinGroup阶段，此阶段的Consumer会向GroupCoordinator发送JoinGroupRequest请求，GroupCoordinator会确认ConsumerGroup的Leader及分区分配策略，并响应给
 消费者。
@@ -274,7 +295,7 @@ boolean ensureActiveGroup(final Timer timer) {
 }
 ```
 
-#### 2.1、SendJoinGroupRequest
+#### SendJoinGroupRequest
 
 继续看joinGroupIfNeeded()方法，通过代码可知发送JoinGroupRequest请求是在initiateJoinGroup()方法中实现的。
 
@@ -371,7 +392,7 @@ RequestFuture<ByteBuffer> sendJoinGroupRequest() {
 
 ```
 
-#### 2.2、HandleJoinGroupRequest
+#### HandleJoinGroupRequest
 
 JoinGroupRequest由对应的GroupCoordinator所在的broker处理，此阶段的入口方法为handleJoinGroupRequest，这里没有贴出，我们主要关注它的下级方法handleJoinGroup的实现，handleJoinGroup方法的实现如下，GroupCoordinator
 通过`groupMetadataCache = new Pool[String, GroupMetadata]`缓存所有groupId与GroupMetadata的对应关系，若groupId对应的GroupMetadata为空，就新建一个放入缓存。
@@ -671,14 +692,14 @@ private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
 
 ```
 
-### 3、SYNC_GROUP
+### SYNC_GROUP
 
 上一阶段JOIN_GROUP阶段的最后，leader consumer会根据GroupCoordinator返回的分区分配策略及member metadata完成具体的分区分配。如何将分区分配的结果同步给其它consumer，这里Kafka并没有
 让leader consumer直接将分配结果同步给其它消费者，而是通过GroupCoordinator来实现中转，减少复杂性。此阶段即SYNC_GROUP阶段，**各个消费者会向GroupCoordinator发送SyncGroupRequest请求来同步分配方案**。
 
 ![SYNC GROUP](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/sync%20group.png)
 
-#### 3.1 sendSyncGroupRequest
+#### sendSyncGroupRequest
 
 Consumer端发送SyncGroupRequest请求的方法如下，发送时会注册一个回调函数SyncGroupResponseHandler。
 
@@ -690,7 +711,7 @@ private RequestFuture<ByteBuffer> sendSyncGroupRequest(SyncGroupRequest.Builder 
 }
 ```
 
-#### 3.2 handleSyncGroupRequest
+#### handleSyncGroupRequest
 
 GroupCoordinator处理SyncGroupRequest的入口方法为KafkaApis#handleSyncGroupRequest，调用链为KafkaApis#handleSyncGroupRequest->GroupCoordinator#handleSyncGroup
 ->GroupCoordinator#doSyncGroup，这里主要关注doSyncGroup方法：
@@ -770,7 +791,7 @@ propagateAssignment方法调用回调方法，响应每个consumer，响应的�
 
 ```
 
-#### 3.3 SyncGroupResponseHandler
+#### SyncGroupResponseHandler
 
 收到SyncGroupResponse由SyncGroupResponseHandler#handle()进行处理，响应数据校验通过后，consumer的状态更新为STABLE。
 
@@ -811,7 +832,7 @@ public void handle(SyncGroupResponse syncResponse,
 }
 ```
 
-### 4、JoinComplete
+### JoinComplete
 
 以上3个阶段后，consumer已完成入组并获取到主题分区，回到joinGroupIfNeeded方法，initiateJoinGroup方法的请求结果由ConsumerCoordinator#onJoinComplete处理，方法中完成了分区信息更新并触发rebalanceListener。
 至此，consumer已完成入组。
