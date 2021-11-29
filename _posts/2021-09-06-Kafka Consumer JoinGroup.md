@@ -18,7 +18,7 @@ Each Kafka server instantiates a coordinator which is responsible for a set of g
 Groups are assigned to coordinators based on their group names.
 ```
 
-可以看出，GroupCoordinator负责消费者组的成员及消费位移管理，每个Broker实例在运行时都会初始化该对象负责管理多个消费者组。那么，consumer如何确定与哪个Broker实例的GroupCoordinator进行交互呢？上一篇内容介绍消费位移时说到
+可以看出，GroupCoordinator负责消费者组的成员及消费位移管理，每个Broker实例在运行时都会初始化该对象，负责管理多个消费者组。那么，consumer如何确定与哪个Broker实例的GroupCoordinator进行交互呢？上一篇内容介绍消费位移时说到
 Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，该主题默认情况下有50个partition，每个partition3个副本：
 
 ```
@@ -38,7 +38,7 @@ Consumer通过配置groupId的hash值与`_consumer_offsets`的分区数取模得
 def partitionFor(groupId: String): Int = Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount
 ```
 
-获得对应的分区后，再寻找此分区的Leader副本所在的Broker节点，该Broker节点即为这个ConsumerGroup所对应的GroupCoordinator节点。
+获得对应的分区后，再寻找此分区的Leader副本所在的Broker节点，该Broker节点即为这个ConsumerGroup内所有consumer所对应的GroupCoordinator节点。
 
 ## KafkaConsumer#poll
 
@@ -120,7 +120,7 @@ ConsumerCoordinator#poll方法的实现：
 
 ```
 public boolean poll(Timer timer, boolean waitForJoinGroup) {
-    //获取最新的元数据信息
+    
     maybeUpdateSubscriptionMetadata();
     //执行队列中位移提交的回调任务
     invokeCompletedOffsetCommitCallbacks();
@@ -139,7 +139,7 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
             if (subscriptions.hasPatternSubscription()) {
                 ... //通过pattern 正则订阅
             }
-            //通过JoinGroup和SyncGroup进行rebalance，来保证达到STABLE状态
+            //当前消费组正常，joined and synced
             if (!ensureActiveGroup(waitForJoinGroup ? timer : time.timer(0L))) {
                 timer.update(time.milliseconds());
                 return false;
@@ -175,7 +175,7 @@ ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size
 
 #### SendFindCoordinatorRequest
 
-请求发送的方法调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendFindCoordinatorRequest()，这一步完成请求的发送及回调函数注册。
+请求发送的方法调用流程为：ensureCoordinatorReady() –> lookupCoordinator() –> sendFindCoordinatorRequest()。
 
 ```
 protected synchronized boolean ensureCoordinatorReady(final Timer timer) {
@@ -223,51 +223,61 @@ private RequestFuture<Void> sendFindCoordinatorRequest(Node node) {
 
 #### handleFindCoordinatorRequest
 
-Broker端处理请求方法入口为handleFindCoordinatorRequest()，业务核心方法是getCoordinator()，实现如下：
+Broker端处理请求方法入口为KafkaApis#handleFindCoordinatorRequest()，实现如下：
 
 
 ```
-private def getCoordinator(request: RequestChannel.Request, keyType: Byte, key: String): (Errors, Node) = {
-    if (校验及认证...)
-        //失败... 返回异常
+  def handleFindCoordinatorRequest(request: RequestChannel.Request): Unit = {
+    val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+
+    ...//校验
     else {
-      val (partition, internalTopicName) = CoordinatorType.forId(keyType) match {
-        //GroupCoordinator
+      val (partition, internalTopicName) = CoordinatorType.forId(findCoordinatorRequest.data.keyType) match {
         case CoordinatorType.GROUP =>
-        //计算分区 Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount 
-        (groupCoordinator.partitionFor(key), GROUP_METADATA_TOPIC_NAME)
-        //TransactionCoordinator  事务相关，具体见Kafka Producer 幂等与事务一文
+          //根据groupId获取对应分区
+          (groupCoordinator.partitionFor(findCoordinatorRequest.data.key), GROUP_METADATA_TOPIC_NAME)
+
         case CoordinatorType.TRANSACTION =>
-          (txnCoordinator.partitionFor(key), TRANSACTION_STATE_TOPIC_NAME)
+          (txnCoordinator.partitionFor(findCoordinatorRequest.data.key), TRANSACTION_STATE_TOPIC_NAME)
       }
-      //获取_consumer_offsets所有分区的元数据信息  
+      //获取_consumer_offsets主题的元数据
       val topicMetadata = metadataCache.getTopicMetadata(Set(internalTopicName), request.context.listenerName)
+      //响应定义
+      def createFindCoordinatorResponse(...}
 
       if (topicMetadata.headOption.isEmpty) {
-        val controllerMutationQuota = quotas.controllerMutation.newPermissiveQuotaFor(request)
-        autoTopicCreationManager.createTopics(Seq(internalTopicName).toSet, controllerMutationQuota, None)
-        (Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
+          ...// 元数据为空，返回异常 COORDINATOR_NOT_AVAILABLE
       } else {
-        if (topicMetadata.head.errorCode != Errors.NONE.code) {
-          (Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
-        } else {
-          //获取Leader副本节点返回
-          val coordinatorEndpoint = topicMetadata.head.partitions.asScala
-            .find(_.partitionIndex == partition)
-            .filter(_.leaderId != MetadataResponse.NO_LEADER_ID)
-            .flatMap(metadata => metadataCache.
-                getAliveBrokerNode(metadata.leaderId, request.context.listenerName))
-          //返回数据
-          coordinatorEndpoint match {
-            case Some(endpoint) =>
-              (Errors.NONE, endpoint)
-            case _ =>
-              (Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
+        def createResponse(requestThrottleMs: Int): AbstractResponse = {
+          val responseBody = if (topicMetadata.head.errorCode != Errors.NONE.code) {
+            createFindCoordinatorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode, requestThrottleMs)
+          } else {
+            
+            val coordinatorEndpoint = topicMetadata.head.partitions.asScala
+              //获取指定的分区
+              .find(_.partitionIndex == partition)
+              //获取leader副本
+              .filter(_.leaderId != MetadataResponse.NO_LEADER_ID)
+              //leader副本所在节点
+              .flatMap(metadata => metadataCache.getAliveBroker(metadata.leaderId))
+              .flatMap(_.endpoints.get(request.context.listenerName.value()))
+              .filterNot(_.isEmpty)
+
+            coordinatorEndpoint match {
+              case Some(endpoint) =>
+                //返回节点信息
+                createFindCoordinatorResponse(Errors.NONE, endpoint, requestThrottleMs)
+              case _ =>
+                createFindCoordinatorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode, requestThrottleMs)
+            }
           }
+          trace("Sending FindCoordinator response %s for correlation id %d to client %s."
+            .format(responseBody, request.header.correlationId, request.header.clientId))
+          responseBody
         }
+        requestHelper.sendResponseMaybeThrottle(request, createResponse)
       }
     }
-  }
 ```
 
 可概括为3步：
@@ -297,7 +307,7 @@ boolean ensureActiveGroup(final Timer timer) {
 
 #### SendJoinGroupRequest
 
-继续看joinGroupIfNeeded()方法，通过代码可知发送JoinGroupRequest请求是在initiateJoinGroup()方法中实现的。
+joinGroupIfNeeded()方法源码如下：
 
 ```
 boolean joinGroupIfNeeded(final Timer timer) {
@@ -308,7 +318,7 @@ boolean joinGroupIfNeeded(final Timer timer) {
         if (needsJoinPrepare) {
             //首次为true
             needsJoinPrepare = false;
-            //触发ConsumerRebalanceListener，如果自动提交为true，尝试提交
+            //Joingroup前的准备工作，如位移提交，回调ConsumerRebalanceListener#onPartitionsRevoked
             onJoinPrepare(generation.generationId, generation.memberId);
         }
         //发送JoinGroupRequest请求
@@ -332,6 +342,7 @@ boolean joinGroupIfNeeded(final Timer timer) {
                 //执行回调 PartitionAssignor#onAssignment, ConsumerRebalanceListener#onPartitionsAssigned
                 onJoinComplete(generationSnapshot.generationId, generationSnapshot.memberId, generationSnapshot.protocolName, memberAssignment);
                 resetJoinGroupFuture();
+                //重置状态
                 needsJoinPrepare = true;
             } else {
                 final String reason = String.format("rebalance failed since the generation/state was " + "modified by heartbeat thread to %s/%s before the rebalance callback triggered",generationSnapshot, stateSnapshot);
@@ -345,8 +356,15 @@ boolean joinGroupIfNeeded(final Timer timer) {
     return true;
 }
 ```
-initiateJoinGroup()方法中先更新consumer状态为PREPARING_REBALANCE，又调用了sendJoinGroupRequest()方法完成JoinGroupRequest请求的发送，这里的代码比较简单，其中参数rebalanceTimeoutMs的值为max.poll.interval.ms，
-而joinGroupTimeoutMs为max.poll.interval.ms加5s。protocolType为"consumer"，generation.memberId初始值为`""`空字符串。
+
+方法可分为以下3步：
+
+* 1、调用onJoinPrepare()方法，发送JoinGroupRequest前完成消费位移的提交及回调ConsumerRebalanceListener#onPartitionsRevoked()方法；
+* 2、调用initiateJoinGroup()方法完成请求的发送；
+* 3、阻塞等待响应，若超时返回false，成功收到响应后，通过onJoinComplete()完成元数据更新并回调ConsumerRebalanceListener#onPartitionsAssigned()方法；
+
+
+请求发送源码如下：
 
 ```
 private synchronized RequestFuture<ByteBuffer> initiateJoinGroup() {
@@ -374,7 +392,6 @@ private synchronized RequestFuture<ByteBuffer> initiateJoinGroup() {
 RequestFuture<ByteBuffer> sendJoinGroupRequest() {
     if (coordinatorUnknown())
         return org.apache.kafka.clients.consumer.internals.RequestFuture.coordinatorNotAvailable();
-    log.info("(Re-)joining group");
     JoinGroupRequest.Builder requestBuilder = new JoinGroupRequest.Builder(
             new JoinGroupRequestData()
                     .setGroupId(rebalanceConfig.groupId)
@@ -392,9 +409,12 @@ RequestFuture<ByteBuffer> sendJoinGroupRequest() {
 
 ```
 
+initiateJoinGroup()方法中先更新consumer状态为PREPARING_REBALANCE，又调用了sendJoinGroupRequest()方法完成JoinGroupRequest请求的发送，其中参数rebalanceTimeoutMs的值为max.poll.interval.ms，
+而joinGroupTimeoutMs为max.poll.interval.ms加5s。protocolType为"consumer"，generation.memberId初始值为`""`空字符串。
+
 #### HandleJoinGroupRequest
 
-JoinGroupRequest由对应的GroupCoordinator所在的broker处理，此阶段的入口方法为handleJoinGroupRequest，这里没有贴出，我们主要关注它的下级方法handleJoinGroup的实现，handleJoinGroup方法的实现如下，GroupCoordinator
+JoinGroupRequest由对应的GroupCoordinator所在的broker处理，入口方法为KafkaApis#handleJoinGroupRequest()，主要的业务由GroupCoordinator#handleJoinGroup()方法完成，GroupCoordinator
 通过`groupMetadataCache = new Pool[String, GroupMetadata]`缓存所有groupId与GroupMetadata的对应关系，若groupId对应的GroupMetadata为空，就新建一个放入缓存。
 后续根据memberId判断是执行doNewMemberJoinGroup()或doCurrentMemberJoinGroup()。
 
@@ -417,7 +437,7 @@ def handleJoinGroup(...): Unit = {
           responseCallback(JoinGroupResult(memberId, Errors.UNKNOWN_MEMBER_ID))
         case Some(group) =>
           group.inLock {
-            //判断当前组是否可以加入，容量状态等因素
+            //判断当前组是否可以加入，group状态 及 group.size 默认Int.MAX_VALUE ,可通过group.max.size配置
             if (!acceptJoiningMember(group, memberId)) {
               //移除
               group.remove(memberId)
@@ -726,18 +746,18 @@ GroupCoordinator处理SyncGroupRequest的入口方法为KafkaApis#handleSyncGrou
           case Empty | Dead => // 省略 ...
           case PreparingRebalance => // 省略 ...
           case CompletingRebalance =>
+            //暂存回调，在延迟任务完成时触发
             group.get(memberId).awaitingSyncCallback = responseCallback
             removePendingSyncMember(group, memberId)
-            //只处理leader consumer
+            
             if (group.isLeader(memberId)) {
-
+               //只处理leader consumer携带的数据
               val missing = group.allMembers.diff(groupAssignment.keySet)
               val assignment = groupAssignment ++ missing.map(_ -> Array.empty[Byte]).toMap
 
               if (missing.nonEmpty) {
                 warn(s"Setting empty assignments for members $missing of ${group.groupId} for generation ${group.generationId}")
               }
-              //分区方案持久化保存到_consumer_offset
               groupManager.storeGroup(group, assignment, (error: Errors) => {
                 group.inLock {
                   if (group.is(CompletingRebalance) && generationId == group.generationId) {
@@ -745,7 +765,7 @@ GroupCoordinator处理SyncGroupRequest的入口方法为KafkaApis#handleSyncGrou
                       resetAndPropagateAssignmentError(group, error)
                       maybePrepareRebalance(group, s"Error when storing group assignment during SyncGroup (member: $memberId)")
                     } else {
-                       //业务处理 
+                       //将分区方案持久化保存到groupMetadata中，并响应给组内消费者
                       setAndPropagateAssignment(group, assignment)
                       // 组状态变为Stable
                       group.transitionTo(Stable)
@@ -755,6 +775,12 @@ GroupCoordinator处理SyncGroupRequest的入口方法为KafkaApis#handleSyncGrou
               }, requestLocal)
               groupCompletedRebalanceSensor.record()
             }
+          case Stable =>
+            removePendingSyncMember(group, memberId)
+            // if the group is stable, we just return the current assignment
+            val memberMetadata = group.get(memberId)
+            responseCallback(SyncGroupResult(group.protocolType, group.protocolName, memberMetadata.assignment, Errors.NONE))
+            completeAndScheduleNextHeartbeatExpiration(group, group.get(memberId))
         }
       }
     }
@@ -762,9 +788,7 @@ GroupCoordinator处理SyncGroupRequest的入口方法为KafkaApis#handleSyncGrou
 
 ```
 
-doSyncGroup方法只处理leader consumer的SyncGroupRequest，并将元数据存入了_consumer_offsets中，之后的业务处理在setAndPropagateAssignment方法，处理完成后将组状态转换为Stable。
-propagateAssignment方法调用回调方法，响应每个consumer，响应的内容是每个consumer的assignment(分配方案)，并在之后开始执行定时任务监控member的心跳.
-
+doSyncGroup
 
 ```
   private def setAndPropagateAssignment(group: GroupMetadata, assignment: Map[String, Array[Byte]]): Unit = {
@@ -783,6 +807,7 @@ propagateAssignment方法调用回调方法，响应每个consumer，响应的�
       if (member.assignment.isEmpty && error == Errors.NONE) {
         warn(s"Sending empty assignment to member ${member.memberId} of ${group.groupId} for generation ${group.generationId} with no errors")
       }
+      //回调，通知组内所有消费者
       if (group.maybeInvokeSyncCallback(member, SyncGroupResult(protocolType, protocolName, member.assignment, error))) {
         completeAndScheduleNextHeartbeatExpiration(group, member)
       }
@@ -819,6 +844,7 @@ public void handle(SyncGroupResponse syncResponse,
                         lastRebalanceEndMs = time.milliseconds();
                         sensors.successfulRebalanceSensor.record(lastRebalanceEndMs - lastRebalanceStartMs);
                         lastRebalanceStartMs = -1L;
+                        //callback
                         future.complete(ByteBuffer.wrap(syncResponse.data().assignment()));
                     }
                 } else {
