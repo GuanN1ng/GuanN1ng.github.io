@@ -5,11 +5,10 @@ date:   2021-09-17 14:32:14
 categories: Kafka
 ---
 
-前面两篇内容已经介绍了consumer的join group以及heartbeat内容，consumer已经获取到TopicPartition的分配方案，但还不能开始进行消息拉取，consumer不知道该从TopicPartition的哪个位置(offset)开始消费，本文继续KafkaConsumer#poll方法的源码解析，来了解consumer
-如何获取订阅主题分区的拉取offset。
+前面两篇内容已经介绍了consumer的join group以及heartbeat内容，consumer已经获取到TopicPartition的分配方案，但还不能开始进行消息拉取，consumer不知道该从TopicPartition的哪个位置(offset)开始消费，本文将继续分析consumer
+如何更新订阅主题分区的消费offset。
 
-[Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)中我们查看KafkaConsumer#updateAssignmentMetadataIfNeeded方法源码时，
-只分析了ConsumerCoordinator#poll的方法调用：
+[Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)中分析KafkaConsumer#updateAssignmentMetadataIfNeeded()方法时，只分析了ConsumerCoordinator#poll的方法调用：
 
 ```
 boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitForJoinGroup) {
@@ -35,32 +34,33 @@ updateFetchPositions的作用是更新分配到的TopicPartitions的消费进度
 
 ```
 private boolean updateFetchPositions(final Timer timer) {
-    //是否有分区的leader切换，有抛出异常，或epoch变更
+
+    //Validate offsets for all assigned partitions for which a leader change has been detected.
     fetcher.validateOffsetsIfNeeded();
-    //判断所有分区 是否在「FETCHING」状态中
+
+    //判断所有分区 是否有有效的消费位移
     cachedSubscriptionHashAllFetchPositions = subscriptions.hasAllFetchPositions();
     if (cachedSubscriptionHashAllFetchPositions) return true;
     
-    //没有消费状态的分区，consuemr向groupCoordinator发送OffsetFetchRequest请求，获取当前组消费者上次提交的offset
+    //consuemr向groupCoordinator发送OffsetFetchRequest请求，获取当前组消费者上次提交的offset
     if (coordinator != null && !coordinator.refreshCommittedOffsetsIfNeeded(timer)) return false;
     
-    // 有auto.offset.reset策略的分区，设置策略，比如earliest或者latest
+   
+    // 仍未获取到消费位移信息的分区是否全部配置了位移重置策勒（auto.offset.reset：earliest或者latest）
     // 否则抛出异常 NoOffsetForPartitionException
     subscriptions.resetInitializingPositions();
     
-    //发送ListOffsetsRequest，根据策略获取TopicPartition的offset
+    //发送ListOffsetsRequest，根据auto.offset.reset策略重置TopicPartition的消费进度
     fetcher.resetOffsetsIfNeeded();
     return true;
 }
 ```
 
-主要可分为三部分内容：
+主要关注两部分内容：
 
-* 1、validateOffsetsIfNeeded：检查TopicPartition的副本Leader及Epoch，向Leader发送异步请求获取lase consume offset，验证及更新；
+* 2、refreshCommittedOffsetsIfNeeded()：对FetchState为INITIALIZING的分区，向groupCoordinator发送请求OffsetFetchRequest，获取并更新TopicPartition对应的committed offsets；
 
-* 2、refreshCommittedOffsetsIfNeeded：对FetchState为INITIALIZING的分区，向groupCoordinator发送请求OffsetFetchRequest，获取并更新TopicPartition对应的committed offsets；
-
-* 3、resetOffsetsIfNeeded：经过第2步，若仍存在没有位移信息的分区，向groupCoordinator发送请求ListOffsetsRequest，按照auto.offset.reset执行offset重置。
+* 3、resetOffsetsIfNeeded()：经过第2步，若仍存在没有位移信息的分区，向groupCoordinator发送请求ListOffsetsRequest，按照auto.offset.reset执行offset重置。
 
 
 ### TopicPartitionState
@@ -90,7 +90,7 @@ private static class TopicPartitionState {
 
 #### 初始化
 
-TopicPartitionState的初始化在JoinGroup完成后的onJoinComplete方法中完成，方法调用路径为：`ConsumerCoordinator#onJoinComplete()->SubscriptionState#assignFromSubscribed`。
+TopicPartitionState的初始化在JoinGroup完成后的onJoinComplete方法中完成，方法调用路径为：`ConsumerCoordinator#onJoinComplete()->SubscriptionState#assignFromSubscribed()`。
 
 ```
 public synchronized void assignFromSubscribed(Collection<TopicPartition> assignments) {
@@ -113,15 +113,14 @@ public synchronized void assignFromSubscribed(Collection<TopicPartition> assignm
 
 FetchState：
 
-* INITIALIZING：初始化状态
-* FETCHING
-* AWAIT_RESET
-* AWAIT_VALIDATION
-
+* INITIALIZING：初始化状态；
+* FETCHING：正常更新状态；
+* AWAIT_RESET：没有消费进度或丢失，待重置，auto.offset.reset：earliest或者latest；
+* AWAIT_VALIDATION：订阅元数据发生变化，待发送OffsetsForLeaderEpochRequest重新获取。
 
 ### OffsetFetchRequest
 
-consumer在refreshCommittedOffsetsIfNeeded方法发起对GroupCoordinator的OffsetFetchRequest请求，为状态是INITIALIZING的分区获取last consumed offset，作为下次消息拉取的参数。
+refreshCommittedOffsetsIfNeeded()方法中会为状态是INITIALIZING的分区发起对GroupCoordinator的OffsetFetchRequest请求，获取last consumed offset，作为下次消息拉取的参数。
 
 ```
 public boolean refreshCommittedOffsetsIfNeeded(Timer timer) {
@@ -168,37 +167,44 @@ private RequestFuture<Map<TopicPartition, OffsetAndMetadata>> sendOffsetFetchReq
     return client.send(coordinator, requestBuilder).compose(new OffsetFetchResponseHandler());
 }
 ```
-GroupCoordinator的请求响应由offsetFetchResponseHandler进行数据预处理并返回。
+GroupCoordinator的响应由offsetFetchResponseHandler进行数据预处理并返回。
 
 #### handleOffsetFetchRequest
 
-请求有KafkaApis#handleOffsetFetchRequest方法处理，这里只贴出核心方法`getOffsets`代码。
+请求由KafkaApis#handleOffsetFetchRequest方法处理，这里只贴出核心方法`getOffsets`代码。
 
 ```
   def getOffsets(groupId: String, requireStable: Boolean, topicPartitionsOpt: Option[Seq[TopicPartition]]): Map[TopicPartition, PartitionData] = {
-    //获取group信息
     val group = groupMetadataCache.get(groupId)
     if (group == null) {
-      ...// PartitionData(OffsetFetchResponse.INVALID_OFFSET,Optional.empty(), "", Errors.NONE)
+      //消费者组元信息不存在 返回INVALID_OFFSET(-1)  Errors.NONE
+      topicPartitionsOpt.getOrElse(Seq.empty[TopicPartition]).map { topicPartition =>
+        val partitionData = new PartitionData(OffsetFetchResponse.INVALID_OFFSET, Optional.empty(), "", Errors.NONE) 
+        topicPartition -> partitionData
+      }.toMap
     } else {
       group.inLock {
         if (group.is(Dead)) {
-          ...// PartitionData(OffsetFetchResponse.INVALID_OFFSET,Optional.empty(), "", Errors.NONE)
+          //消费者组消费offset日志已被删除 返回 INVALID_OFFSET Errors.NONE
+          topicPartitionsOpt.getOrElse(Seq.empty[TopicPartition]).map { topicPartition =>
+            val partitionData = new PartitionData(OffsetFetchResponse.INVALID_OFFSET, Optional.empty(), "", Errors.NONE)
+            topicPartition -> partitionData
+          }.toMap
         } else {
-          //获取当前组的所有分区offset
+          //返回group消费的所有tp的offset信息
           val topicPartitions = topicPartitionsOpt.getOrElse(group.allOffsets.keySet)
 
           topicPartitions.map { topicPartition =>
             if (requireStable && group.hasPendingOffsetCommitsForTopicPartition(topicPartition)) {
-              //该TopicPartition有正在处理的位移提交请求
+              //该分区正在更新消费offset Errors.UNSTABLE_OFFSET_COMMIT
               topicPartition -> new PartitionData(OffsetFetchResponse.INVALID_OFFSET,Optional.empty(), "", Errors.UNSTABLE_OFFSET_COMMIT)
             } else {
               val partitionData = group.offset(topicPartition) match {
                 case None =>
-                  //不存在offset
+                  //新订阅的主题，不存在消费进度，返回INVALID_OFFSET Errors.NONE
                   new PartitionData(OffsetFetchResponse.INVALID_OFFSET,Optional.empty(), "", Errors.NONE)
                 case Some(offsetAndMetadata) =>
-                  //正常返回
+                  //返回last consumed offset
                   new PartitionData(offsetAndMetadata.offset,offsetAndMetadata.leaderEpoch, offsetAndMetadata.metadata, Errors.NONE)
               }
               topicPartition -> partitionData
@@ -211,21 +217,111 @@ GroupCoordinator的请求响应由offsetFetchResponseHandler进行数据预处�
 ```
 
 
-### ListOffsetsRequest
-
-OffsetFetchRequest中，出现不存在offset的情况有以下几种：
+GroupCoordinator获取不到该主题分区的offset，返回INVALID_OFFSET(`NVALID_OFFSET = -1L`)的情况有以下几种(无异常) ：
 
 * consumer group为新建group；
-* 所查找的TopicPartition为consumer新订阅的主题；
 * 当_consumer_offsets主题中关于这个group的消费位移消息被删除后(例超过offsets.retention.minutes配置时间，过期删除)，则消费位移丢失。
+* 所查找的Topic为consumerGroup新订阅的主题；
 
-此时仍没有获取到相应的offset的分区，则会根据配置的`auto.offset.reset`的值来决定从何处(offset)进行消费，auto.offset.reset共有3个可选配置项：
+
+
+#### OffsetFetchResponseHandler
+
+```
+public void handle(OffsetFetchResponse response, RequestFuture<Map<TopicPartition, OffsetAndMetadata>> future) {
+    if (response.hasError()) {
+        ...// 异常处理
+    }
+
+    Set<String> unauthorizedTopics = null;
+    Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>(response.responseData().size());
+    Set<TopicPartition> unstableTxnOffsetTopicPartitions = new HashSet<>();
+    for (Map.Entry<TopicPartition, OffsetFetchResponse.PartitionData> entry : response.responseData().entrySet()) {
+        TopicPartition tp = entry.getKey();
+        OffsetFetchResponse.PartitionData partitionData = entry.getValue();
+        if (partitionData.hasError()) {
+            Errors error = partitionData.error;
+            log.debug("Failed to fetch offset for partition {}: {}", tp, error.message());
+            if (error == Errors.UNKNOWN_TOPIC_OR_PARTITION) {
+                future.raise(new KafkaException("Topic or Partition " + tp + " does not exist"));
+                return;
+            } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {
+                if (unauthorizedTopics == null) {
+                    unauthorizedTopics = new HashSet<>();
+                }
+                unauthorizedTopics.add(tp.topic());
+            } else if (error == Errors.UNSTABLE_OFFSET_COMMIT) {
+                //重试
+                unstableTxnOffsetTopicPartitions.add(tp);
+            } else {
+                future.raise(new KafkaException("Unexpected error in fetch offset response for partition " +tp + ": " + error.message()));
+                return;
+            }
+        } else if (partitionData.offset >= 0) {
+            // record the position with the offset 
+            offsets.put(tp, new OffsetAndMetadata(partitionData.offset, partitionData.leaderEpoch, partitionData.metadata));
+        } else {
+            // INVALID_OFFSET(-1)   -1 indicates no committed offset to fetch
+            offsets.put(tp, null);
+        }
+    }
+
+    if (unauthorizedTopics != null) {
+        future.raise(new TopicAuthorizationException(unauthorizedTopics));
+    } else if (!unstableTxnOffsetTopicPartitions.isEmpty()) {
+        // just retry
+        future.raise(new UnstableOffsetCommitException("There are unstable offsets for the requested topic partitions"));
+    } else {
+        future.complete(offsets);
+    }
+}
+```
+
+### ListOffsetsRequest
+
+
+进过OffsetFetchRequest请求后，仍未获取到相应的offset的分区，则会根据配置的`auto.offset.reset`的值来决定从何处(offset)进行消费，auto.offset.reset共有3个可选配置项：
 
 * earliest：**默认值**，从分区消息日志的起始处开始消费
 * latest：从分区日志的末尾开始消费
 * none：抛出NoOffsetForPartitionException异常
 
-对于前两种配置，KafkaConsumer通过向GroupCoordinator发送ListOffsetsRequest来获取对应的位移信息，这里的方法调用链为Fetcher#resetOffsetsIfNeeded()->Fetcher#resetOffsetsAsync()->Fetcher#sendListOffsetRequest()。
+```
+public void resetOffsetsIfNeeded() {
+    RuntimeException exception = cachedListOffsetsException.getAndSet(null);
+    if (exception != null)
+        throw exception;
+    //状态为AWAIT_RESET的分区
+    Set<TopicPartition> partitions = subscriptions.partitionsNeedingReset(time.milliseconds());
+    if (partitions.isEmpty())
+        return;
+
+    final Map<TopicPartition, Long> offsetResetTimestamps = new HashMap<>();
+    for (final TopicPartition partition : partitions) {
+        //根据策略转换固定long值
+        Long timestamp = offsetResetStrategyTimestamp(partition);
+        if (timestamp != null)
+            offsetResetTimestamps.put(partition, timestamp);
+    }
+    //发送请求
+    resetOffsetsAsync(offsetResetTimestamps);
+}
+```
+
+ListOffsetsRequest本质是根据请求参数中的timeStamp获取消费者能够fetch的位移，timestamp根据配置的策略决定，如下：
+
+```
+private Long offsetResetStrategyTimestamp(final TopicPartition partition) {
+    OffsetResetStrategy strategy = subscriptions.resetStrategy(partition);
+    if (strategy == OffsetResetStrategy.EARLIEST) // -2L
+        return ListOffsetsRequest.EARLIEST_TIMESTAMP;
+    else if (strategy == OffsetResetStrategy.LATEST)
+        return ListOffsetsRequest.LATEST_TIMESTAMP; // -1L
+    else
+        return null;
+}
+
+```
 
 #### sendListOffsetRequest
 
@@ -248,31 +344,9 @@ private RequestFuture<ListOffsetResult> sendListOffsetRequest(final Node node,fi
 
 ```
 
-ListOffsetsRequest本质是根据请求参数中的timeStamp获取消费者能够fetch的位移，timestamp根据配置的策略决定，如下：
-
-```
-private Long offsetResetStrategyTimestamp(final TopicPartition partition) {
-    OffsetResetStrategy strategy = subscriptions.resetStrategy(partition);
-    if (strategy == OffsetResetStrategy.EARLIEST) // -2L
-        return ListOffsetsRequest.EARLIEST_TIMESTAMP;
-    else if (strategy == OffsetResetStrategy.LATEST)
-        return ListOffsetsRequest.LATEST_TIMESTAMP; // -1L
-    else
-        return null;
-}
-
-```
-
 #### handleListOffsetRequest
 
-Broker端请求处理的入口为KafkaApis#handleListOffsetRequest，整个的请求过程处理有4层：
-
-* 1、KafkaApis#handleListOffsetRequest
-* 2、ReplicaManager#fetchOffsetForTimestamp
-* 3、Partition#fetchOffsetForTimestamp
-* 4、Log#fetchOffsetByTimestamp
-
-我们主要看下Partition#fetchOffsetForTimestamp()方法的实现：
+Broker端请求处理的入口为KafkaApis#handleListOffsetRequest，核心方法Partition#fetchOffsetForTimestamp()的实现：
 
 
 ```
@@ -280,7 +354,7 @@ Broker端请求处理的入口为KafkaApis#handleListOffsetRequest，整个的�
                               isolationLevel: Option[IsolationLevel],
                               currentLeaderEpoch: Optional[Integer],
                               fetchOnlyFromLeader: Boolean): Option[TimestampAndOffset] = inReadLock(leaderIsrUpdateLock) {
-    
+    //获取日志对象
     val localLog = localLogWithEpochOrException(currentLeaderEpoch, fetchOnlyFromLeader)
     
     //consumer隔离级别，获取最新可拉取的位移
@@ -302,9 +376,11 @@ Broker端请求处理的入口为KafkaApis#handleListOffsetRequest，整个的�
 
     timestamp match {
       case ListOffsetsRequest.LATEST_TIMESTAMP =>
+        //返回最新的可拉取位移
         maybeOffsetsError.map(e => throw e)
           .orElse(Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, lastFetchableOffset, Optional.of(leaderEpoch))))
       case ListOffsetsRequest.EARLIEST_TIMESTAMP =>
+        //获取startOffset
         getOffsetByTimestamp
       case _ =>
         //KafkaConsuemr#offsetsForTimes()
