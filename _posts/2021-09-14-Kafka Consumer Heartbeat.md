@@ -14,11 +14,10 @@ KafkaConsumer完成JoinGroup及SyncGroup后，就已经处于正常工作状态�
 
 * consumer的心跳线程超时时，consumer会主动发送leave group请求。
 
-下面我们通过KafkaConsumer心跳发送及GroupCoordinator处理心跳请求来进行源码分析。
 
 ## SendHeartbeatRequest
 
-消费者侧关于心跳发送的源码有两个重要类：Heartbeat和HeartbeatThread，Heartbeat类负责记录当前consumer与GroupCoordinator的交互信息，如心跳、poll时间、session，HeartbeatThread是
+KafkaConsumer关于心跳发送的实现有两个重要类：Heartbeat和HeartbeatThread，Heartbeat类负责记录当前consumer与GroupCoordinator的交互信息，如心跳、poll时间、session，HeartbeatThread是
 心跳线程，负责完成心跳发送。
 
 
@@ -61,7 +60,7 @@ public class Timer {
 
 ### HeartbeatThread
 
-**HeartbeatThread**是KafkaConsumer中的一个单独线程（Java Thread），负责发送心跳，定义如下：
+**HeartbeatThread**是KafkaConsumer中的一个单独线程，负责发送心跳，定义如下：
 
 ```
 private class HeartbeatThread extends KafkaThread implements AutoCloseable {
@@ -159,7 +158,7 @@ public void run() {
                     //心跳发送
                     final RequestFuture<Void> heartbeatFuture = sendHeartbeatRequest();
                     heartbeatFuture.addListener(new RequestFutureListener<Void>() {
-                        ... //心跳监听处理 见下方HeartbeatResponse响应处理
+                        ... //心跳响应处理 见下方HeartbeatResponse响应处理
                     });
                 }
             }
