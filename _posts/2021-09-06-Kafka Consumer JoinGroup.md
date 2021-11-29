@@ -28,8 +28,8 @@ Topic:__consumer_offsets	PartitionCount:50	ReplicationFactor:3	Configs:segment.b
 	Topic: __consumer_offsets	Partition: 1	Leader: 5	Replicas: 5,4,6	Isr: 5
 	Topic: __consumer_offsets	Partition: 2	Leader: 5	Replicas: 6,5,4	Isr: 5
 	Topic: __consumer_offsets	Partition: 3	Leader: 5	Replicas: 4,5,6	Isr: 5
-    ...
-    Topic: __consumer_offsets	Partition: 49	Leader: 5	Replicas: 5,4,6	Isr: 5
+	...
+	Topic: __consumer_offsets	Partition: 49	Leader: 5	Replicas: 5,4,6	Isr: 5
 ```
 
 Consumer通过配置groupId的hash值与`_consumer_offsets`的分区数取模得到对应的分区，如下：
@@ -116,7 +116,7 @@ boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitFo
 
 ## ConsumerCoordinator#poll
 
-ConsumerCoordinator#poll方法的实现：
+ConsumerCoordinator负责KafkaConsumer与GroupCoordinator的交互及本地元信息的维护，poll方法实现如下：
 
 ```
 public boolean poll(Timer timer, boolean waitForJoinGroup) {
@@ -164,6 +164,8 @@ public boolean poll(Timer timer, boolean waitForJoinGroup) {
 * 2、心跳任务，通过pollHeartbeat()唤醒心跳线程，发送心跳并记录pollTimer；
 * 3、消费者入组及再平衡：ensureCoordinatorReady()及ensureActiveGroup()。
 
+接来下通过ensureCoordinatorReady()及ensureActiveGroup()方法的源码实现来分析本文的核心内容：消费组如何完成JoinGroup，可分为以下阶段：
+
 ### FIND_COORDINATOR
 
 ensureCoordinatorReady()方法的作用是向LeastLoadNode(inFlightRequests.size最小)发送FindCoordinatorRequest，查找GroupCoordinator所在的Broker，
@@ -187,6 +189,7 @@ protected synchronized boolean ensureCoordinatorReady(final Timer timer) {
         final RequestFuture<Void> future = lookupCoordinator();
         client.poll(future, timer);
         if (!future.isDone()) { 
+            // ran out of time
             break;
         }
         //异常及重试处理
@@ -223,7 +226,7 @@ private RequestFuture<Void> sendFindCoordinatorRequest(Node node) {
 
 #### handleFindCoordinatorRequest
 
-Broker端处理请求方法入口为KafkaApis#handleFindCoordinatorRequest()，实现如下：
+Broker端处理FindCoordinatorRequest请求方法入口为KafkaApis#handleFindCoordinatorRequest()，实现如下：
 
 
 ```
@@ -288,7 +291,7 @@ Broker端处理请求方法入口为KafkaApis#handleFindCoordinatorRequest()，�
 
 ### JOIN_GROUP
 
-成功找到GroupCoordinator后，Consumer进入JoinGroup阶段，此阶段的Consumer会向GroupCoordinator发送JoinGroupRequest请求，GroupCoordinator会确认ConsumerGroup的Leader及分区分配策略，并响应给
+成功找到GroupCoordinator后，Consumer进入JoinGroup阶段，此阶段的Consumer会向GroupCoordinator发送JoinGroupRequest请求，GroupCoordinator会选出ConsumerGroup中leader的消费者及分区分配策略，并响应给
 消费者。
 
 ![JOIN GROUP](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/join%20group.png)
@@ -509,13 +512,8 @@ def remove(memberId: String): Unit = {
 
 ##### 延迟Join
 
-maybePrepareRebalance方法中通过判断当前group状态若是Stable、CompletingRebalance、Empty其中之一，即可调用prepareRebalance方法，进行Rebalance。
-prepareRebalance方法中并不是直接触发再平衡的，**为了避免多个consumer短时间内均发起JoinGroup请求（如应用启动时），导致频繁的rebalance**，这里Kafka通过DelayedJoin来进行优化：
-
-* 当ConsumerGroup为空时，即第一个消费者加入，创建InitialDelayedJoin，等待时长为group.initial.rebalance.delay.ms；
-* 后续消费者加入时，创建DelayedJoin，等待时长rebalanceTimeoutMs的值为max.poll.interval.ms
-
-同时group的状态也会转为PreparingRebalance。
+maybePrepareRebalance方法中通过判断当前group状态若是Stable、CompletingRebalance、Empty其中之一，即可调用prepareRebalance方法，进行Rebalance，
+同时group的状态也会转为PreparingRebalance。。
 
 ```
 private def maybePrepareRebalance(group: GroupMetadata, reason: String): Unit = {
@@ -540,7 +538,8 @@ val delayedRebalance = if (group.is(Empty))
     max(group.rebalanceTimeoutMs - groupConfig.groupInitialRebalanceDelayMs, 0))
 else
   new DelayedJoin(this, group, group.rebalanceTimeoutMs)
-  // 状态转变为PreparingRebalance
+
+  // 组状态转变为PreparingRebalance
   group.transitionTo(PreparingRebalance)
 
   val groupKey = GroupJoinKey(group.groupId)
@@ -548,22 +547,67 @@ else
 }
 ```
 
+prepareRebalance方法中并不是直接触发再平衡的，**为了避免多个consumer短时间内均发起JoinGroup请求（如应用启动时），导致频繁的rebalance**，这里Kafka通过DelayedJoin来进行优化：
 
-InitialDelayedJoin的父类是DelayedJoin，DelayedJoin的onComplete会调用GroupCoordinator的onCompleteJoin方法响应请求。
+* 当ConsumerGroup不为空时，即当前组内已存在消费者，创建DelayedJoin，等待时长rebalanceTimeoutMs的值为max.poll.interval.ms，任务到期后执行GroupCoordinator#onCompleteJoin()方法：
 
 ```
-private[group] class InitialDelayedJoin(...) extends DelayedJoin(）
-
-rivate[group] class DelayedJoin(...) extends DelayedRebalance(...) {
+private[group] class DelayedJoin(...) extends DelayedRebalance(...) {
   override def tryComplete(): Boolean = coordinator.tryCompleteJoin(group, forceComplete _)
 
   override def onExpiration(): Unit = {
     tryToCompleteDelayedAction()
   }
+  //延时到期后执行GroupCoordinator#onCompleteJoin
   override def onComplete(): Unit = coordinator.onCompleteJoin(group)
   private def tryToCompleteDelayedAction(): Unit = coordinator.groupManager.replicaManager.tryCompleteActions()
 }
 ```
+
+* 当ConsumerGroup为空时，当前消费者为该组的第一个消费者，创建InitialDelayedJoin实现延时任务，该对象有2个时间配置：remainingMs(等待时间)和延时时间(delayMs)，延时到期触发后，先判断是否
+等待时间已耗尽，若耗尽，则执行DelayedJoin#onComplete()，否则更新时间，再次方法延时队列。
+
+```
+private[group] class InitialDelayedJoin(
+  coordinator: GroupCoordinator,
+  purgatory: DelayedOperationPurgatory[DelayedRebalance],
+  group: GroupMetadata,
+  configuredRebalanceDelay: Int,  //group.initial.rebalance.delay.ms  默认3s
+  delayMs: Int,
+  remainingMs: Int ) extends DelayedJoin( coordinator, group, delayMs ) {  //父类为DelayedJoin
+  override def tryComplete(): Boolean = false
+
+  override def onComplete(): Unit = {
+    group.inLock {
+      if (group.newMemberAdded && remainingMs != 0) {
+        // 有新成员加入 且等待时间不为0，继续等待
+        // 重置的等待时间和延时时间
+        group.newMemberAdded = false
+        val delay = min(configuredRebalanceDelay, remainingMs)
+        val remaining = max(remainingMs - delayMs, 0)
+        purgatory.tryCompleteElseWatch(new InitialDelayedJoin(coordinator,
+          purgatory,
+          group,
+          configuredRebalanceDelay,
+          delay,
+          remaining
+        ), Seq(GroupJoinKey(group.groupId)))
+      } else
+        //执行
+        super.onComplete()
+    }
+  }
+}
+```
+
+
+
+
+
+
+InitialDelayedJoin的父类是DelayedJoin，DelayedJoin的onComplete会调用GroupCoordinator的onCompleteJoin方法响应请求。
+
+
 
 ##### 分区分配策略选举及请求响应
 
@@ -632,6 +676,7 @@ initNextGeneration方法：
     if (members.isEmpty)
       throw new IllegalStateException("Cannot select protocol for empty group")
     val candidates = candidateProtocols
+    //遍历所有消费者，投票选举
     val (protocol, _) = allMemberMetadata
       .map(_.vote(candidates))
       .groupBy(identity)
@@ -715,7 +760,7 @@ private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
 ### SYNC_GROUP
 
 上一阶段JOIN_GROUP阶段的最后，leader consumer会根据GroupCoordinator返回的分区分配策略及member metadata完成具体的分区分配。如何将分区分配的结果同步给其它consumer，这里Kafka并没有
-让leader consumer直接将分配结果同步给其它消费者，而是通过GroupCoordinator来实现中转，减少复杂性。此阶段即SYNC_GROUP阶段，**各个消费者会向GroupCoordinator发送SyncGroupRequest请求来同步分配方案**。
+让leader consumer直接将分配结果同步给其它消费者，而是通过GroupCoordinator来实现中转，**减少复杂性**。此阶段即SYNC_GROUP阶段，**各个消费者会向GroupCoordinator发送SyncGroupRequest请求来同步分配方案**。
 
 ![SYNC GROUP](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/sync%20group.png)
 
