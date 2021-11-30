@@ -5,12 +5,12 @@ date:   2021-10-12 17:18:31
 categories: Kafka
 ---
 
-前面几篇内容我们分析了`updateAssignmentMetadataIfNeeded`的执行流程，包含两部分内容：
+前面几篇内容分析了`updateAssignmentMetadataIfNeeded()`的执行流程，包含两部分内容：
 
 * ConsumerCoordinator#poll方法，获取GroupCoordinator，完成JoinGroup及主题分区方案获取，详情见[Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)；
 * KafkaConsumer#updateFetchPositions方法，更新consumer订阅的TopicPartition的有效offset，确认下次消息拉取的偏移量(offset)，详情见[Kafka Consumer UpdateFetchPosition](https://guann1ng.github.io/kafka/2021/09/17/Kafka-Consumer-UpdateFetchPosition/)。
 
-本篇内容我们继续KafkaConsumer#poll方法的后半部分内容，即消息拉取部分，方法为KafkaConsumer#pollForFetches。
+下面继续分析KafkaConsumer#poll方法的后半部分内容，即消息拉取部分：。
 
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
@@ -83,7 +83,7 @@ sendFetches方法的作用是向consumer订阅的所有可发送的TopicPartitio
 
 * 1、prepareFetchRequests()方法中获取所有可发送FetchRequest的分区Broker。**可进行消息拉取的分区有以下三点要求**：
     * TopicPartition对应的分区副本Leader有效(连接正常)；
-    * Leader所在节点没有待发送或挂起的请求**，避免请求积压；
+    * Leader所在节点没有待发送或挂起的请求，避免请求积压；
     * TopicPartition之前的拉取响应数据已全部处理(completedFetches中不存在对应的分区数据)。
 * 2、遍历第一步返回的Broker节点列表，构建FetchRequest，并调用NetworkClient发送；
 * 3、为请求Future对象设置响应处理的Listener。
@@ -159,7 +159,7 @@ Broker端处理FetchRequest的入口为KafkaApis#handleFetchRequest方法，以�
 
 #### RequestFutureListener
 
-FetchRequest请求发送时注册的Listener，会在获取到请求响应时触发回调，主要将响应数据放入`completedFetches`中以及从`nodesWithPendingFetchRequests`将Broker节点移除，以便可以进行
+FetchRequest请求发送时注册的Listener，会在获取到响应时触发回调，主要将响应数据放入`completedFetches`中以及从`nodesWithPendingFetchRequests`将Broker节点移除，以便可以进行
 下次请求的发送。
 
 ```
@@ -176,6 +176,7 @@ future.addListener(new RequestFutureListener<ClientResponse>() {
                }
                if (!handler.handleResponse(response, resp.requestHeader().apiVersion())) {
                    if (response.error() == Errors.FETCH_SESSION_TOPIC_ID_ERROR || response.error() == Errors.UNKNOWN_TOPIC_ID || response.error() == Errors.INCONSISTENT_TOPIC_ID) {
+                       //元数据更新
                        metadata.requestUpdate();
                    }
                    return;
@@ -225,6 +226,38 @@ future.addListener(new RequestFutureListener<ClientResponse>() {
 });
 
 ```
+
+### CompletedFetch
+
+通过FetchRequest请求获取的数据封装为CompletedFetch存储在KafkaConsumer端，其结构如下：
+
+```
+private class CompletedFetch {
+        private final TopicPartition partition; //主题分区
+        private final Iterator<? extends RecordBatch> batches;  //消息
+        private final Set<Long> abortedProducerIds; //中止事务的producerId
+        private final PriorityQueue<FetchResponse.AbortedTransaction> abortedTransactions; //中止的事务id
+        private final FetchResponse.PartitionData<Records> partitionData;  //响应数据
+        private final FetchResponseMetricAggregator metricAggregator;
+        private final short responseVersion;
+
+        private int recordsRead;  //已读取的行数,
+        private int bytesRead;  //已读取的字节数
+        private RecordBatch currentBatch; //正在读取的RecordBatch
+        private Record lastRecord; 
+        private CloseableIterator<Record> records;
+        private long nextFetchOffset;
+        private Optional<Integer> lastEpoch;
+        private boolean isConsumed = false;
+        private Exception cachedRecordException = null;
+        private boolean corruptLastRecord = false;
+        private boolean initialized = false; 
+        
+        ...// 成员方法
+}
+
+```
+
 
 ### fetchedRecords
 

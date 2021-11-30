@@ -15,13 +15,11 @@ KafkaConsumer完成JoinGroup及SyncGroup后，就已经处于正常工作状态�
 * consumer的心跳线程超时时，consumer会主动发送leave group请求。
 
 
-## SendHeartbeatRequest
-
 KafkaConsumer关于心跳发送的实现有两个重要类：Heartbeat和HeartbeatThread，Heartbeat类负责记录当前consumer与GroupCoordinator的交互信息，如心跳、poll时间、session，HeartbeatThread是
 心跳线程，负责完成心跳发送。
 
 
-### Heartbeat
+## Heartbeat
 
 Heartbeat中的时间信息通过Timer类进行维护，并提供了查询更新的方法。以下为类的定义（成员方法后续使用时再介绍）；
 
@@ -58,7 +56,7 @@ public class Timer {
 ```
 
 
-### HeartbeatThread
+## HeartbeatThread
 
 **HeartbeatThread**是KafkaConsumer中的一个单独线程，负责发送心跳，定义如下：
 
@@ -101,14 +99,14 @@ private class HeartbeatThread extends KafkaThread implements AutoCloseable {
 }
 ```
 
-#### run方法
+### run方法
 
 HeartbeatThread#run方法内是具体的心跳发送逻辑，心跳发送前会经过以下判断：
 
 * 1、获取AbstractCoordinator对象锁，保证线程安全；
 * 2、coordinator未知(为null或无法连接)时，会去查找coordinator，若还是失败，则等待重试，retryBackoffMs表示重试间隔；
 * 3、consumer端计算sessionTimeout，超时后标记coordinator未知；
-* 4、consumer的两次poll间隔超过了maxPollIntervalMs，发起Leave Group请；
+* 4、consumer的两次poll间隔超过了maxPollIntervalMs，发起Leave Group请求；
 * 5、Heartbeat#shouldHeartbeat，判断是否到达心跳发送时间。
 
 通过后，才会发送心跳，方法源码如下：
@@ -172,7 +170,14 @@ public void run() {
     }
 }
 ```
-### 心跳请求
+
+run()方法中与心跳相关的核心请求有两种：HeartbeatRequest和LeaveGroupRequest。
+
+## HeartbeatRequest
+
+HeartbeatRequest处理流程如下：
+
+### SendHeartbeatRequest
 
 AbstractCoordinator#sendHeartbeatRequest()方法中完成请求的构建及发送，并添加HeartbeatResponseHandler响应处理器。
 
@@ -191,11 +196,11 @@ synchronized RequestFuture<Void> sendHeartbeatRequest() {
 ```
 
 
-## HandleHeartbeatRequest
+### HandleHeartbeatRequest
 
 Broker端对应的API为KafkaApis#handleHeartbeatRequest，调用链为：KafkaApis#handleHeartbeatRequest()->GroupCoordinator.handleHeartbeat()
 ->GroupCoordinator#completeAndScheduleNextHeartbeatExpiration()->GroupCoordinator#completeAndScheduleNextExpiration()。下面我们主要分析下
-handleHeartbeat及completeAndScheduleNextExpiration方法。
+handleHeartbeat()及completeAndScheduleNextExpiration()方法。
 
 ```
 def handleHeartbeat(groupId: String,
@@ -261,7 +266,7 @@ handleHeartbeat方法内根据group的状态对heartbeatRequest做出响应：
 * PreparingRebalance时，心跳正常处理，但需返回Errors.REBALANCE_IN_PROGRESS，通知组内消费者rejoin group；
 * CompletingRebalance及Stable，心跳正常处理
 
-### DelayedHeartbeat
+#### DelayedHeartbeat
 
 completeAndScheduleNextExpiration方法中完成该consumer本次的DelayedHeartbeat心跳延时任务，并构建新的延时任务监控下次心跳情况。
 
@@ -291,14 +296,15 @@ private[group] class DelayedHeartbeat(coordinator: GroupCoordinator,
                                       isPending: Boolean,
                                       timeoutMs: Long)
   extends DelayedOperation(timeoutMs, Some(group.lock)) {
-
+ 
   override def tryComplete(): Boolean = coordinator.tryCompleteHeartbeat(group, memberId, isPending, forceComplete _)
+  //心跳超时执行
   override def onExpiration(): Unit = coordinator.onExpireHeartbeat(group, memberId, isPending)
   override def onComplete(): Unit = {}
 }
 ```
 
-对于心跳超时的consumer，会被group移除，若移除的是leader，需重新选举consumer leader，然后将group的状态转化为PreparingRebalance，触发其它consumer的rejoin group和rebalance。
+对于心跳超时的consumer，会被group移除，若移除的是leader，需重新选举consumer leader，然后调用maybePrepareRebalance()判断否进行group rebalance。
 
 ```
 //心跳超时处理
@@ -306,7 +312,7 @@ def onExpireHeartbeat(group: GroupMetadata, memberId: String, isPending: Boolean
     group.inLock {
       if (group.is(Dead)) {
       } else if (isPending) {
-        ...
+        removePendingMemberAndUpdateGroup(group, memberId)  //正在执行JoinGroup
       } else if (!group.has(memberId)) {
       } else {
         val member = group.get(memberId)
@@ -328,16 +334,62 @@ private def removeMemberAndUpdateGroup(group: GroupMetadata, member: MemberMetad
     case Dead | Empty =>
     //触发rebalance
     case Stable | CompletingRebalance => maybePrepareRebalance(group, reason)  
+    //检查是否可以将JoinGroup请求任务完成
     case PreparingRebalance => rebalancePurgatory.checkAndComplete(GroupJoinKey(group.groupId))
   }
 }
 ```
+maybePrepareRebalance()方法源码如下：
 
-## HeartbeatResponse响应处理
+```
+  private def maybePrepareRebalance(group: GroupMetadata, reason: String): Unit = {
+    group.inLock {
+      //group 的状态为 Stable || CompletingRebalance || Empty 
+      if (group.canRebalance)
+        prepareRebalance(group, reason)
+    }
+  }
+
+  private[group] def prepareRebalance(group: GroupMetadata, reason: String): Unit = {
+    
+    if (group.is(CompletingRebalance))
+      //group正在进行rebalance,废弃当前分配方案，返回Errors.REBALANCE_IN_PROGRESS，使组内消费者rejoin
+      resetAndPropagateAssignmentError(group, Errors.REBALANCE_IN_PROGRESS)
+
+    // 取消SYNC_GROUP请求响应
+    removeSyncExpiration(group)
+    //创建rejoin任务
+    val delayedRebalance = if (group.is(Empty))
+      new InitialDelayedJoin(this,
+        rebalancePurgatory,
+        group,
+        groupConfig.groupInitialRebalanceDelayMs,
+        groupConfig.groupInitialRebalanceDelayMs,
+        max(group.rebalanceTimeoutMs - groupConfig.groupInitialRebalanceDelayMs, 0))
+    else
+      new DelayedJoin(this, group, group.rebalanceTimeoutMs)
+    //组状态
+    group.transitionTo(PreparingRebalance)
+
+    info(s"Preparing to rebalance group ${group.groupId} in state ${group.currentState} with old generation " +
+      s"${group.generationId} (${Topic.GROUP_METADATA_TOPIC_NAME}-${partitionFor(group.groupId)}) (reason: $reason)")
+
+    val groupKey = GroupJoinKey(group.groupId)
+    rebalancePurgatory.tryCompleteElseWatch(delayedRebalance, Seq(groupKey))
+  }
+```
+
+若有consumer因心跳超时被移除，则需要进行rebalance，可概括为三部分内容：
+
+* 1、若group状态为CompletingRebalance，即group内所有consumer已完成JoinGroup阶段，正在进行SyncGroup，此时废弃当前分配方案，返回Errors.REBALANCE_IN_PROGRESS，使组内消费者rejoin；
+* 2、创建JoinGroup任务，等待consumer再次发起JoinGroup请求，进行rebalance；
+* 3、将group状态置为PreparingRebalance。
+
+### HandleHeartbeatResponse
 
 对心跳响应的处理主要有两部分，发送请求时注册的HeartbeatResponseHandler以及对heartbeatFuture添加的RequestFutureListener。
 
-### HeartbeatResponseHandler
+#### HeartbeatResponseHandler
 
 HeartbeatResponseHandler中主要是对异常分类出路，其中**Errors.REBALANCE_IN_PROGRESS**会触发consumer的rejoin group，进行rebalance。
 
@@ -358,6 +410,7 @@ public void handle(HeartbeatResponse heartbeatResponse, RequestFuture<Void> futu
         //group正在进行rebalance
         synchronized (AbstractCoordinator.this) {
             if (state == MemberState.STABLE) {
+                //标记，需重新发起joingroup
                 requestRejoin("group is already rebalancing");
                 future.raise(error);
             } else {
@@ -365,9 +418,7 @@ public void handle(HeartbeatResponse heartbeatResponse, RequestFuture<Void> futu
                 future.complete(null);
             }
         }
-    } else if (error == Errors.ILLEGAL_GENERATION ||
-               error == Errors.UNKNOWN_MEMBER_ID ||
-               error == Errors.FENCED_INSTANCE_ID) {
+    } else if (error == Errors.ILLEGAL_GENERATION || error == Errors.UNKNOWN_MEMBER_ID || error == Errors.FENCED_INSTANCE_ID) {
         if (generationUnchanged()) {
             log.info("Attempt to heartbeat with {} and group instance id {} failed due to {}, resetting generation",
                 sentGeneration, rebalanceConfig.groupInstanceId, error);
@@ -389,7 +440,7 @@ public void handle(HeartbeatResponse heartbeatResponse, RequestFuture<Void> futu
 ```
 
 
-### RequestFutureListener
+#### RequestFutureListener
 
 RequestFutureListener主要是完成心跳时间的更新。
 
@@ -424,6 +475,147 @@ heartbeatFuture.addListener(new RequestFutureListener<Void>() {
     }
 });
 
+```
+
+## LeaveGroupRequest
+
+KafkaConsumer可通过主动发送LeaveGroupRequest，表明中止消息消费，触发group rebalance，且KafkaConsumer状态会重置为`UNJOINED`。KafkaConsumer主动发送LeaveGroupRequest存在三种情况：
+
+* 心跳线程检测到KafkaConsumer两次poll时间间隔超过`max.poll.interval.ms`；
+* KafkaConsumer调用`KafkaConsumer#unsubscribe()`方法，取消对所有Topic的消费；
+* KafkaConsumer配置项`internal.leave.group.on.close`为true，执行close()方法时主动发送，否则等待session.timeout.ms，有GroupCoordinator移除。
+
+
+### SendLeaveGroupRequest
+
+请求发送的入口方法为：`AbstractCoordinator#maybeLeaveGroup()`，源码如下：
+
+```
+public synchronized RequestFuture<Void> maybeLeaveGroup(String leaveReason) {
+    RequestFuture<Void> future = null;
+
+    // Starting from 2.3, only dynamic members will send LeaveGroupRequest to the broker,
+    // consumer with valid group.instance.id is viewed as static member that never sends LeaveGroup,
+    // and the membership expiration is only controlled by session timeout.
+    if (isDynamicMember() && !coordinatorUnknown() && state != MemberState.UNJOINED && generation.hasMemberId()) {
+        // this is a minimal effort attempt to leave the group. we do not
+        // attempt any resending if the request fails or times out.
+        //LeaveGroupRequest不会进行重试
+        LeaveGroupRequest.Builder request = new LeaveGroupRequest.Builder(rebalanceConfig.groupId,Collections.singletonList(new MemberIdentity().setMemberId(generation.memberId)));
+        //请求发送
+        future = client.send(coordinator, request).compose(new LeaveGroupResponseHandler(generation));
+        client.pollNoWakeup();
+    }
+    //Consumer状态会重置为UNJOINED 及rejoinNeeded = true;
+    resetGenerationOnLeaveGroup();
+
+    return future;
+}
+```
+
+若KafkaConsumer配置了`group.instance.id`，则此consumer被视为该group的**static member**，永远不会发送LeaveGroup请求，**可结合较大的`session.timeout.ms`配置，以避免由暂时不可用（例如进程重新启动）引起的group rebalance。**
+
+### HandleLeaveGroupRequest
+
+GroupCoordinator处理LeaveGroupRequest的流程如下：
+
+```
+   def handleLeaveGroup(groupId: String,
+                       leavingMembers: List[MemberIdentity],
+                       responseCallback: LeaveGroupResult => Unit): Unit = {
+    //执行移除成员函数
+    def removeCurrentMemberFromGroup(group: GroupMetadata, memberId: String): Unit = {
+      val member = group.get(memberId)
+      //当memberId从group移除，并触发再平衡  同心跳任务超时，源码见上方
+      removeMemberAndUpdateGroup(group, member, s"Removing member $memberId on LeaveGroup")
+      //移除该成员的心跳任务
+      removeHeartbeatForLeavingMember(group, member.memberId)
+      info(s"Member $member has left group $groupId through explicit `LeaveGroup` request")
+    }
+
+    validateGroupStatus(groupId, ApiKeys.LEAVE_GROUP) match {
+      case Some(error) =>
+        responseCallback(leaveError(error, List.empty))
+      case None =>
+        groupManager.getGroup(groupId) match {
+          case None =>
+            responseCallback(leaveError(Errors.NONE, leavingMembers.map {leavingMember =>
+              memberLeaveError(leavingMember, Errors.UNKNOWN_MEMBER_ID)
+            }))
+          case Some(group) =>
+            group.inLock {
+              if (group.is(Dead)) {
+                responseCallback(leaveError(Errors.COORDINATOR_NOT_AVAILABLE, List.empty))
+              } else {
+                val memberErrors = leavingMembers.map { leavingMember =>
+                  val memberId = leavingMember.memberId
+                  val groupInstanceId = Option(leavingMember.groupInstanceId)
+
+                  if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+                    groupInstanceId.flatMap(group.currentStaticMemberId) match {
+                      case Some(currentMemberId) =>
+                        removeCurrentMemberFromGroup(group, currentMemberId)
+                        memberLeaveError(leavingMember, Errors.NONE)
+                      case None =>
+                        memberLeaveError(leavingMember, Errors.UNKNOWN_MEMBER_ID)
+                    }
+                  } else if (group.isPendingMember(memberId)) {
+                    //正在JoinGrup的consumre
+                    removePendingMemberAndUpdateGroup(group, memberId)
+                    //取消心跳任务
+                    heartbeatPurgatory.checkAndComplete(MemberKey(group.groupId, memberId))
+                    memberLeaveError(leavingMember, Errors.NONE)
+                  } else {
+                    val memberError = validateCurrentMember(
+                      group,
+                      memberId,
+                      groupInstanceId,
+                      operation = "leave-group"
+                    ).getOrElse {
+                      //将consumer移除
+                      removeCurrentMemberFromGroup(group, memberId)
+                      Errors.NONE
+                    }
+                    memberLeaveError(leavingMember, memberError)
+                  }
+                }
+                responseCallback(leaveError(Errors.NONE, memberErrors))
+              }
+            }
+        }
+    }
+  }
+```
+
+除去一些检验逻辑，和consumer因心跳超时被GroupCoordinator移除的逻辑一致，核心方法均为`removeMemberAndUpdateGroup()`(源码详解见上方)。
+
+### HandleLeaveGroupResponse
+
+LeaveGroupResponse的处理十分简单，若存在异常，仅做记录，不会自行对LeaveGroupRequest进行重试。
+
+```
+private class LeaveGroupResponseHandler extends CoordinatorResponseHandler<LeaveGroupResponse, Void> {
+    private LeaveGroupResponseHandler(final Generation generation) {
+        super(generation);
+    }
+
+    @Override
+    public void handle(LeaveGroupResponse leaveResponse, RequestFuture<Void> future) {
+        final List<MemberResponse> members = leaveResponse.memberResponses();
+        if (members.size() > 1) {
+            future.raise(new IllegalStateException("The expected leave group response " +
+                                                       "should only contain no more than one member info, however get " + members));
+        }
+        final Errors error = leaveResponse.error();
+        if (error == Errors.NONE) {
+            log.debug("LeaveGroup response with {} returned successfully: {}", sentGeneration, response);
+            future.complete(null);
+        } else {
+            log.error("LeaveGroup request with {} failed with error: {}", sentGeneration, error.message());
+            future.raise(error);
+        }
+    }
+}
 ```
 
 ## 相关参数

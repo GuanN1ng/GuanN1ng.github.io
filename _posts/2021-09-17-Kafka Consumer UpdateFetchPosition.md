@@ -58,9 +58,9 @@ private boolean updateFetchPositions(final Timer timer) {
 
 主要关注两部分内容：
 
-* 2、refreshCommittedOffsetsIfNeeded()：对FetchState为INITIALIZING的分区，向groupCoordinator发送请求OffsetFetchRequest，获取并更新TopicPartition对应的committed offsets；
+* refreshCommittedOffsetsIfNeeded()：对FetchState为INITIALIZING的分区，向groupCoordinator发送请求OffsetFetchRequest，获取并更新TopicPartition对应的committed offsets；
 
-* 3、resetOffsetsIfNeeded()：经过第2步，若仍存在没有位移信息的分区，向groupCoordinator发送请求ListOffsetsRequest，按照auto.offset.reset执行offset重置。
+* resetOffsetsIfNeeded()：若仍存在没有位移信息的分区，向groupCoordinator发送请求ListOffsetsRequest，按照auto.offset.reset执行offset重置。
 
 
 ### TopicPartitionState
@@ -83,7 +83,7 @@ private static class TopicPartitionState {
     private Long preferredReadReplicaExpireTimeMs;
     private boolean endOffsetRequested;
     
-    ...//方法
+    ...//成员方法
 }
 
 ```
@@ -114,9 +114,9 @@ public synchronized void assignFromSubscribed(Collection<TopicPartition> assignm
 FetchState：
 
 * INITIALIZING：初始化状态；
-* FETCHING：正常更新状态；
+* FETCHING：正常消费状态；
 * AWAIT_RESET：没有消费进度或丢失，待重置，auto.offset.reset：earliest或者latest；
-* AWAIT_VALIDATION：订阅元数据发生变化，待发送OffsetsForLeaderEpochRequest重新获取。
+* AWAIT_VALIDATION：订阅元数据发生变化，通过发送OffsetsForLeaderEpochRequest重新获取。
 
 ### OffsetFetchRequest
 
@@ -280,7 +280,7 @@ public void handle(OffsetFetchResponse response, RequestFuture<Map<TopicPartitio
 ### ListOffsetsRequest
 
 
-进过OffsetFetchRequest请求后，仍未获取到相应的offset的分区，则会根据配置的`auto.offset.reset`的值来决定从何处(offset)进行消费，auto.offset.reset共有3个可选配置项：
+经过OffsetFetchRequest请求后，仍未获取到相应的offset的分区，则会根据配置的`auto.offset.reset`的值来决定从何处(offset)进行消费，auto.offset.reset共有3个可选配置项：
 
 * earliest：**默认值**，从分区消息日志的起始处开始消费
 * latest：从分区日志的末尾开始消费
@@ -298,7 +298,7 @@ public void resetOffsetsIfNeeded() {
 
     final Map<TopicPartition, Long> offsetResetTimestamps = new HashMap<>();
     for (final TopicPartition partition : partitions) {
-        //根据策略转换固定long值
+        //根据策略转换固定时间戳
         Long timestamp = offsetResetStrategyTimestamp(partition);
         if (timestamp != null)
             offsetResetTimestamps.put(partition, timestamp);
@@ -388,7 +388,6 @@ Broker端请求处理的入口为KafkaApis#handleListOffsetRequest，核心方�
           .orElse(maybeOffsetsError.map(e => throw e))
     }
   }
-
 ```
 
 Log层的源码实现后续分析Server端日志存储时再进行分析。
