@@ -12,10 +12,10 @@ KafkaConsumer完成JoinGroup及SyncGroup后，就已经处于正常工作状态�
 * 心跳是GroupCoordinator通知consumer其所属的group状态变化的通道。如有新的消费者入组导致rebalance，当group内已处于stable的consumer发送心跳时,GroupCoordinator会通过Errors.REBALANCE_IN_PROGRESS
 异常告知consumer进行rejoin group；
 
-* consumer的心跳线程超时时，consumer会主动发送leave group请求。
+* consumer的心跳线程会检测两次两次poll()方法(消息拉取)的间隔时间，若超过max.poll.interval.ms，consumer会主动发送leave group请求。
 
 
-KafkaConsumer关于心跳发送的实现有两个重要类：Heartbeat和HeartbeatThread，Heartbeat类负责记录当前consumer与GroupCoordinator的交互信息，如心跳、poll时间、session，HeartbeatThread是
+KafkaConsumer关于心跳发送的实现有两个重要类：Heartbeat和HeartbeatThread，Heartbeat类负责记录当前consumer与GroupCoordinator的交互信息，如心跳、poll、session的时间，HeartbeatThread是
 心跳线程，负责完成心跳发送。
 
 
