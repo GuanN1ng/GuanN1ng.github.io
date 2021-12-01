@@ -7,10 +7,10 @@ categories: Kafka
 
 KafkaConsumer完成JoinGroup及SyncGroup后，就已经处于正常工作状态。此后consumer需要向GroupCoordinator定时发送心跳请求，心跳主要有以下几点功能：
 
-* 心跳是GroupCoordinator判断consumer是否存活的依据，若一个consumer未在指定时间内发送心跳，group将移除该consumer，并触发rebalance；
+* 心跳是GroupCoordinator判断consumer是否存活的依据，若GroupCoordinator在指定时间(heartbeat.interval.ms)内未能收到consumer发送的心跳，group将移除该consumer，并触发rebalance；
 
-* 心跳是GroupCoordinator通知consumer其所属的group状态变化的通道。如发生consumer JoinGroup或LeaveGroup时，group状态将置为PreparingRebalance，当group内已处于stable的consumer发送心跳时,GroupCoordinator会响应Errors.REBALANCE_IN_PROGRESS
-异常告知consumer进行rejoin group；
+* GroupCoordinator可通过心跳响应通知consumer当前group的状态变化。如发生consumer JoinGroup或LeaveGroup时，group状态将置为PreparingRebalance，当group内的consumer发送心跳时,GroupCoordinator会响应Errors.REBALANCE_IN_PROGRESS
+异常触发consumer进行rejoin group；
 
 * consumer的心跳线程会检测两次两次poll()方法(消息拉取)的间隔时间，若超过max.poll.interval.ms，consumer会主动发送leave group请求。
 
