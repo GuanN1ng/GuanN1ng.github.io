@@ -101,15 +101,7 @@ private class HeartbeatThread extends KafkaThread implements AutoCloseable {
 
 ### run方法
 
-HeartbeatThread#run方法内是具体的心跳发送逻辑，心跳发送前会经过以下判断：
-
-* 1、获取AbstractCoordinator对象锁，保证线程安全；
-* 2、coordinator未知(为null或无法连接)时，会去查找coordinator，若还是失败，则等待重试，retryBackoffMs表示重试间隔；
-* 3、consumer端计算sessionTimeout，超时后标记coordinator未知；
-* 4、consumer的两次poll间隔超过了maxPollIntervalMs，发起Leave Group请求；
-* 5、Heartbeat#shouldHeartbeat，判断是否到达心跳发送时间。
-
-通过后，才会发送心跳，方法源码如下：
+HeartbeatThread#run()方法源码如下：
 
 ```
 @Override
@@ -170,8 +162,15 @@ public void run() {
     }
 }
 ```
+run()方法是具体的心跳发送逻辑，心跳发送前会经过以下判断：
 
-run()方法中与心跳相关的核心请求有两种：HeartbeatRequest和LeaveGroupRequest。
+* 1、获取AbstractCoordinator对象锁，保证线程安全；
+* 2、coordinator未知(为null或无法连接)时，会去查找coordinator，若还是失败，则等待重试，retryBackoffMs表示重试间隔；
+* 3、consumer端计算sessionTimeout，超时后标记coordinator未知；
+* 4、consumer的两次poll间隔超过了maxPollIntervalMs，发起Leave Group请求；
+* 5、Heartbeat#shouldHeartbeat，判断是否到达心跳发送时间。
+
+其中与心跳相关的核心请求有两种：**HeartbeatRequest和LeaveGroupRequest**。
 
 ## HeartbeatRequest
 
