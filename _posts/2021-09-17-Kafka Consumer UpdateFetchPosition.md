@@ -5,8 +5,8 @@ date:   2021-09-17 14:32:14
 categories: Kafka
 ---
 
-前面两篇内容已经介绍了consumer的join group以及heartbeat内容，consumer已经获取到TopicPartition的分配方案，但还不能开始进行消息拉取，consumer不知道该从TopicPartition的哪个位置(offset)开始消费，本文将继续分析consumer
-如何更新订阅主题分区的消费offset。
+前面已经介绍了consumer的join group以及heartbeat内容，consumer已经获取到TopicPartition的分配方案，但还不能开始进行消息拉取，此时consumer并不知道该从TopicPartition的哪个位置(offset)开始消费，本文将继续分析consumer
+如何更新订阅主题分区的消费偏移量(offset)。
 
 [Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)中分析KafkaConsumer#updateAssignmentMetadataIfNeeded()方法时，只分析了ConsumerCoordinator#poll的方法调用：
 
@@ -19,7 +19,7 @@ boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitFo
 }
 ```
 
-coordinator.poll完成了consumer入组的完整过程，包括：
+coordinator.poll()方法中consumer完成了JoinGroup的完整过程，包括：
 
 * 1、FIND_COORDINATOR：获取GroupCoordinator的地址并建立TCP连接；
 * 2、JOIN_GROUP：consumer leader选举及分区策略选举，触发rebalance；
@@ -70,7 +70,7 @@ consumer端会保存订阅的每个TopicPartition的消费进度信息，并在�
 ```
 private static class TopicPartitionState {
 
-    private FetchState fetchState;
+    private FetchState fetchState; //消费进度状态
     private FetchPosition position; // last consumed position
 
     private Long highWatermark; // the high watermark from last fetch
@@ -204,7 +204,7 @@ GroupCoordinator的响应由offsetFetchResponseHandler进行数据预处理并�
                   //新订阅的主题，不存在消费进度，返回INVALID_OFFSET Errors.NONE
                   new PartitionData(OffsetFetchResponse.INVALID_OFFSET,Optional.empty(), "", Errors.NONE)
                 case Some(offsetAndMetadata) =>
-                  //返回last consumed offset
+                  //获取元数据中保存的消费进度， 返回last consumed offset
                   new PartitionData(offsetAndMetadata.offset,offsetAndMetadata.leaderEpoch, offsetAndMetadata.metadata, Errors.NONE)
               }
               topicPartition -> partitionData
@@ -226,6 +226,9 @@ GroupCoordinator获取不到该主题分区的offset，返回INVALID_OFFSET(`NVA
 
 
 #### OffsetFetchResponseHandler
+
+OffsetFetchResponse会返回对应分区的消费进度，若offset有效(partitionData.offset >= 0)，则更新TopicPartitionState等元数据，若无效(INVALID_OFFSET)
+则不做处理。
 
 ```
 public void handle(OffsetFetchResponse response, RequestFuture<Map<TopicPartition, OffsetAndMetadata>> future) {
@@ -325,7 +328,52 @@ private Long offsetResetStrategyTimestamp(final TopicPartition partition) {
 
 #### sendListOffsetRequest
 
-请求发送源码如下：
+resetOffsetsAsync()方法主要是对分区数据按照leader副本所在节点进行分组，然后遍历发送并注册处理响应的Listener。
+
+```
+private void resetOffsetsAsync(Map<TopicPartition, Long> partitionResetTimestamps) {
+    //根据TopicPartition leader副本所在节点 进行分组
+    Map<Node, Map<TopicPartition, ListOffsetsPartition>> timestampsToSearchByNode =
+            groupListOffsetRequests(partitionResetTimestamps, new HashSet<>());
+    for (Map.Entry<Node, Map<TopicPartition, ListOffsetsPartition>> entry : timestampsToSearchByNode.entrySet()) {
+        //按照节点发送请求
+        
+        Node node = entry.getKey();
+        final Map<TopicPartition, ListOffsetsPartition> resetTimestamps = entry.getValue();
+        subscriptions.setNextAllowedRetry(resetTimestamps.keySet(), time.milliseconds() + requestTimeoutMs);
+
+        RequestFuture<ListOffsetResult> future = sendListOffsetRequest(node, resetTimestamps, false);
+        future.addListener(new RequestFutureListener<ListOffsetResult>() {
+            @Override
+            public void onSuccess(ListOffsetResult result) {
+                if (!result.partitionsToRetry.isEmpty()) {
+                    subscriptions.requestFailed(result.partitionsToRetry, time.milliseconds() + retryBackoffMs);
+                    metadata.requestUpdate();
+                }
+                
+                for (Map.Entry<TopicPartition, ListOffsetData> fetchedOffset : result.fetchedOffsets.entrySet()) {
+                    //更新TopicPartitionState
+                    TopicPartition partition = fetchedOffset.getKey();
+                    ListOffsetData offsetData = fetchedOffset.getValue();
+                    ListOffsetsPartition requestedReset = resetTimestamps.get(partition);
+                    resetOffsetIfNeeded(partition, timestampToOffsetResetStrategy(requestedReset.timestamp()), offsetData);
+                }
+            }
+
+            @Override
+            public void onFailure(RuntimeException e) {
+                subscriptions.requestFailed(resetTimestamps.keySet(), time.milliseconds() + retryBackoffMs);
+                metadata.requestUpdate();
+                if (!(e instanceof RetriableException) && !cachedListOffsetsException.compareAndSet(null, e))
+                    log.error("Discarding error in ListOffsetResponse because another error is pending", e);
+            }
+        });
+    }
+}
+
+```
+
+请求发送：
 
 ```
 private RequestFuture<ListOffsetResult> sendListOffsetRequest(final Node node,final Map<TopicPartition, ListOffsetsPartition> timestampsToSearch,boolean requireTimestamp) {
