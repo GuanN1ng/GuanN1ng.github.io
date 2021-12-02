@@ -260,10 +260,11 @@ fetchMessages()方法实现如下：
 
 fetchMessages()方法执行流程如下：
 
-* 确定日志可读取的位置上限及是否必须从leader副本读取数据：
-  * fetch请求为follower副本的同步请求，则必须leader副本读取，上限位置为FetchLogEnd日志末尾；
-  * fetch请求为consumer拉取消息的请求，若事务隔离级别为READ_COMMITTED，则
-  * fetch请求为consumer拉取消息的请求，若事务隔离级别为READ_UNCOMMITTED或无配置，
+* 确定可读取日志的范围的及是否必须从leader副本读取数据：
+  * fetch请求为follower副本的同步请求，则必须从leader副本读取，上限位置为FetchLogEnd，即日志末尾；
+  * fetch请求为consumer拉取消息的请求，不要求必须从leader副本读取消息：
+    * 若隔离级别为READ_COMMITTED，上限位置为LastStableOffset
+    * 若隔离级别为READ_UNCOMMITTED，上限位置为HighWaterMark
 * 调用readFromLocalLog()方法读取消息；
 * 判断是否立即返回，否则通过延时操作延时返回。
 
