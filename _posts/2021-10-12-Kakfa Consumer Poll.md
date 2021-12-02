@@ -79,16 +79,11 @@ private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer tim
 
 # sendFetches
 
-sendFetches方法的作用是向consumer订阅的所有可发送的TopicPartition发送FetchRequest拉取消息，可分为以下三步：
+sendFetches方法的主要作用是向consumer订阅的所有可发送的TopicPartition发送FetchRequest拉取消息，并将结果缓存到本地。
 
-* 1、prepareFetchRequests()方法中获取所有可发送FetchRequest的分区节点与对应的请求数据。**可进行消息拉取的分区有以下三点要求**：
-    * TopicPartition之前的拉取响应数据已全部处理(详见fetchablePartitions()方法)。
-    * TopicPartition对应的分区副本节点有效(连接正常)；
-    * 待读取副本所在节点没有待发送或挂起的请求，避免请求积压；
-    
-* 2、遍历第一步返回的<Broker,FetchRequestData>集合，构建FetchRequest，并调用NetworkClient发送；
-* 3、为请求Future对象设置响应处理的Listener。
+## sendFetchRequest
 
+Fetch请求发送流程如下：
 
 ```
 public synchronized int sendFetches() {
@@ -127,8 +122,17 @@ public synchronized int sendFetches() {
     return fetchRequestMap.size();
 }
 ```
+方法可分为3步：
 
-## selectReadReplica
+* 1、prepareFetchRequests()方法中获取所有可发送FetchRequest的分区节点与对应的请求数据。**可进行消息拉取的分区有以下三点要求**：
+  * TopicPartition之前的拉取响应数据已全部处理(详见fetchablePartitions()方法)。
+  * TopicPartition对应的分区副本节点有效(连接正常)；
+  * 待读取副本所在节点没有待发送或挂起的请求，避免请求积压；
+
+* 2、遍历第一步返回的<Broker,FetchRequestData>集合，构建FetchRequest，并调用NetworkClient发送；
+* 3、为请求Future对象设置响应处理的Listener。
+
+### selectReadReplica
 
 Kafka2.4后支持consumer从follower副本中读取消息，以减少集群环境下跨数据中心的流量，prepareFetchRequests()方法获取目标副本节点时优先使用Broker返回的preferredReadReplica节点。
 
@@ -154,9 +158,9 @@ Kafka2.4后支持consumer从follower副本中读取消息，以减少集群环�
   }
 ```
 
-支持KafkaConsumer读取follower副本的详情可见：[KIP-392: Allow consumers to fetch from closest replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica) 。
+KafkaConsumer读取follower副本的特性可见：[KIP-392: Allow consumers to fetch from closest replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica) 。
 
-## sendFetchRequest
+### send
 
 FetchRequest的发送很简单，将请求放入待发送队列`unsent`中，调用NetworkClient的wakeup()方法，唤醒可能阻塞在poll中的NetworkClient，尽快的发送队列中的请求。
 
@@ -639,7 +643,7 @@ private[log] class AbortedTxn(val buffer: ByteBuffer) {
 
 ### LogSegment#read
 
-LogSegment#read()的主要功能时进行文件读取，
+LogSegment#read()的主要功能时进行文件读取，这里需要完成消息偏移量到文件物理位置的转换查找，即`translateOffset()`方法，
 
 ```
   def read(startOffset: Long,
@@ -648,7 +652,7 @@ LogSegment#read()的主要功能时进行文件读取，
            minOneMessage: Boolean = false): FetchDataInfo = {
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
-    //偏移量转为文件的物理位置
+    //偏移量转为文件的物理位置  
     val startOffsetAndSize = translateOffset(startOffset)
 
     //未找到对应的信息
@@ -674,8 +678,8 @@ LogSegment#read()的主要功能时进行文件读取，
   }
 ```
 
-#### FileRecords#slice
 
+#### FileRecords#slice
 
 文件IO实现如下：
 
