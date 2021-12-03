@@ -79,7 +79,7 @@ private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer tim
 
 # sendFetches
 
-sendFetches方法的主要作用是向consumer订阅的所有可发送的TopicPartition发送FetchRequest拉取消息，并将结果缓存到本地。
+sendFetches()方法的主要作用是向consumer订阅的所有可发送的TopicPartition发送FetchRequest拉取消息，并将结果缓存到consumer本地。
 
 ## sendFetchRequest
 
@@ -88,7 +88,7 @@ Fetch请求发送流程如下：
 ```
 public synchronized int sendFetches() {
     sensors.maybeUpdateAssignment(subscriptions);
-    //获取可发送的Broker
+    //准备请求数据，主要是获取可发送的分区节点及相应的请求数据
     Map<Node, FetchSessionHandler.FetchRequestData> fetchRequestMap = prepareFetchRequests();
     for (Map.Entry<Node, FetchSessionHandler.FetchRequestData> entry : fetchRequestMap.entrySet()) {
         final Node fetchTarget = entry.getKey();
@@ -182,7 +182,7 @@ Broker端处理FetchRequest的入口为KafkaApis#handleFetchRequest方法，相�
 * KafkaApis#handleFetchRequest
 * ReplicaManager#fetchMessages
 * Partition#readRecords
-* Log#read
+* LocalLog#read
 * LogSegment#read
 
 KafkaApis#handleFetchRequest()中更多的逻辑是参数验证及响应定义，下面从ReplicaManager#fetchMessages()方法开始分析。
@@ -204,9 +204,9 @@ fetchMessages()方法实现如下：
     val fetchIsolation = if (!isFromConsumer)
       FetchLogEnd //同步请求，上限为log结尾
     else if (isolationLevel == IsolationLevel.READ_COMMITTED)
-      FetchTxnCommitted  //  consumer隔离级别READ_COMMITTED
+      FetchTxnCommitted  //  consumer隔离级别READ_COMMITTED 消息读取位置上限为LOS
     else
-      FetchHighWatermark 
+      FetchHighWatermark   
 
     //判断是否必须从leader副本拉取数据  follower副本的同步请求必须从leader副本读取，consumer2.4后支持从follower副本拉取
     val fetchOnlyFromLeader = isFromFollower || (isFromConsumer && clientMetadata.isEmpty)
@@ -260,7 +260,7 @@ fetchMessages()方法实现如下：
 
 fetchMessages()方法执行流程如下：
 
-* 确定可读取日志的范围的及是否必须从leader副本读取数据：
+* 确定可读取日志的范围及是否必须从leader副本读取数据：
   * fetch请求为follower副本的同步请求，则必须从leader副本读取，上限位置为FetchLogEnd，即日志末尾；
   * fetch请求为consumer拉取消息的请求，不要求必须从leader副本读取消息：
     * 若隔离级别为READ_COMMITTED，上限位置为LastStableOffset
@@ -301,7 +301,7 @@ readFromLocalLog()方法可分为两部分内容：
   }
 ```
 
-##### read()方法定义如下：
+##### read
 
 read()方法源码如下：
 
@@ -322,7 +322,7 @@ read()方法源码如下：
       if (!hasConsistentTopicId(topicId, partition.topicId))
         throw new InconsistentTopicIdException("Topic ID in the fetch session did not match the topic ID in the log.")
 
-      // 当前节点为leader节点，查找更适合读取的preferredReadReplica
+      // 当前节点为leader节点，查找更适合consumer读取的preferredReadReplica
       val preferredReadReplica = clientMetadata.flatMap(
         metadata => findPreferredReadReplica(partition, metadata, replicaId, fetchInfo.fetchOffset, fetchTimeMs))
 
@@ -371,7 +371,7 @@ read()方法源码如下：
 
 ```
 
-read()方法主要是调用Partition#readRecords()方法读取数据，并将读取结果封装为LogReadResult返回。进行分区消息读取前，还会**调用findPreferredReadReplica()方法判断当前consumer是否有更适合读取的分区，即PreferredReadReplica**，
+read()方法主要是调用Partition#readRecords()方法读取数据，并将读取结果封装为LogReadResult返回。进行分区消息读取前，还会**调用findPreferredReadReplica()方法判断是否有更适合当前consumer读取消息的分区，即PreferredReadReplica**，
 若获取到PreferredReadReplica，则直接返回，下一次KafkaConsumer调用poll()方法拉取消息，则会发送Fetch请求至PreferredReadReplica。
 
 ##### findPreferredReadReplica
@@ -400,6 +400,7 @@ findPreferredReadReplica()实现如下：
           //获取可供读取的副本集合
           val replicaInfos = partition.remoteReplicas
             // Exclude replicas that don't have the requested offset (whether or not if they're in the ISR)
+            //follower副本日志位移小于consumer消费进度
             .filter(replica => replica.logEndOffset >= fetchOffset && replica.logStartOffset <= fetchOffset)
             .map(replica => new DefaultReplicaView(
               replicaEndpoints.getOrElse(replica.brokerId, Node.noNode()),
@@ -562,7 +563,7 @@ LocalLog是消息日志的抽象，每个LocalLog对象相应的也管理者一�
 read()方法核心功能有两点：
 
 * 根据Fetch请求的startOffset获取相应的LogSegment对象，确认offset有效后，调用LogSegment#read()方法读取消息；
-* 若KafkaConsumer的事务隔离级别为READ_COMMIT，调用addAbortedTransactions()方法将读取消息范围内的中止的事务信息添加到读取结果中一起返回consumer。
+* 若KafkaConsumer的事务隔离级别为READ_COMMIT，调用addAbortedTransactions()方法将读取消息范围内的中止的事务信息添加到读取结果中一起返回给consumer。
 
 #### addAbortedTransactions
 
@@ -598,10 +599,10 @@ read()方法核心功能有两点：
 
 #### TransactionIndex#collectAbortedTxns
 
-中止事务信息的查找依赖于事务索引，物理上以`offset.txnindex`文件的形式存储。事务索引中维护关于对应LogSegment的中止事务的元数据，包括**中止事务的开始和结束偏移量以及中止时的最后一个稳定偏移量(LSO)**。 
-事务索主要用于为在READ_COMMITTED隔离级别下的KafkaConsumer查找给定偏移量范围内的中止事务信息。
+中止事务信息的查找依赖于事务索引，索引存储在`offset.txnindex`形式的文件中。事务索引中维护关于对应LogSegment的中止事务的元数据，包括**中止事务的开始和结束偏移量以及中止时的最后一个LSO**。 
+事务索引主要用于为在READ_COMMITTED隔离级别下的KafkaConsumer查找给定偏移量范围内的中止事务信息。
 
-定义如下：
+索引数据结构定义如下：
 
 ```
 private[log] class AbortedTxn(val buffer: ByteBuffer) {
@@ -644,7 +645,10 @@ private[log] class AbortedTxn(val buffer: ByteBuffer) {
 
 ### LogSegment#read
 
-LogSegment#read()的主要功能时进行文件读取，这里需要完成消息偏移量到文件物理位置的转换查找，即`translateOffset()`方法，
+LogSegment#read()方法的主要功能是进行文件读取，主要分为两步：
+
+* 完成消息偏移量到文件物理位置的转换查找，即`translateOffset()`方法；
+* 日志文件的IO读取，即FileRecords#slice()方法。
 
 ```
   def read(startOffset: Long,
@@ -678,6 +682,78 @@ LogSegment#read()的主要功能时进行文件读取，这里需要完成消息
                   firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
 ```
+
+#### LogSegment#translateOffset
+
+因为消息日志的偏移量索引是**稀疏索引**，所以根据offset获取相应的物理文件地址分为两步：
+
+* 查找偏移量索引文件，获取小于等于指定offset的最大索引；
+* 根据索引的指示的物理位置依次读取日志文件中的消息，直至找到指定offset的物理位置。
+
+```
+  private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
+    //查找偏移量索引文件
+    val mapping = offsetIndex.lookup(offset)
+    //从索引位置
+    log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
+  }
+```
+
+##### OffsetIndex#lookup
+
+Broker将日志偏移量索引文件映射到内存中进行二分查找，并读取出该位置索引的内容。
+
+```
+  def lookup(targetOffset: Long): OffsetPosition = {
+    maybeLock(lock) {
+      内存映射 复制 防止变化
+      val idx = mmap.duplicate
+      //二分法查找
+      val slot = largestLowerBoundSlotFor(idx, targetOffset, IndexSearchType.KEY)
+      if(slot == -1)
+        OffsetPosition(baseOffset, 0)
+      else
+        //从内存映射中读取结果 相对偏移量 及 物理位置
+        parseEntry(idx, slot)
+    }
+  }
+  //每一个索引项的大小
+  override def entrySize = 8
+ 
+  private def relativeOffset(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize)
+  
+  private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize + 4)
+
+  override protected def parseEntry(buffer: ByteBuffer, n: Int): OffsetPosition = {
+    OffsetPosition(baseOffset + relativeOffset(buffer, n), physical(buffer, n))
+  }
+
+```
+
+偏移量索引的基本格式<relativeOffset(Int 4B) ，position(Int 4B)>，所以此处的计算公式为：
+
+* relativeOffset = buffer.getInt(n * 8)
+* position = buffer.getInt(n * 8 + 4) 
+
+
+
+##### FileRecords#searchForOffsetWithSize
+
+searchForOffsetWithSize()方法将**通过偏移量索引指向的物理位置向后遍历查找**，直至找到targetOffset的准确物理位置信息。
+
+```
+public LogOffsetPosition searchForOffsetWithSize(long targetOffset, int startingPosition) {
+    for (FileChannelRecordBatch batch : batchesFrom(startingPosition)) {
+        //从索引指示的物理位置开始读
+        long offset = batch.lastOffset();
+        if (offset >= targetOffset)
+            //获取到符合的位置返回
+            return new LogOffsetPosition(offset, batch.position(), batch.sizeInBytes());
+    }
+    return null;
+}
+```
+
 
 
 #### FileRecords#slice
