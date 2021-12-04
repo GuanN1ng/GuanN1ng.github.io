@@ -843,38 +843,6 @@ future.addListener(new RequestFutureListener<ClientResponse>() {
 
 ```
 
-# CompletedFetch
-
-通过FetchRequest请求获取的数据封装为CompletedFetch存储在KafkaConsumer端，其结构如下：
-
-```
-private class CompletedFetch {
-        private final TopicPartition partition; //主题分区
-        private final Iterator<? extends RecordBatch> batches;  //消息
-        private final Set<Long> abortedProducerIds; //中止事务的producerId
-        private final PriorityQueue<FetchResponse.AbortedTransaction> abortedTransactions; //中止的事务id
-        private final FetchResponse.PartitionData<Records> partitionData;  //响应数据
-        private final FetchResponseMetricAggregator metricAggregator;
-        private final short responseVersion;
-
-        private int recordsRead;  //已读取的行数,
-        private int bytesRead;  //已读取的字节数
-        private RecordBatch currentBatch; //正在读取的RecordBatch
-        private Record lastRecord; 
-        private CloseableIterator<Record> records;
-        private long nextFetchOffset;
-        private Optional<Integer> lastEpoch;
-        private boolean isConsumed = false;
-        private Exception cachedRecordException = null;
-        private boolean corruptLastRecord = false;
-        private boolean initialized = false; 
-        
-        ...// 成员方法
-}
-
-```
-
-
 # fetchedRecords
 
 上一步的sendFetches方法中会把成功的结果放在sendFetches这个completedFetches集合中，fetchedRecords方法主要有两部分作用：
@@ -943,6 +911,38 @@ public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
 ```
 
 可以看到整个方法分为两步：initializeCompletedFetch()及fetchRecords()。
+
+
+## CompletedFetch
+
+通过FetchRequest请求获取的数据封装为CompletedFetch存储在KafkaConsumer端，其结构如下：
+
+```
+private class CompletedFetch {
+        private final TopicPartition partition; //主题分区
+        private final Iterator<? extends RecordBatch> batches;  //消息
+        private final Set<Long> abortedProducerIds; //中止事务的producerId
+        private final PriorityQueue<FetchResponse.AbortedTransaction> abortedTransactions; //中止的事务id
+        private final FetchResponse.PartitionData<Records> partitionData;  //响应数据
+        private final FetchResponseMetricAggregator metricAggregator;
+        private final short responseVersion;
+
+        private int recordsRead;  //已读取的行数,
+        private int bytesRead;  //已读取的字节数
+        private RecordBatch currentBatch; //正在读取的RecordBatch
+        private Record lastRecord; 
+        private CloseableIterator<Record> records;
+        private long nextFetchOffset;
+        private Optional<Integer> lastEpoch;
+        private boolean isConsumed = false;
+        private Exception cachedRecordException = null;
+        private boolean corruptLastRecord = false;
+        private boolean initialized = false; 
+        
+        ...// 成员方法
+}
+
+```
 
 ## initializeCompletedFetch
 
