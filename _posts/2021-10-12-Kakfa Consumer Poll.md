@@ -10,7 +10,7 @@ categories: Kafka
 * ConsumerCoordinator#poll方法，获取GroupCoordinator，完成JoinGroup及主题分区方案获取，详情见[Kafka Consumer JoinGroup](https://guann1ng.github.io/kafka/2021/09/06/Kafka-Consumer-JoinGroup/)；
 * KafkaConsumer#updateFetchPositions方法，更新consumer订阅的TopicPartition的有效offset，确认下次消息拉取的偏移量(offset)，详情见[Kafka Consumer UpdateFetchPosition](https://guann1ng.github.io/kafka/2021/09/17/Kafka-Consumer-UpdateFetchPosition/)。
 
-下面继续分析KafkaConsumer#poll方法的后半部分内容，即消息拉取部分，核心方法为pollForFetches()。
+本篇内容将分析KafkaConsumer#poll方法的后半部分内容，即消息拉取部分，核心方法为pollForFetches()。
 
 ```
 private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
@@ -730,7 +730,7 @@ Broker将日志偏移量索引文件映射到内存中进行二分查找，并�
 
 ```
 
-偏移量索引的基本格式<relativeOffset(Int 4B) ，position(Int 4B)>，所以此处的计算公式为：
+偏移量索引存储的格式<relativeOffset(Int 4B) ，position(Int 4B)>，所以此处的计算公式为：
 
 * relativeOffset = buffer.getInt(n * 8)
 * position = buffer.getInt(n * 8 + 4) 
@@ -775,7 +775,7 @@ public FileRecords slice(int position, int size) throws IOException {
 
 ## RequestFutureListener
 
-FetchRequest请求发送时注册的Listener，会在获取到响应时触发回调，主要将响应数据放入`completedFetches`中以及从`nodesWithPendingFetchRequests`将Broker节点移除，以便可以进行
+FetchRequest请求发送时注册的Listener，会在获取到响应时触发回调，主要功能是将响应数据放入`completedFetches`中以及从`nodesWithPendingFetchRequests`将Broker节点移除，以便可以进行
 下次请求的发送。
 
 ```
@@ -852,13 +852,16 @@ future.addListener(new RequestFutureListener<ClientResponse>() {
 
 ```
 public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
-    //结果集
+    //初始化结果集
     Map<TopicPartition, List<ConsumerRecord<K, V>>> fetched = new HashMap<>();
+    //临时保存分区被暂停消费的数据
     Queue<CompletedFetch> pausedCompletedFetches = new ArrayDeque<>();
+    //剩余可拉取消息数
     int recordsRemaining = maxPollRecords;
     try {
         //可拉取数为0 退出
         while (recordsRemaining > 0) {
+            //nextInLineFetch  Fetcher类的成员属性，表示当前正在处理的分区响应数据
             if (nextInLineFetch == null || nextInLineFetch.isConsumed) {
                 //从completedFetches获取一个响应数据
                 CompletedFetch records = completedFetches.peek();
@@ -866,23 +869,28 @@ public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
                 if (records == null) break;
                 if (records.notInitialized()) {
                     try {
+                        //CompletedFetch中的数据未初始化，执
                         nextInLineFetch = initializeCompletedFetch(records);  //①
                     } catch (Exception e) {
                         FetchResponseData.PartitionData partition = records.partitionData;
-                        //异常 移除该CompletedFetch
-                        if (fetched.isEmpty() && FetchResponse.recordsOrFail(partition).sizeInBytes() == 0) { completedFetches.poll(); }
+                        if (fetched.isEmpty() && FetchResponse.recordsOrFail(partition).sizeInBytes() == 0) { 
+                          //本轮第一次获取，且CompletedFetch内消息未空，抛出异常，丢弃当前CompletedFetch
+                          completedFetches.poll(); 
+                        }
                         throw e;
                     }
                 } else {
+                    //数据已初始化
                     nextInLineFetch = records;
                 }
+                //从队列去除，下一次循环将从nextInLineFetch中获取
                 completedFetches.poll();
             } else if (subscriptions.isPaused(nextInLineFetch.partition)) {
-                //已暂停分区消费
+                //已暂停消费的分区数据
                 pausedCompletedFetches.add(nextInLineFetch);
                 nextInLineFetch = null;
             } else {
-                //完成数据
+                //获取消息
                 List<ConsumerRecord<K, V>> records = fetchRecords(nextInLineFetch, recordsRemaining); //②
                 if (!records.isEmpty()) {
                     //数据填充
@@ -910,19 +918,19 @@ public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
 }
 ```
 
-可以看到整个方法分为两步：initializeCompletedFetch()及fetchRecords()。
+可以看到整个方法主要分为两部分：initializeCompletedFetch()方法及fetchRecords()方法，而这两个方法均是围绕CompletedFetch数据进行操作。
 
 
 ## CompletedFetch
 
-通过FetchRequest请求获取的数据封装为CompletedFetch存储在KafkaConsumer端，其结构如下：
+CompletedFetch表示对某一主题分区执行的一次FetchRequest请求返回的数据封住结果，结构定义如下：
 
 ```
 private class CompletedFetch {
         private final TopicPartition partition; //主题分区
         private final Iterator<? extends RecordBatch> batches;  //消息
         private final Set<Long> abortedProducerIds; //中止事务的producerId
-        private final PriorityQueue<FetchResponse.AbortedTransaction> abortedTransactions; //中止的事务id
+        private final PriorityQueue<FetchResponse.AbortedTransaction> abortedTransactions; //本批次内中止事务的信息
         private final FetchResponse.PartitionData<Records> partitionData;  //响应数据
         private final FetchResponseMetricAggregator metricAggregator;
         private final short responseVersion;
@@ -932,7 +940,7 @@ private class CompletedFetch {
         private RecordBatch currentBatch; //正在读取的RecordBatch
         private Record lastRecord; 
         private CloseableIterator<Record> records;
-        private long nextFetchOffset;
+        private long nextFetchOffset; 
         private Optional<Integer> lastEpoch;
         private boolean isConsumed = false;
         private Exception cachedRecordException = null;
@@ -946,30 +954,36 @@ private class CompletedFetch {
 
 ## initializeCompletedFetch
 
-initializeCompletedFetch方法主要是确保响应数据有效，并更新本地消息SubscriptionState.TopicPartitionState数据。
+initializeCompletedFetch()方法主要是确保响应数据有效，并更新本地SubscriptionState.TopicPartitionState元数据。
 
 ```
 private CompletedFetch initializeCompletedFetch(CompletedFetch nextCompletedFetch) {
     TopicPartition tp = nextCompletedFetch.partition;
     FetchResponseData.PartitionData partition = nextCompletedFetch.partitionData;
+    //FetchResponse的返回的消息起始位移
     long fetchOffset = nextCompletedFetch.nextFetchOffset;
     CompletedFetch completedFetch = null;
     Errors error = Errors.forCode(partition.errorCode());
 
     try {
-        //分区验证
         if (!subscriptions.hasValidPosition(tp)) {
+            // this can happen when a rebalance happened while fetch is still in-flight
+            log.debug("Ignoring fetched records for partition {} since it no longer has valid position", tp);
         } else if (error == Errors.NONE) {
-            //位移验证
             FetchPosition position = subscriptions.position(tp);
-            if (position == null || position.offset != fetchOffset) { return null;}
-
+            if (position == null || position.offset != fetchOffset) {
+                //响应的消息起始位移与本地元数据的拉取起始位移不一致
+                return null;
+            }
+            
             Iterator<? extends RecordBatch> batches = FetchResponse.recordsOrFail(partition).batches().iterator();
             completedFetch = nextCompletedFetch;
             if (!batches.hasNext() && FetchResponse.recordsSize(partition) > 0) {
-                ... //拉取失败 抛出异常
+                //响应结果中没有完整的一条消息但有数据  ，低版本API可能发生 max.partition.fetch.bytes ， 抛出异常 
+                //should not happen with brokers that support FetchRequest/Response V3 or higher (i.e. KIP-74)
+                ... //异常抛出代码 
             }
-            //更新SubscriptionState.TopicPartitionState数据
+            //本地主题分区元数据更新
             if (partition.highWatermark() >= 0) {
                 subscriptions.updateHighWatermark(tp, partition.highWatermark());
             }
@@ -979,62 +993,237 @@ private CompletedFetch initializeCompletedFetch(CompletedFetch nextCompletedFetc
             if (partition.lastStableOffset() >= 0) {
                 subscriptions.updateLastStableOffset(tp, partition.lastStableOffset());
             }
+            
+            //Fetch响应返回了PreferredReplica，更新本地元数据，下次poll从PreferredReplica读取消息
             if (FetchResponse.isPreferredReplica(partition)) {
                 subscriptions.updatePreferredReadReplica(completedFetch.partition, partition.preferredReadReplica(), () -> {
+                    //设置PreferredReplica过期时间，  值为metadata.max.age.ms  元数据有效时间
                     long expireTimeMs = time.milliseconds() + metadata.metadataExpireMs();
                     return expireTimeMs;
                 });
             }
+            //初始化完成
             nextCompletedFetch.initialized = true;
-        } else if (...) {
-            // 异常处理
+        } else if{
+           ... //省略部分异常
+        } else if (error == Errors.OFFSET_OUT_OF_RANGE) {
+            //
+            Optional<Integer> clearedReplicaId = subscriptions.clearPreferredReadReplica(tp);
+            if (!clearedReplicaId.isPresent()) {
+                //不存在PreferredReadReplica ，消息是从leader副本读取
+                FetchPosition position = subscriptions.position(tp);
+                if (position == null || fetchOffset != position.offset) {
+                    //响应与本地记录不一致，丢弃
+                    log.debug("Discarding stale fetch response for partition {} since the fetched offset {} " +
+                            "does not match the current offset {}", tp, fetchOffset, position);
+                } else {
+                    //进行auto.offset.reset,重置消费位移，若未配置，抛出异常
+                    handleOffsetOutOfRange(position, tp);
+                }
+            } else {
+                log.debug("Unset the preferred read replica {} for partition {} since we got {} when fetching {}",
+                        clearedReplicaId.get(), tp, error, fetchOffset);
+            }
         } 
+        ...// 省略部分异常处理
     } finally {
         if (completedFetch == null)
             nextCompletedFetch.metricAggregator.record(tp, 0, 0);
         if (error != Errors.NONE)
+            // we move the partition to the end if there was an error. This way, it's more likely that partitions for
+            // the same topic can remain together (allowing for more efficient serialization).
             subscriptions.movePartitionToEnd(tp);
     }
+
     return completedFetch;
 }
-
 ```
 
 ## fetchRecords
 
-fetchRecords中完成消息的反序列化及本地消费offset(TopicPartitionState#position)的更新，并将消息返回。
+通过CompletedFetch验证后，即可调用fetchRecords()方法从CompletedFetch中读取消息，实现如下：
 
 ```
 private List<ConsumerRecord<K, V>> fetchRecords(CompletedFetch completedFetch, int maxRecords) {
     if (!subscriptions.isAssigned(completedFetch.partition)) {
-        //再次验证分区，防止rebalance发生
+        //再次验证是否订阅了该主题分区，防止有rebalance发生
     } else if (!subscriptions.isFetchable(completedFetch.partition)) {
         //再次判断分区是否被暂停消费
     } else {
+        //consumer本地的消费进度
         FetchPosition position = subscriptions.position(completedFetch.partition);
         if (position == null) {
             throw new IllegalStateException("Missing position for fetchable partition " + completedFetch.partition);
         }
         if (completedFetch.nextFetchOffset == position.offset) {
-            //位移验证正确，拉取消息 此处完成消息序列化
+            //位移验证一致，从CompletedFetch读取消息
             List<ConsumerRecord<K, V>> partRecords = completedFetch.fetchRecords(maxRecords);
             if (completedFetch.nextFetchOffset > position.offset) {
+                //更新本地消费进度
                 FetchPosition nextPosition = new FetchPosition(completedFetch.nextFetchOffset,completedFetch.lastEpoch,position.currentLeader);
-                //更新本场消费位移
                 subscriptions.position(completedFetch.partition, nextPosition);
             }
-            Long partitionLag = subscriptions.partitionLag(completedFetch.partition, isolationLevel);
-            if (partitionLag != null)
-                this.sensors.recordPartitionLag(completedFetch.partition, partitionLag);
-            Long lead = subscriptions.partitionLead(completedFetch.partition);
-            if (lead != null) {
-                this.sensors.recordPartitionLead(completedFetch.partition, lead);
-            }
+            
+            ... // 省略 FetchManagerMetrics 相关，统计服务
             //返回消息
             return partRecords;
         } else { //消费位移不正确 }
     }
+    //无法消费，置为已消费，并关闭流
     completedFetch.drain();
+    //返回空
     return emptyList();
 }
 ```
+
+Fetcher#fetchRecords()方法中主要是完成消息读取前的验证，如分区订阅关系是够改变，分区是否被暂停消费以及本地消费进度与响应是否一致等判断，消息的读取则是通过
+CompletedFetch#fetchRecords()方法完成。
+
+### CompletedFetch#fetchRecords
+
+从CompletedFetch中读取消息的方法源码如下：
+
+```
+private List<ConsumerRecord<K, V>> fetchRecords(int maxRecords) {
+  // Error when fetching the next record before deserialization.
+  if (corruptLastRecord) //初始值为false
+      throw new KafkaException("Received exception when fetching the next record from " + partition + ". If needed, please seek past the record to continue consumption.", cachedRecordException);
+
+  if (isConsumed) //CompleteFetch中的数据已被全部读取
+      return Collections.emptyList();
+
+  List<ConsumerRecord<K, V>> records = new ArrayList<>();
+  try {
+      for (int i = 0; i < maxRecords; i++) {
+          if (cachedRecordException == null) {
+              corruptLastRecord = true;
+              lastRecord = nextFetchedRecord(); //读取一条消息
+              corruptLastRecord = false;
+          }
+          if (lastRecord == null)
+              //已读取完毕
+              break;
+          //完成消息反序列化并添加到结果集  
+          records.add(parseRecord(partition, currentBatch, lastRecord));
+          //更新已读取消息树
+          recordsRead++;
+          //已读取字节数
+          bytesRead += lastRecord.sizeInBytes();
+          nextFetchOffset = lastRecord.offset() + 1;
+          cachedRecordException = null;
+      }
+  } catch (SerializationException se) {
+      cachedRecordException = se;
+      if (records.isEmpty())
+          throw se;
+  } catch (KafkaException e) {
+      cachedRecordException = e;
+      if (records.isEmpty())
+          throw new KafkaException(...);
+  }
+  return records;
+}
+```
+
+方法可分为三部分：
+
+* 调用nextFetchedRecord()方法读取一条消息；
+* 调用parseRecord()方法完成消息反序列化；
+* 更新读取进度，如`recordsRead`、`bytesRead`、`nextFetchOffset`。
+
+#### nextFetchedRecord
+
+nextFetchedRecord()源码如下：
+
+```
+private Record nextFetchedRecord() {
+    while (true) {
+        if (records == null || !records.hasNext()) {
+            maybeCloseRecordStream();
+            if (!batches.hasNext()) {
+                //读取结束
+                if (currentBatch != null)
+                    nextFetchOffset = currentBatch.nextOffset();
+                //更新isConsumed    
+                drain();
+                return null;
+            }
+            
+            currentBatch = batches.next();
+            lastEpoch = currentBatch.partitionLeaderEpoch() == RecordBatch.NO_PARTITION_LEADER_EPOCH ?
+                    Optional.empty() : Optional.of(currentBatch.partitionLeaderEpoch());
+
+            maybeEnsureValid(currentBatch);
+            //事务消息处理 读已提交
+            if (isolationLevel == IsolationLevel.READ_COMMITTED && currentBatch.hasProducerId()) {
+                //统计中止事务的第一条事务消息的offset <= 当前offset的所有pid，放入abortedProducerIds
+                consumeAbortedTransactionsUpTo(currentBatch.lastOffset());
+                long producerId = currentBatch.producerId();
+                if (containsAbortMarker(currentBatch)) {
+                    //判断当前bath是否为ABORT，若是移除对应的PID，防止ControlBatch重试，导致本批次存在多余的ControlBatch
+                    abortedProducerIds.remove(producerId);
+                } else if (isBatchAborted(currentBatch)) {
+                   // 本条消息为中止事务的消息，跳过 abortedProducerIds.contains(batch.producerId())
+                   //Skipping aborted record batc
+                    nextFetchOffset = currentBatch.nextOffset();
+                    continue;
+                }
+            }
+            //
+            records = currentBatch.streamingIterator(decompressionBufferSupplier);
+        } else {
+            Record record = records.next();
+            // skip any records out of range
+            if (record.offset() >= nextFetchOffset) {
+                // we only do validation when the message should not be skipped.
+                maybeEnsureValid(record);
+
+                // control records are not returned to the user
+                if (!currentBatch.isControlBatch()) {
+                    return record;
+                } else {
+                    // Increment the next fetch offset when we skip a control batch.
+                    nextFetchOffset = record.offset() + 1;
+                }
+            }
+        }
+    }
+}
+```
+
+可以看到，**事务消息的处理是在KafkaConsumer本地进行处理的**，consumer会过滤所有的ControlBatch，以及若事务隔离级别为READ_COMMITTED，还需要根据FetchResponse返回的中止事务信息将该事务对应的普通消息过滤。
+
+#### parseRecord
+
+消息的反序列化比较简单，就是使用配置`key.deserializer`和`value.deserializer`指定的反序列化器完成。
+
+```
+private ConsumerRecord<K, V> parseRecord(TopicPartition partition, RecordBatch batch, Record record) {
+    try {
+        long offset = record.offset();
+        long timestamp = record.timestamp();
+        Optional<Integer> leaderEpoch = maybeLeaderEpoch(batch.partitionLeaderEpoch());
+        TimestampType timestampType = batch.timestampType();
+        Headers headers = new RecordHeaders(record.headers());
+        ByteBuffer keyBytes = record.key();
+        byte[] keyByteArray = keyBytes == null ? null : Utils.toArray(keyBytes);
+        //Key反序列化
+        K key = keyBytes == null ? null : this.keyDeserializer.deserialize(partition.topic(), headers, keyByteArray);
+        ByteBuffer valueBytes = record.value();
+        byte[] valueByteArray = valueBytes == null ? null : Utils.toArray(valueBytes);
+        //value反序列化
+        V value = valueBytes == null ? null : this.valueDeserializer.deserialize(partition.topic(), headers, valueByteArray);
+        //消息封装
+        return new ConsumerRecord<>(partition.topic(), partition.partition(), offset,
+                                    timestamp, timestampType,
+                                    keyByteArray == null ? ConsumerRecord.NULL_SIZE : keyByteArray.length,
+                                    valueByteArray == null ? ConsumerRecord.NULL_SIZE : valueByteArray.length,
+                                    key, value, headers, leaderEpoch);
+    } catch (RuntimeException e) {
+        //反序列化失败异常
+        throw new RecordDeserializationException(...);
+    }
+}
+
+```
+
