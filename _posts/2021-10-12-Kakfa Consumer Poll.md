@@ -775,8 +775,8 @@ public FileRecords slice(int position, int size) throws IOException {
 
 ## RequestFutureListener
 
-FetchRequest请求发送时注册的Listener，会在获取到响应时触发回调，主要功能是将响应数据放入`completedFetches`中以及从`nodesWithPendingFetchRequests`将Broker节点移除，以便可以进行
-下次请求的发送。
+FetchRequest请求发送时注册的Listener，会在获取到响应时触发回调，主要功能是将响应数据封装为CompletedFetch对象并放入`completedFetches`队列中以及从`nodesWithPendingFetchRequests`将对应的Broker标识移除，以便可以对Broker发起
+下次Fetch请求的发送。
 
 ```
 future.addListener(new RequestFutureListener<ClientResponse>() {
@@ -845,10 +845,10 @@ future.addListener(new RequestFutureListener<ClientResponse>() {
 
 # fetchedRecords
 
-上一步的sendFetches方法中会把成功的结果放在sendFetches这个completedFetches集合中，fetchedRecords方法主要有两部分作用：
+上一步的sendFetches方法中会异步的把消息拉取的结果放在completedFetches队列中，fetchedRecords方法主要有两部分作用：
 
-* 将缓存在completedFetches中的数据进一步验证处理返回给consumer进行消费，已暂停消费的分区(如使用pause(Collection<TopicPartition> partitions)的分区)不会返回；
-* 更新TopicPartitionState中的offset信息，准备下一次拉取。
+* 遍历completedFetches队列中的数据，做进一步验证处理返回给consumer进行消费，如将已暂停消费的分区(使用pause(Collection<TopicPartition> partitions)的分区)的消息过滤等；
+* 更新TopicPartitionState元信息，准备下一次拉取。
 
 ```
 public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
@@ -923,7 +923,7 @@ public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
 
 ## CompletedFetch
 
-CompletedFetch表示对某一主题分区执行的一次FetchRequest请求返回的数据封住结果，结构定义如下：
+CompletedFetch表示对某一主题分区执行的一次FetchRequest请求返回的消息数据，结构定义如下：
 
 ```
 private class CompletedFetch {
@@ -1041,7 +1041,7 @@ private CompletedFetch initializeCompletedFetch(CompletedFetch nextCompletedFetc
 
 ## fetchRecords
 
-通过CompletedFetch验证后，即可调用fetchRecords()方法从CompletedFetch中读取消息，实现如下：
+CompletedFetch通过验证后，即可调用fetchRecords()方法从CompletedFetch中读取消息，实现如下：
 
 ```
 private List<ConsumerRecord<K, V>> fetchRecords(CompletedFetch completedFetch, int maxRecords) {
