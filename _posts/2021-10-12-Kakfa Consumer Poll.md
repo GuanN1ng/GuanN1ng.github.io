@@ -1191,7 +1191,7 @@ private Record nextFetchedRecord() {
 }
 ```
 
-可以看到，**事务消息的处理是在KafkaConsumer本地进行处理的**，consumer会过滤所有的ControlBatch，以及若事务隔离级别为READ_COMMITTED，还需要根据FetchResponse返回的中止事务信息将该事务对应的普通消息过滤。
+可以看到，**事务消息是在KafkaConsumer本地进行处理的**，consumer会过滤所有的ControlBatch，以及若事务隔离级别为READ_COMMITTED，还需要根据FetchResponse返回的中止事务信息对普通消息进行过滤。
 
 #### parseRecord
 
