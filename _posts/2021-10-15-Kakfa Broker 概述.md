@@ -467,7 +467,7 @@ onControllerFailover()方法的主要内容可分为以下几部分：
 * 注册相关ZK节点变动的时间处理器，见下表格；
 * 调用initializeControllerContext()方法初始化初始化ControllerContext；
 * 初始化主题删除管理器`TopicDeletionManager` ，当配置`delete.topic.enable`为true时，负责删除`/admin/delete_topics`节点下的topic；
-* 调用`sendUpdateMetadataRequest()`方法向集群内所有在线Broker发送UpdateMetadataRequest，
+* 调用`sendUpdateMetadataRequest()`方法向集群内所有在线Broker发送UpdateMetadataRequest，获取在线节点元数据；
 * 启动ReplicaStateMachine(副本状态机)，初始化所有副本的状态；
 * 启动PartitionStateMachine(分区状态机)，初始化所有主题分区的状态；
 * 如有需要，触发分区副本重分配以及leader选举；
@@ -489,39 +489,7 @@ KafkaController选举成功后需监听的ZK节点列表如下：
 
 #### ControllerContext初始化
 
-ControllerContext的作用是读取Kafka集群Zookeeper相关节点的信息并缓存到本地，包括Broker、Topic、Partition以及Replica等，定义如下：
-
-```
-class ControllerContext {
-  val stats = new ControllerStats
-  //离线分区数量
-  var offlinePartitionCount = 0
-  var preferredReplicaImbalanceCount = 0
-  val shuttingDownBrokerIds = mutable.Set.empty[Int]
-  private val liveBrokers = mutable.Set.empty[Broker]
-  private val liveBrokerEpochs = mutable.Map.empty[Int, Long]
-  var epoch: Int = KafkaController.InitialControllerEpoch
-  var epochZkVersion: Int = KafkaController.InitialControllerEpochZkVersion
-
-  val allTopics = mutable.Set.empty[String]
-  var topicIds = mutable.Map.empty[String, Uuid]
-  var topicNames = mutable.Map.empty[Uuid, String]
-  // 主题分区数据
-  val partitionAssignments = mutable.Map.empty[String, mutable.Map[Int, ReplicaAssignment]]
-  private val partitionLeadershipInfo = mutable.Map.empty[TopicPartition, LeaderIsrAndControllerEpoch]
-  //待进行副本重分配的分区集合
-  val partitionsBeingReassigned = mutable.Set.empty[TopicPartition]
-  //分区状态
-  val partitionStates = mutable.Map.empty[TopicPartition, PartitionState]
-  val replicaStates = mutable.Map.empty[PartitionAndReplica, ReplicaState]
-  val replicasOnOfflineDirs = mutable.Map.empty[Int, Set[TopicPartition]]
-
-  val topicsToBeDeleted = mutable.Set.empty[String]
-  ...//other method
-}  
-```
-
-初始化方法源码如下：
+ControllerContext的作用是读取Kafka集群Zookeeper相关节点的信息并缓存到本地，包括Broker、Topic、Partition以及Replica等，初始化方法源码如下：
 
 ```
   private def initializeControllerContext(): Unit = {
@@ -567,9 +535,145 @@ class ControllerContext {
   }
 ```
 
-initializeControllerContext()方法的作用，并缓存到本地，
-
 ### ControllerChannelManager
+
+ControllerContext初始化完成后，调用ControllerChannelManager#startup()方法完成ControllerChannelManager对象启动，ControllerChannelManager**负责Controller与
+集群内其它Broker节点间的通信**，类定义如下：
+
+```
+class ControllerChannelManager(controllerContext: ControllerContext, config: KafkaConfig, time: Time, metrics: Metrics, stateChangeLogger: StateChangeLogger, threadNamePrefix: Option[String] = None) extends Logging with KafkaMetricsGroup {
+  import ControllerChannelManager._
+  //<brokerId,ControllerBrokerStateInfo>
+  protected val brokerStateInfo = new HashMap[Int, ControllerBrokerStateInfo]
+  //对象锁
+  private val brokerLock = new Object
+  this.logIdent = "[Channel manager on controller " + config.brokerId + "]: "
+  newGauge("TotalQueueSize", () => brokerLock synchronized { brokerStateInfo.values.iterator.map(_.messageQueue.size).sum } )
+  
+  ...//other method
+```
+
+ControllerChannelManager中为每个Broker都维护了一个ControllerBrokerStateInfo对象，定义如下：
+
+```
+case class ControllerBrokerStateInfo(networkClient: NetworkClient, 
+                                     brokerNode: Node,
+                                     messageQueue: BlockingQueue[QueueItem],
+                                     requestSendThread: RequestSendThread,
+                                     queueSizeGauge: Gauge[Int],
+                                     requestRateAndTimeMetrics: Timer,
+                                     reconfigurableChannelBuilder: Option[Reconfigurable])
+```
+
+重要属性如下：
+
+* NetworkClient：与节点的网络连接对象；
+* Node： Broker节点信息；
+* MessageQueue(BlockingQueue)：请求队列
+* RequestSendThread：请求发送线程；
+
+#### startup
+
+ControllerChannelManager的启动方法实现如下：
+
+```
+def startup() = {
+  //为每个在线的broker初始化ControllerBrokerStateInfo
+  controllerContext.liveOrShuttingDownBrokers.foreach(addNewBroker)
+
+  brokerLock synchronized {
+    //创建发送线程
+    brokerStateInfo.foreach(brokerState => startRequestSendThread(brokerState._1))
+  }
+}
+```
+
+startup()方法分为两步：
+
+* 遍历在线broker，调用addNewBroker()方法完成对应的ControllerBrokerStateInfo对象初始化；
+* 为ControllerBrokerStateInfo对象启动请求发送线程RequestSendThread。
+
+addNewBroker()方法源码如下：
+
+```
+  private def addNewBroker(broker: Broker): Unit = {
+    //请求队列
+    val messageQueue = new LinkedBlockingQueue[QueueItem]
+    val controllerToBrokerListenerName = config.controlPlaneListenerName.getOrElse(config.interBrokerListenerName)
+    val controllerToBrokerSecurityProtocol = config.controlPlaneSecurityProtocol.getOrElse(config.interBrokerSecurityProtocol)
+    val brokerNode = broker.node(controllerToBrokerListenerName)
+    val logContext = new LogContext(s"[Controller id=${config.brokerId}, targetBrokerId=${brokerNode.idString}] ")
+    //初始化client
+    val (networkClient, reconfigurableChannelBuilder) = {
+      val channelBuilder = ChannelBuilders.clientChannelBuilder(...//channel配置)
+      val reconfigurableChannelBuilder = channelBuilder match {
+        case reconfigurable: Reconfigurable =>
+          config.addReconfigurable(reconfigurable)
+          Some(reconfigurable)
+        case _ => None
+      }
+      // nio selector
+      val selector = new Selector(...)
+      //
+      val networkClient = new NetworkClient(...)
+      (networkClient, reconfigurableChannelBuilder)
+    }
+    val threadName = threadNamePrefix match {
+      case None => s"Controller-${config.brokerId}-to-broker-${broker.id}-send-thread"
+      case Some(name) => s"$name:Controller-${config.brokerId}-to-broker-${broker.id}-send-thread"
+    }
+
+    val requestRateAndQueueTimeMetrics = newTimer(
+      RequestRateAndQueueTimeMetricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS, brokerMetricTags(broker.id)
+    )
+
+    val requestThread = new RequestSendThread(config.brokerId, controllerContext, messageQueue, networkClient, brokerNode, config, time, requestRateAndQueueTimeMetrics, stateChangeLogger, threadName)
+    requestThread.setDaemon(false)
+
+    val queueSizeGauge = newGauge(QueueSizeMetricName, () => messageQueue.size, brokerMetricTags(broker.id))
+    //
+    brokerStateInfo.put(broker.id, ControllerBrokerStateInfo(networkClient, brokerNode, messageQueue,
+      requestThread, queueSizeGauge, requestRateAndQueueTimeMetrics, reconfigurableChannelBuilder))
+  }
+```
+
+#### sendRequest
+
+请求发送实现如下：
+
+```
+def sendRequest(brokerId: Int, request: AbstractControlRequest.Builder[_ <: AbstractControlRequest],
+                callback: AbstractResponse => Unit = null): Unit = {
+  brokerLock synchronized {
+    val stateInfoOpt = brokerStateInfo.get(brokerId)
+    stateInfoOpt match {
+      case Some(stateInfo) =>
+        stateInfo.messageQueue.put(QueueItem(request.apiKey, request, callback, time.milliseconds()))
+      case None =>
+        warn(s"Not sending request $request to broker $brokerId, since it is offline.")
+    }
+  }
+}
+```
+
+sendRequest()方法只是将请求放入对应Broker的MessageQueue中，而后由RequestSendThread从MessageQueue中获取并进行发送处理。
+
+
+## BrokerChange
+
+Broker启动时，会在`/brokers/ids/`ZK节点下注册自己的brokerId，KafkaController为`/brokers/ids/`ZK节点注册的BrokerChangeHandler监听到变化后，会将
+**BrokerChange**时间放入ControllerEventManager中处理，如下：
+
+```
+class BrokerChangeHandler(eventManager: ControllerEventManager) extends ZNodeChildChangeHandler {
+  override val path: String = BrokerIdsZNode.path
+
+  override def handleChildChange(): Unit = {
+    eventManager.put(BrokerChange)
+  }
+}
+```
+
 
 
 
