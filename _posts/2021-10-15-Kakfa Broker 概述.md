@@ -149,7 +149,7 @@ cluster.id=NzU2NTYzNTYtNzQ2MS00Nzk0LTg2M2EtN2NjZDQzZDkzYTlm
 
 ## KafkaController
 
-**`KafkaController`对象体现了Kafka集群内Broker节点间的角色差异**，Kafka集群内所有Broker实例都会完成`KafkaController`对象的初始化，但**整个集群内同时只会有一个Broker实例的`KafaController.isActive`属性为true**，
+**`KafkaController`对象体现了Kafka集群内Broker节点间的角色差异**，Kafka集群内所有Broker实例都会完成`KafkaController`对象的创建，但**整个集群内同时只会有一个Broker实例的`KafaController.isActive`属性为true**，
 表示该Broker节点的`KafkaController`被选举为当前**集群的控制器**，负责管理集群中所有分区和副本的状态。
 
 
@@ -193,7 +193,7 @@ startup()方法包含两部分内容：
 
 ### ControllerEventManager
 
-ControllerEventManager类的核心属性如下：
+ControllerEventManager类的核心定义如下：
 
 ```
 class ControllerEventManager(controllerId: Int, processor: ControllerEventProcessor, time: Time, rateAndTimeMetrics: Map[ControllerState, KafkaTimer], eventQueueTimeTimeoutMs: Long = 300000) extends KafkaMetricsGroup {
@@ -206,11 +206,26 @@ class ControllerEventManager(controllerId: Int, processor: ControllerEventProces
   // 负责处理事件的线程
   private[controller] var thread = new ControllerEventThread(ControllerEventThreadName)
   
+  def put(event: ControllerEvent): QueuedEvent = inLock(putLock) {
+    val queuedEvent = new QueuedEvent(event, time.milliseconds())
+    queue.put(queuedEvent)
+    queuedEvent
+  }
+  //ZK连接重置或 Broker关闭时执行
+  def clearAndPut(event: ControllerEvent): QueuedEvent = inLock(putLock){
+    val preemptedEvents = new ArrayList[QueuedEvent]()
+    queue.drainTo(preemptedEvents)
+    //只执行事件的preempt方法。
+    preemptedEvents.forEach(_.preempt(processor))
+    //放入ShutdownEventThread 或 Expire事件
+    put(event)
+  }
+  
   ...//other codes 
 }  
 ```
 
-ControllerEventManager的实现与Java线程池一致，使用队列缓存任务，并初始化ControllerEventThread负责任务的处理。
+ControllerEventManager的实现与Java线程池思想一致，使用队列缓存任务，并初始化ControllerEventThread负责任务的处理。
 
 #### ControllerEvent
 
@@ -227,6 +242,7 @@ class QueuedEvent(val event: ControllerEvent, //事件
 sealed trait ControllerEvent {
   def state: ControllerState
   // preempt() is not executed by `ControllerEventThread` but by the main thread.
+  //ZK连接重置或Broker关闭时执行
   def preempt(): Unit
 }
 
@@ -245,7 +261,7 @@ case object BrokerChange extends ControllerEvent {
 
 #### ControllerEventThread
 
-ControllerEventManager#start()方法的作用只是完成ControllerEventThread的启动。
+ControllerEventManager#start()方法的作用是完成ControllerEventThread的启动。
 
 ```
 def start(): Unit = thread.start()
@@ -388,12 +404,12 @@ def tryCreateControllerZNodeAndIncrementEpoch(): (Int, Int) = {
 主要涉及两个ZK node的写入，通过zooKeeper.multi() API确保多个操作原子执行：
 
 * `/controller`，存储当前集群controller所在Broker的id，即为controllerId;
-* `/controller_epoch`,CAS操作，controller选举纪元，每次集群controller发生变化，自增1。
+* `/controller_epoch`,CAS操作，不匹配则为非法请求，表示当前集群controller纪元，每次集群controller发生变化，自增1。
 
 
-### Controller初始化
+### Controller启动
 
-KafkaController对象
+KafkaController当选集群Controller后，通过调用onControllerFailover()方法完成Controller的真正启动，源码如下：
 
 ```
  private def onControllerFailover(): Unit = {
@@ -402,52 +418,158 @@ KafkaController对象
     info("Registering handlers")
 
     // before reading source of truth from zookeeper, register the listeners to get broker/topic callbacks
-    val childChangeHandlers = Seq(brokerChangeHandler, topicChangeHandler, topicDeletionHandler, logDirEventNotificationHandler,
-      isrChangeNotificationHandler)
+    //注册相关zk节点下监听器
+    val childChangeHandlers = Seq(brokerChangeHandler, topicChangeHandler, topicDeletionHandler, logDirEventNotificationHandler, isrChangeNotificationHandler)
     childChangeHandlers.foreach(zkClient.registerZNodeChildChangeHandler)
-
+    //注册/admin/preferred_replica_election, /admin/reassign_partitions节点事件处理
     val nodeChangeHandlers = Seq(preferredReplicaElectionHandler, partitionReassignmentHandler)
     nodeChangeHandlers.foreach(zkClient.registerZNodeChangeHandlerAndCheckExistence)
-
-    info("Deleting log dir event notifications")
     zkClient.deleteLogDirEventNotifications(controllerContext.epochZkVersion)
-    info("Deleting isr change notifications")
     zkClient.deleteIsrChangeNotifications(controllerContext.epochZkVersion)
+    
     info("Initializing controller context")
     initializeControllerContext()
-    info("Fetching topic deletions in progress")
+    
+    //初始化主题删除管理器 delete.topic.enable为true时才会删除
     val (topicsToBeDeleted, topicsIneligibleForDeletion) = fetchTopicDeletionsInProgress()
-    info("Initializing topic deletion manager")
     topicDeletionManager.init(topicsToBeDeleted, topicsIneligibleForDeletion)
 
+    //向集群内的其他Broker发送UpdateMetadata请求，
     sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, Set.empty)
-
+    
+    //启动副本状态机，初始化所有 Replica 的状态信息
     replicaStateMachine.startup()
+    //启动分区状态机，初始化所有 Partition 的状态信息
     partitionStateMachine.startup()
-
     info(s"Ready to serve as the new controller with epoch $epoch")
-
+    //如果有需要，触发分区副本重分配(迁移) 
     initializePartitionReassignments()
+    //主题删除
     topicDeletionManager.tryTopicDeletion()
+    //触发分区副本leader选举
     val pendingPreferredReplicaElections = fetchPendingPreferredReplicaElections()
     onReplicaElection(pendingPreferredReplicaElections, ElectionType.PREFERRED, ZkTriggered)
     info("Starting the controller scheduler")
     kafkaScheduler.startup()
     if (config.autoLeaderRebalanceEnable) {
+      //leader副本自动均衡,
       scheduleAutoLeaderRebalanceTask(delay = 5, unit = TimeUnit.SECONDS)
     }
 
     if (config.tokenAuthEnabled) {
-      info("starting the token expiry check scheduler")
-      tokenCleanScheduler.startup()
-      tokenCleanScheduler.schedule(name = "delete-expired-tokens",
-        fun = () => tokenManager.expireTokens(),
-        period = config.delegationTokenExpiryCheckIntervalMs,
-        unit = TimeUnit.MILLISECONDS)
+     ...//tokenManager 
     }
   }
 ```
 
+onControllerFailover()方法的主要内容可分为以下几部分：
+
+* 注册相关ZK节点变动的时间处理器，见下表格；
+* 调用initializeControllerContext()方法初始化初始化ControllerContext；
+* 初始化主题删除管理器`TopicDeletionManager` ，当配置`delete.topic.enable`为true时，负责删除`/admin/delete_topics`节点下的topic；
+* 调用`sendUpdateMetadataRequest()`方法向集群内所有在线Broker发送UpdateMetadataRequest，
+* 启动ReplicaStateMachine(副本状态机)，初始化所有副本的状态；
+* 启动PartitionStateMachine(分区状态机)，初始化所有主题分区的状态；
+* 如有需要，触发分区副本重分配以及leader选举；
+
+
+#### 监听ZK节点
+
+KafkaController选举成功后需监听的ZK节点列表如下：
+
+| 事件Handler | 节点路径  | 事件(ControllerEvent) | 作用  |
+|----------|-------|----------|----------|
+|BrokerChangeHandler| /brokers/ids | BrokerChange |处理Broker节点上、下线事件 |
+|TopicChangeHandler|/brokers/topics| TopicChange |处理消息Topic的增减事件 |
+|topicDeletionHandler|	/admin/delete_topics| TopicDeletion |处理Topic的删除事件|
+|logDirEventNotificationHandler|	/log_dir_event_notification	|LogDirEventNotification| 处理LogDir异常事件(如某个Broker读取日志失败时，会添加通知) |
+|isrChangeNotificationHandler|	/isr_change_notification	|IsrChangeNotification| 处理Partition ISR集合变动事件|
+|partitionReassignmentHandler|	/admin/reassign_partitions	|PartitionReassignment| 处理分区副本重分配(迁移) |
+|preferredReplicaElectionHandler|	/admin/preferred_replica_election	|PreferredReplicaLeaderElection| 处理Partition优先副本(leader)选举 |
+
+#### ControllerContext初始化
+
+ControllerContext的作用是读取Kafka集群Zookeeper相关节点的信息并缓存到本地，包括Broker、Topic、Partition以及Replica等，定义如下：
+
+```
+class ControllerContext {
+  val stats = new ControllerStats
+  //离线分区数量
+  var offlinePartitionCount = 0
+  var preferredReplicaImbalanceCount = 0
+  val shuttingDownBrokerIds = mutable.Set.empty[Int]
+  private val liveBrokers = mutable.Set.empty[Broker]
+  private val liveBrokerEpochs = mutable.Map.empty[Int, Long]
+  var epoch: Int = KafkaController.InitialControllerEpoch
+  var epochZkVersion: Int = KafkaController.InitialControllerEpochZkVersion
+
+  val allTopics = mutable.Set.empty[String]
+  var topicIds = mutable.Map.empty[String, Uuid]
+  var topicNames = mutable.Map.empty[Uuid, String]
+  // 主题分区数据
+  val partitionAssignments = mutable.Map.empty[String, mutable.Map[Int, ReplicaAssignment]]
+  private val partitionLeadershipInfo = mutable.Map.empty[TopicPartition, LeaderIsrAndControllerEpoch]
+  //待进行副本重分配的分区集合
+  val partitionsBeingReassigned = mutable.Set.empty[TopicPartition]
+  //分区状态
+  val partitionStates = mutable.Map.empty[TopicPartition, PartitionState]
+  val replicaStates = mutable.Map.empty[PartitionAndReplica, ReplicaState]
+  val replicasOnOfflineDirs = mutable.Map.empty[Int, Set[TopicPartition]]
+
+  val topicsToBeDeleted = mutable.Set.empty[String]
+  ...//other method
+}  
+```
+
+初始化方法源码如下：
+
+```
+  private def initializeControllerContext(): Unit = {
+    //获取 /brokers/ids 节点下所有的Broker数据
+    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
+    
+    //版本兼容性
+    val (compatibleBrokerAndEpochs, incompatibleBrokerAndEpochs) = partitionOnFeatureCompatibility(curBrokerAndEpochs)
+    if (!incompatibleBrokerAndEpochs.isEmpty) {
+      warn("Ignoring registration of new brokers due to incompatibilities with finalized features: incompatibleBrokerAndEpochs.map { case (broker, _) => broker.id }.toSeq.sorted.mkString(","))
+    }
+    //缓存所有在线Broker
+    controllerContext.setLiveBrokers(compatibleBrokerAndEpochs)
+    //缓存  /brokers/topics 节点下记录的Topic
+    controllerContext.setAllTopics(zkClient.getAllTopicsInCluster(true))
+    //为每个Topic节点注册监听器  /brokers/topics/${topic}
+    registerPartitionModificationsHandlers(controllerContext.allTopics.toSeq)
+    //获取所有Topic的分区数据 
+    val replicaAssignmentAndTopicIds = zkClient.getReplicaAssignmentAndTopicIdForTopics(controllerContext.allTopics.toSet)
+    //判断是否使用topicId,自动生成topicId  
+    //Create topic IDs for topics missing them if we are using topic IDs Otherwise, maintain what we have in the topicZNode
+    processTopicIds(replicaAssignmentAndTopicIds)
+
+    //缓存主题分区元数据
+    replicaAssignmentAndTopicIds.foreach { case TopicIdReplicaAssignment(_, _, assignments) =>
+      assignments.foreach { case (topicPartition, replicaAssignment) =>
+        controllerContext.updatePartitionFullReplicaAssignment(topicPartition, replicaAssignment)
+        if (replicaAssignment.isBeingReassigned) 
+          //addingReplicas.nonEmpty || removingReplicas.nonEmpty
+          //添加待重分配的主题分区 
+          controllerContext.partitionsBeingReassigned.add(topicPartition)
+      }
+    }
+    //初始化partitionLeadershipInfo和shuttingDownBrokerIds集合
+    controllerContext.clearPartitionLeadershipInfo()
+    controllerContext.shuttingDownBrokerIds.clear()
+    //注册broker节点监听器 /brokers/ids/${id}
+    registerBrokerModificationsHandler(controllerContext.liveOrShuttingDownBrokerIds)
+    // update the leader and isr cache for all existing partitions from Zookeeper
+    updateLeaderAndIsrCache()
+    // start the channel manager
+    controllerChannelManager.startup()
+  }
+```
+
+initializeControllerContext()方法的作用，并缓存到本地，
+
+### ControllerChannelManager
 
 
 
