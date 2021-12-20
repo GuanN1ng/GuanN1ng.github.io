@@ -471,6 +471,7 @@ onControllerFailover()方法的主要内容可分为以下几部分：
 * 启动ReplicaStateMachine(副本状态机)，初始化所有副本的状态；
 * 启动PartitionStateMachine(分区状态机)，初始化所有主题分区的状态；
 * 如有需要，触发分区副本重分配以及leader选举；
+* 若`auto.leader.rebalance.enable`配置为true，开启定时任务，维护分区优先副本均衡。
 
 
 #### 监听ZK节点
@@ -661,19 +662,281 @@ sendRequest()方法只是将请求放入对应Broker的MessageQueue中，而后�
 
 ## BrokerChange
 
-Broker启动时，会在`/brokers/ids/`ZK节点下注册自己的brokerId，KafkaController为`/brokers/ids/`ZK节点注册的BrokerChangeHandler监听到变化后，会将
-**BrokerChange**时间放入ControllerEventManager中处理，如下：
+Broker上线或下线时，相应的在`/brokers/ids/`ZK节点下的数据也会发生增加或减少，KafkaController为`/brokers/ids/`ZK节点注册的BrokerChangeHandler监听到变化后，会将
+**BrokerChange**事件放入ControllerEventManager中处理，如下：
 
 ```
 class BrokerChangeHandler(eventManager: ControllerEventManager) extends ZNodeChildChangeHandler {
   override val path: String = BrokerIdsZNode.path
-
+  //监听节点下数据项变化
   override def handleChildChange(): Unit = {
     eventManager.put(BrokerChange)
   }
 }
 ```
 
+ControllerEventThread会从事件队列中取出**BrokerChange**事件，调用`processBrokerChange()`方法进行处理，源码如下：
+
+```
+  private def processBrokerChange(): Unit = {
+    //确认Controller有效
+    if (!isActive) return
+    //获取ZK /brokers/ids节点下所有的broker信息
+    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
+    val curBrokerIdAndEpochs = curBrokerAndEpochs map { case (broker, epoch) => (broker.id, epoch) }
+    val curBrokerIds = curBrokerIdAndEpochs.keySet
+    //获取controllerContext中缓存的在线broker信息
+    val liveOrShuttingDownBrokerIds = controllerContext.liveOrShuttingDownBrokerIds
+    //新上线的brokerids
+    val newBrokerIds = curBrokerIds.diff(liveOrShuttingDownBrokerIds)
+    //已下线的brokerids
+    val deadBrokerIds = liveOrShuttingDownBrokerIds.diff(curBrokerIds)
+    //重启的brokerids
+    val bouncedBrokerIds = (curBrokerIds & liveOrShuttingDownBrokerIds)
+      .filter(brokerId => curBrokerIdAndEpochs(brokerId) > controllerContext.liveBrokerIdAndEpochs(brokerId))
+    val newBrokerAndEpochs = curBrokerAndEpochs.filter { case (broker, _) => newBrokerIds.contains(broker.id) }
+    val bouncedBrokerAndEpochs = curBrokerAndEpochs.filter { case (broker, _) => bouncedBrokerIds.contains(broker.id) }
+    val newBrokerIdsSorted = newBrokerIds.toSeq.sorted
+    val deadBrokerIdsSorted = deadBrokerIds.toSeq.sorted
+    val liveBrokerIdsSorted = curBrokerIds.toSeq.sorted
+    val bouncedBrokerIdsSorted = bouncedBrokerIds.toSeq.sorted
+  
+    //为新上线的broker初始化ControllerBrokerStateInfo对象
+    newBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
+    //重启的broker,移除旧的，重新初始化ControllerBrokerStateInfo对象
+    bouncedBrokerIds.foreach(controllerChannelManager.removeBroker)
+    bouncedBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
+    //移除下线的broker
+    deadBrokerIds.foreach(controllerChannelManager.removeBroker)
+
+    if (newBrokerIds.nonEmpty) {
+      //处理新上线的broker
+      val (newCompatibleBrokerAndEpochs, newIncompatibleBrokerAndEpochs) = partitionOnFeatureCompatibility(newBrokerAndEpochs)
+      if (!newIncompatibleBrokerAndEpochs.isEmpty) {
+        warn("Ignoring registration of new brokers due to incompatibilities with finalized features: " +
+          newIncompatibleBrokerAndEpochs.map { case (broker, _) => broker.id }.toSeq.sorted.mkString(","))
+      }
+      controllerContext.addLiveBrokers(newCompatibleBrokerAndEpochs)
+      onBrokerStartup(newBrokerIdsSorted)
+    }
+    if (bouncedBrokerIds.nonEmpty) {
+      controllerContext.removeLiveBrokers(bouncedBrokerIds)
+      onBrokerFailure(bouncedBrokerIdsSorted)
+      val (bouncedCompatibleBrokerAndEpochs, bouncedIncompatibleBrokerAndEpochs) = partitionOnFeatureCompatibility(bouncedBrokerAndEpochs)
+      if (!bouncedIncompatibleBrokerAndEpochs.isEmpty) {
+        warn("Ignoring registration of bounced brokers due to incompatibilities with finalized features: " + bouncedIncompatibleBrokerAndEpochs.map { case (broker, _) => broker.id }.toSeq.sorted.mkString(","))
+      }
+      controllerContext.addLiveBrokers(bouncedCompatibleBrokerAndEpochs)
+      onBrokerStartup(bouncedBrokerIdsSorted)
+    }
+    if (deadBrokerIds.nonEmpty) {
+      //移除下线broker
+      controllerContext.removeLiveBrokers(deadBrokerIds)
+      onBrokerFailure(deadBrokerIdsSorted)
+    }
+
+    if (newBrokerIds.nonEmpty || deadBrokerIds.nonEmpty || bouncedBrokerIds.nonEmpty) {
+      info(s"Updated broker epochs cache: ${controllerContext.liveBrokerIdAndEpochs}")
+    }
+  }
+```
+
+processBrokerChange()方法主要可分为以下几部分：
+
+* 读取ZK节点`/brokers/ids`下所有的broker元数据curBrokerAndEpochs；
+* 对比curBrokerAndEpochs与ControllerContext中broker缓存liveOrShuttingDownBrokerIds，共分为三类，如下：
+  * 新增节点newBrokerIds，即新上线的broker节点，先调用**ControllerChannelManager#addBroker()方法**与新上线的broker节点初始化ControllerBrokerStateInfo对象(网络连接及请求发送队列及线程)，然后再调用**onBrokerStartup()方法**进行上线处理；
+  * 下线节点deadBrokerIds，即已下线的broker节点，先调用**ControllerChannelManager#removeBroker()方法**移除broker节点的ControllerBrokerStateInfo对象，然后再调用**onBrokerFailure()方法**进行上线处理；；
+  * 重启节点bouncedBrokerIds，及发生重启的broker节点(epoch)，先进行下线操作，再进行上线操作；
+  
+可知，负责处理Broker节点上线和下线的核心方法是onBrokerStartup()和onBrokerFailure()方法。
+
+
+### Broker节点上线
+
+KafkaServer启动时，会写入`/brokers/ids/${id}`的节点，触发BrokerChange事件，负责处理Broker节点上线的核心方法onBrokerStartup()的实现如下：
+
+```
+private def onBrokerStartup(newBrokers: Seq[Int]): Unit = {
+  
+  newBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+  val newBrokersSet = newBrokers.toSet
+  //此前已存在的broker
+  val existingBrokers = controllerContext.liveOrShuttingDownBrokerIds.diff(newBrokersSet)
+  // Send update metadata request to all the existing brokers in the cluster so that they know about the new brokers
+  // via this update. No need to include any partition states in the request since there are no partition state changes.
+  //发送UpdateMetadataRequest给已存在broker, 使broker知道有新的broker节点上线
+  sendUpdateMetadataRequest(existingBrokers.toSeq, Set.empty)
+  // Send update metadata request to all the new brokers in the cluster with a full set of partition states for initialization.
+  // In cases of controlled shutdown leaders will not be elected when a new broker comes up. So at least in the
+  // common controlled shutdown case, the metadata will reach the new brokers faster.
+  sendUpdateMetadataRequest(newBrokers, controllerContext.partitionsWithLeaders)
+  
+  //获取broker上的所有 replica
+  val allReplicasOnNewBrokers = controllerContext.replicasOnBrokers(newBrokersSet)
+  //将新上线broker上的副本的状态设置为 OnlineReplica
+  replicaStateMachine.handleStateChanges(allReplicasOnNewBrokers.toSeq, OnlineReplica)
+  // when a new broker comes up, the controller needs to trigger leader election for all new and offline partitions
+  // to see if these brokers can become leaders for some/all of those
+  partitionStateMachine.triggerOnlinePartitionStateChange()
+  // 如果需要副本进行迁移的话,就执行副本迁移操作
+  maybeResumeReassignments { (_, assignment) =>
+    assignment.targetReplicas.exists(newBrokersSet.contains)
+  }
+  // 检查是否需要恢复主题删除。如果新重启的broker上至少存在一个属于被删除主题的副本，则主题删除有可能恢复
+  val replicasForTopicsToBeDeleted = allReplicasOnNewBrokers.filter(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
+  if (replicasForTopicsToBeDeleted.nonEmpty) {
+    //进行主题删除
+    topicDeletionManager.resumeDeletionForTopics(replicasForTopicsToBeDeleted.map(_.topic))
+  }
+  //为新上线的broker注册监听器  /brokers/ids/${id}
+  registerBrokerModificationsHandler(newBrokers)
+}
+```
+
+
+### Broker节点下线
+
+Broker节点下线可分为正常下线(调用 shutdown API)和突然掉线(服务宕机或ZK网络连接失败)，两种情况都会因为`/brokers/ids/${id}`节点的消失触发onBrokerFailure()方法，但Broker正常下线
+时还会向集群Controller发送**ControlledShutdownRequest**，该请求由KafkaApis#handleControlledShutdownRequest()方法进行处理。
+
+#### handleControlledShutdownRequest
+
+集群Controller节点收到ControlledShutdownRequest后，会封装为**ControlledShutdown**事件放入事件队列。
+
+```
+  def handleControlledShutdownRequest(request: RequestChannel.Request): Unit = {
+    val zkSupport = metadataSupport.requireZkOrThrow(KafkaApis.shouldNeverReceive(request)
+    val controlledShutdownRequest = request.body[ControlledShutdownRequest]
+    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
+    //结果回调
+    def controlledShutdownCallback(controlledShutdownResult: Try[Set[TopicPartition]]): Unit = {...} 
+    zkSupport.controller.controlledShutdown(controlledShutdownRequest.data.brokerId, controlledShutdownRequest.data.brokerEpoch, controlledShutdownCallback)
+  }
+  
+  def controlledShutdown(id: Int, brokerEpoch: Long, controlledShutdownCallback: Try[Set[TopicPartition]] => Unit): Unit = {
+    val controlledShutdownEvent = ControlledShutdown(id, brokerEpoch, controlledShutdownCallback)
+    //放入controlledShutdownEvent
+    eventManager.put(controlledShutdownEvent)
+  }
+```
+
+ControllerEventThread会从事件队列中取出**ControlledShutdown**事件，调用`processControlledShutdown()`方法进行处理，源码如下：
+
+```
+  private def processControlledShutdown(id: Int, brokerEpoch: Long, controlledShutdownCallback: Try[Set[TopicPartition]] => Unit): Unit = {
+    //调用doControlledShutdown方法处理
+    val controlledShutdownResult = Try { doControlledShutdown(id, brokerEpoch) }
+    controlledShutdownCallback(controlledShutdownResult)
+  }
+
+  private def doControlledShutdown(id: Int, brokerEpoch: Long): Set[TopicPartition] = {
+    if (!isActive) {... //异常，当前节点非集群Controller}
+
+    if (brokerEpoch != AbstractControlRequest.UNKNOWN_BROKER_EPOCH) {
+      val cachedBrokerEpoch = controllerContext.liveBrokerIdAndEpochs(id)
+      if (brokerEpoch < cachedBrokerEpoch) {... //broker epoch失效 异常}
+    }
+
+    info(s"Shutting down broker $id")
+
+    if (!controllerContext.liveOrShuttingDownBrokerIds.contains(id))
+      throw new BrokerNotAvailableException(s"Broker id $id does not exist.")
+    //上下文更新
+    controllerContext.shuttingDownBrokerIds.add(id)
+    
+   //需处理分区
+    val partitionsToActOn = controllerContext.partitionsOnBroker(id).filter { partition =>
+      controllerContext.partitionReplicaAssignment(partition).size > 1 && //主题分区数 > 1
+        controllerContext.partitionLeadershipInfo(partition).isDefined &&  //存在leader副本
+        !topicDeletionManager.isTopicQueuedUpForDeletion(partition.topic)  //主题非待删除主题
+    }
+    //分类 leader副本是否在该broker上
+    val (partitionsLedByBroker, partitionsFollowedByBroker) = partitionsToActOn.partition { partition =>
+      controllerContext.partitionLeadershipInfo(partition).get.leaderAndIsr.leader == id
+    }
+    //下线节点上存在副本leader 通过重置分区状态为OnlinePartition 触发副本leader选举
+    //选举策略为 ControlledShutdownPartitionLeaderElectionStrategy
+    partitionStateMachine.handleStateChanges(partitionsLedByBroker.toSeq, OnlinePartition, Some(ControlledShutdownPartitionLeaderElectionStrategy))
+    try {
+      brokerRequestBatch.newBatch()
+      //非leader副本，发送 StopReplica 请求，停止副本同步
+      partitionsFollowedByBroker.foreach { partition =>
+        brokerRequestBatch.addStopReplicaRequestForBrokers(Seq(id), partition, deletePartition = false)
+      }
+      brokerRequestBatch.sendRequestsToBrokers(epoch)
+    } catch {
+      case e: IllegalStateException =>
+        handleIllegalState(e)
+    }
+    // If the broker is a follower, updates the isr in ZK and notifies the current leader
+    replicaStateMachine.handleStateChanges(partitionsFollowedByBroker.map(partition =>
+      PartitionAndReplica(partition, id)).toSeq, OfflineReplica)
+    trace(s"All leaders = ${controllerContext.partitionsLeadershipInfo.mkString(",")}")
+    controllerContext.partitionLeadersOnBroker(id)
+  }
+```
+
+processControlledShutdown()方法是在Broker下线前，对有副本在下线broker上的分区预处理，分两种情况：
+
+* 下线broker节点上的副本为leader副本，通过重置分区状态为OnlinePartition，触发副本leader选举；
+* 下线broker节点上的副本为follower副本，发送StopReplicaRequest停止副本同步，并将该副本状态设置为OfflineReplica状态。
+
+Broker处理完后，继续进行其它资源的关闭操作，最后，ZK节点`/brokers/ids/${id}`消失，Controller监听到节点变化，继续Broker下线后的其他工作。
+
+#### onBrokerFailure
+
+负责处理Broker下线的方法为onBrokerFailure()，源码如下：
+
+```
+private def onBrokerFailure(deadBrokers: Seq[Int]): Unit = {
+  //移除缓存中下线的broker上的分区
+  deadBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+  val deadBrokersThatWereShuttingDown =
+    deadBrokers.filter(id => controllerContext.shuttingDownBrokerIds.remove(id))
+  if (deadBrokersThatWereShuttingDown.nonEmpty)
+    info(s"Removed ${deadBrokersThatWereShuttingDown.mkString(",")} from list of shutting down brokers.")
+  //下线broker上的副本
+  val allReplicasOnDeadBrokers = controllerContext.replicasOnBrokers(deadBrokers.toSet)
+  //处理下线broker节点的副本
+  onReplicasBecomeOffline(allReplicasOnDeadBrokers)
+  //取消/brokers/ids/${id} 节点的监听
+  unregisterBrokerModificationsHandler(deadBrokers)
+}
+```
+
+onBrokerFailure()方法主要是完成ControllerContext的更新以及取消`/brokers/ids/${id}`节点的监听，下线副本的进一步操作则由onReplicasBecomeOffline()方法负责：
+
+```
+private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]): Unit = {
+  val (newOfflineReplicasForDeletion, newOfflineReplicasNotForDeletion) =
+    newOfflineReplicas.partition(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
+
+  val partitionsWithOfflineLeader = controllerContext.partitionsWithOfflineLeader
+
+  // trigger OfflinePartition state for all partitions whose current leader is one amongst the newOfflineReplicas
+  partitionStateMachine.handleStateChanges(partitionsWithOfflineLeader.toSeq, OfflinePartition)
+  // trigger OnlinePartition state changes for offline or new partitions
+  val onlineStateChangeResults = partitionStateMachine.triggerOnlinePartitionStateChange()
+  // trigger OfflineReplica state change for those newly offline replicas
+  replicaStateMachine.handleStateChanges(newOfflineReplicasNotForDeletion.toSeq, OfflineReplica)
+
+  // fail deletion of topics that are affected by the offline replicas
+  if (newOfflineReplicasForDeletion.nonEmpty) {
+    // it is required to mark the respective replicas in TopicDeletionFailed state since the replica cannot be
+    // deleted when its log directory is offline. This will prevent the replica from being in TopicDeletionStarted state indefinitely
+    // since topic deletion cannot be retried until at least one replica is in TopicDeletionStarted state
+    topicDeletionManager.failReplicaDeletion(newOfflineReplicasForDeletion)
+  }
+
+  // If no partition has changed leader or ISR, no UpdateMetadataRequest is sent through PartitionStateMachine
+  // and ReplicaStateMachine. In that case, we want to send an UpdateMetadataRequest explicitly to
+  // propagate the information about the new offline brokers.
+  if (newOfflineReplicasNotForDeletion.isEmpty && onlineStateChangeResults.values.forall(_.isLeft)) {
+    sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, Set.empty)
+  }
+}
+```
 
 
 
