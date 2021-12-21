@@ -6,7 +6,7 @@ categories: Kafka
 ---
 
 Broker是指Kafka服务的代理节点，Broker实例提供了消息存储、副本管理、集群控制、消费者管理和请求处理等一系列功能，而这些功能分别由Broker端的不同服务对象提供，如负责消费者组管理的`GroupCoordinator`，负责事务的`TransactionCoordinator`，
-负责请求分发处理的`KafkaApis`等等。 本篇内容主要分析Broker实例及负责集群内分区和副本的状态管理对象`KafkaController`(控制器)的启动和停止的源码实现。
+负责请求分发处理的`KafkaApis`等等。 本篇内容主要分析Broker实例和其中负责集群内分区和副本的状态管理的`KafkaController`(控制器)对象的启动和停止的源码实现。
 
 
 # Kafka#main
@@ -882,7 +882,7 @@ processControlledShutdown()方法是在Broker下线前，对有副本在下线br
 * 下线broker节点上的副本为leader副本，通过重置分区状态为OnlinePartition，触发副本leader选举；
 * 下线broker节点上的副本为follower副本，发送StopReplicaRequest停止副本同步，并将该副本状态设置为OfflineReplica状态。
 
-Broker处理完后，继续进行其它资源的关闭操作，最后，ZK节点`/brokers/ids/${id}`消失，Controller监听到节点变化，继续Broker下线后的其他工作。
+正在执行关机的Broker继续进行其它资源的关闭操作，最后，ZK节点`/brokers/ids/${id}`消失，Controller监听到节点变化，继续Broker下线后的其他工作。
 
 #### onBrokerFailure
 
@@ -909,25 +909,30 @@ onBrokerFailure()方法主要是完成ControllerContext的更新以及取消`/br
 
 ```
 private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]): Unit = {
-  val (newOfflineReplicasForDeletion, newOfflineReplicasNotForDeletion) =
-    newOfflineReplicas.partition(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
+    //分类，是否为待删除的离线副本
+    val (newOfflineReplicasForDeletion, newOfflineReplicasNotForDeletion) =
+      newOfflineReplicas.partition(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
 
-  val partitionsWithOfflineLeader = controllerContext.partitionsWithOfflineLeader
+    //leader副本离线的分区
+    val partitionsWithOfflineLeader = controllerContext.partitionsWithOfflineLeader
 
-  // trigger OfflinePartition state for all partitions whose current leader is one amongst the newOfflineReplicas
-  partitionStateMachine.handleStateChanges(partitionsWithOfflineLeader.toSeq, OfflinePartition)
-  // trigger OnlinePartition state changes for offline or new partitions
-  val onlineStateChangeResults = partitionStateMachine.triggerOnlinePartitionStateChange()
-  // trigger OfflineReplica state change for those newly offline replicas
-  replicaStateMachine.handleStateChanges(newOfflineReplicasNotForDeletion.toSeq, OfflineReplica)
+    //leader副本离线的分区标记为OfflinePartition状态
+    partitionStateMachine.handleStateChanges(partitionsWithOfflineLeader.toSeq, OfflinePartition)
+    
+    // trigger OnlinePartition state changes for offline or new partitions
+    //使用OfflinePartitionLeaderElectionStrategy策略进行leader选举
+    val onlineStateChangeResults = partitionStateMachine.triggerOnlinePartitionStateChange()
+    
+    // trigger OfflineReplica state change for those newly offline replicas
+    //副本状态修改为离线，
+    replicaStateMachine.handleStateChanges(newOfflineReplicasNotForDeletion.toSeq, OfflineReplica)
 
-  // fail deletion of topics that are affected by the offline replicas
-  if (newOfflineReplicasForDeletion.nonEmpty) {
-    // it is required to mark the respective replicas in TopicDeletionFailed state since the replica cannot be
-    // deleted when its log directory is offline. This will prevent the replica from being in TopicDeletionStarted state indefinitely
-    // since topic deletion cannot be retried until at least one replica is in TopicDeletionStarted state
-    topicDeletionManager.failReplicaDeletion(newOfflineReplicasForDeletion)
-  }
+    // fail deletion of topics that are affected by the offline replicas
+    if (newOfflineReplicasForDeletion.nonEmpty) {
+      //broker离线，无法进行副本删除，需要将副本标记为ReplicaDeletionIneligible状态，
+      // 防止副本无限期地处于ReplicaDeletionStarted状态
+      topicDeletionManager.failReplicaDeletion(newOfflineReplicasForDeletion)
+    }
 
   // If no partition has changed leader or ISR, no UpdateMetadataRequest is sent through PartitionStateMachine
   // and ReplicaStateMachine. In that case, we want to send an UpdateMetadataRequest explicitly to
@@ -937,6 +942,9 @@ private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]
   }
 }
 ```
+
+onBrokerFailure()方法中同样会判断离线broker上是否有leader副本，若有则使用OfflinePartitionLeaderElectionStrategy策略进行副本leader选举，以及
+Replica状态修改，即正常下线时发送的ControlledShutdownRequest只是提前触发一部分副本工作。至此，Controller端对于Broker下线的处理已全部完成。
 
 
 
