@@ -946,23 +946,80 @@ private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]
 onBrokerFailure()方法中同样会判断离线broker上是否有leader副本，若有则使用OfflinePartitionLeaderElectionStrategy策略进行副本leader选举，以及
 Replica状态修改，即正常下线时发送的ControlledShutdownRequest只是提前触发一部分副本工作。至此，Controller端对于Broker下线的处理已全部完成。
 
-
-
 # KafkaRaftServer
 
+KafkaRaftServer实现中，移除了对Zookeeper集群的依赖，基于raft协议实现集群控制，可通过配置文件中的`process.roles`属性指定一个Broker节点角色，可供使用的配置项有：
 
+* broker，负责消息存储及请求处理；
+* controller，负责集群元数据管理；
+
+两个配置项即可只配置其中任意一个，只承担一种角色，也可两个均配置，同时承担两种角色。
+
+KafkaRaftServer定义如下：
+
+```
+class KafkaRaftServer( config: KafkaConfig, time: Time, threadNamePrefix: Option[String] ) extends Server with Logging {
+
+  KafkaMetricsReporter.startReporters(VerifiableProperties(config.originals))
+  KafkaYammerMetrics.INSTANCE.configure(config.originals)
+  
+  //初始化配置的日志目录，包括消息日志目录 'log.dirs' 或 'log.dir'   节点元数据目录 'metadata.log.dir'
+  //验证所有目录均可访问 和 meta.properties内容与配置一致
+  private val (metaProps, offlineDirs) = KafkaRaftServer.initializeLogDirs(config)
+
+  private val metrics = Server.initializeMetrics( config, time, metaProps.clusterId )
+  
+  //初始化raft 集群连接   
+  //配置为 controller.quorum.voters=1@localhost:9092,2@localhost:9093,3@localhost:9094;
+  private val controllerQuorumVotersFuture = CompletableFuture.completedFuture(
+    RaftConfig.parseVoterConnections(config.quorumVoters))
+  
+  //创建KafkaRaftManager
+  private val raftManager = new KafkaRaftManager[ApiMessageAndVersion]( metaProps, config, new MetadataRecordSerde, KafkaRaftServer.MetadataPartition, KafkaRaftServer.MetadataTopicId, time, metrics, threadNamePrefix, controllerQuorumVotersFuture )
+
+  //`process.roles`配置中包含 broker 项 创建BrokerServer
+  private val broker: Option[BrokerServer] = if (config.processRoles.contains(BrokerRole)) {
+    Some(new BrokerServer( config, metaProps, raftManager, time, metrics, threadNamePrefix, offlineDirs, controllerQuorumVotersFuture, Server.SUPPORTED_FEATURES ))
+  } else {
+    None
+  }
+  
+  //`process.roles`配置中包含 controller 项  创建ControllerServer
+  private val controller: Option[ControllerServer] = if (config.processRoles.contains(ControllerRole)) {
+    Some(new ControllerServer( metaProps, config, raftManager, time, metrics, threadNamePrefix, controllerQuorumVotersFuture ))
+  } else {
+    None
+  }
+  ...// other code
+}
+
+```
 
 ## startup
 
-
+KafkaRaftServer#startup()方法如下：
 
 ```
   override def startup(): Unit = {
     Mx4jLoader.maybeLoad()
+    //kafka raft集群管理
     raftManager.startup()
+    //如有，启动Controller服务
     controller.foreach(_.startup())
+    //如有，启动Broker服务
     broker.foreach(_.startup())
     AppInfoParser.registerAppInfo(Server.MetricsPrefix, config.brokerId.toString, metrics, time.milliseconds())
     info(KafkaBroker.STARTED_MESSAGE)
   }
 ```
+startup()方法主要负责完成三个角色的启动：**KafkaRaftManager、ControllerServer以及BrokerServer**，
+
+
+### ControllerServer
+
+
+### BrokerServer
+
+
+### KafkaRaftManager
+
