@@ -1012,7 +1012,7 @@ KafkaRaftServer#startup()方法如下：
     info(KafkaBroker.STARTED_MESSAGE)
   }
 ```
-startup()方法主要负责完成三个角色的启动：**KafkaRaftManager、ControllerServer以及BrokerServer**，
+startup() ：**KafkaRaftManager、ControllerServer以及BrokerServer**，
 
 
 ### ControllerServer
