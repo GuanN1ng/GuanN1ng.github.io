@@ -489,7 +489,7 @@ def createTopicWithAssignment(topic: String,
 ## TopicChange
 
 Topic数据写入ZK后，会触发KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
-的事件队列中，等待处理，负责处理TopicChange的方法为processTopicChange()方法，源码如下：
+的事件队列中，等待处理，负责处理TopicChange事件的方法为processTopicChange()方法，源码如下：
 
 ```
 private def processTopicChange(): Unit = {
@@ -527,7 +527,7 @@ private def processTopicChange(): Unit = {
 }
 ```
 
-processTopicChange()方法会读取ZK对应节点下的数据，并更新本地缓存，同时为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，最后调用onNewPartitionCreation()方法开始进行状态转换。
+processTopicChange()方法会读取ZK对应节点下的数据，并更新本地缓存，同时为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，最后调用onNewPartitionCreation()方法开始进行分区与副本的相关操作。
 
 ```
 //It does the following -
@@ -542,10 +542,10 @@ private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
 }
 ```
 
-### PartitionState
+### Partition
 
 
-### ReplicaState
+### Replica
 
 
 # ModifyTopic
