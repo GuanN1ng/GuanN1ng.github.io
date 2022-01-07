@@ -250,15 +250,16 @@ private def replicaIndex(firstReplicaIndex: Int, secondReplicaShift: Int, replic
 
 最终分配结果如下：
 
-<table cellpadding="2" cellspacing="2">
-<tr><th>broker-0</th><th>broker-1</th><th>broker-2</th><th>broker-3</th><th>broker-4</th>
-<tr><td>p0      </td><td>p1      </td><td>p2      </td><td>p3      </td><td>p4      </td></tr>
-<tr><td>p5      </td><td>p6      </td><td>p7      </td><td>p8      </td><td>p9      </td></tr>
-<tr><td>p4      </td><td>p0      </td><td>p1      </td><td>p2      </td><td>p3      </td></tr>
-<tr><td>p8      </td><td>p9      </td><td>p5      </td><td>p6      </td><td>p7      </td></tr>
-<tr><td>p3      </td><td>p4      </td><td>p0      </td><td>p1      </td><td>p2      </td></tr>
-<tr><td>p7      </td><td>p8      </td><td>p9      </td><td>p5      </td><td>p6      </td></tr>
-</table>
+
+| broker-0 | broker-1  | broker-2 | broker-3  | broker-4  |
+|----------|-------|----------|----------|----------|
+|p0      |p1      |p2      |p3      |p4     | 
+|p5      |p6      |p7      |p8      |p9      |
+|p4      |p0      |p1      |p2      |p3      |
+|p8      |p9      |p5      |p6      |p7      |
+|p3      |p4      |p0      |p1      |p2      |
+|p7      |p8      |p9      |p5      |p6      |
+
 
 
 ##### 有机架信息
@@ -360,7 +361,62 @@ def createTopicWithAssignment(topic: String,
 * 将Topic的分区信息写入zk中，节点路径为：`/brokers/topics/${topicName}/partitions/${partition}`，内容为该Partition的副本信息；
 
 
-### KafkaController
+### TopicChange
+
+Topic数据写入ZK后，会调用KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
+的事件队列中，等待处理，负责处理TopicChange的方法为processTopicChange()方法，源码如下：
+
+```
+private def processTopicChange(): Unit = {
+  if (!isActive) return
+  //获取/brokers/topics节点下的所有主题
+  val topics = zkClient.getAllTopicsInCluster(true)
+  //新增加的topic
+  val newTopics = topics -- controllerContext.allTopics
+  //被删除的topic
+  val deletedTopics = controllerContext.allTopics.diff(topics)
+  //更新缓存
+  controllerContext.setAllTopics(topics)
+  //为新建主题注册分区变动的Handler 节点  /brokers/topics/${topicName}
+  registerPartitionModificationsHandlers(newTopics.toSeq)
+  //获取主题分区分配方案
+  val addedPartitionReplicaAssignment = zkClient.getReplicaAssignmentAndTopicIdForTopics(newTopics)
+  deletedTopics.foreach(controllerContext.removeTopic)
+  processTopicIds(addedPartitionReplicaAssignment)
+
+  addedPartitionReplicaAssignment.foreach { case TopicIdReplicaAssignment(_, _, newAssignments) =>
+    newAssignments.foreach { case (topicAndPartition, newReplicaAssignment) =>
+      controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
+    }
+  }
+  info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
+    s"[$addedPartitionReplicaAssignment]")
+  if (addedPartitionReplicaAssignment.nonEmpty) {
+    val partitionAssignments = addedPartitionReplicaAssignment
+      .map { case TopicIdReplicaAssignment(_, _, partitionsReplicas) => partitionsReplicas.keySet }
+      .reduce((s1, s2) => s1.union(s2))
+    //创建分区副本
+    onNewPartitionCreation(partitionAssignments)
+  }
+}
+```
+
+processTopicChange()方法会读取ZK对应节点下的数据，并为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，Partition和Replica的实例对象的创建则由方法onNewPartitionCreation()实现。
+
+```
+private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
+  info(s"New partition creation callback for ${newPartitions.mkString(",")}")
+  partitionStateMachine.handleStateChanges(newPartitions.toSeq, NewPartition)
+  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, NewReplica)
+  partitionStateMachine.handleStateChanges(
+    newPartitions.toSeq,
+    OnlinePartition,
+    Some(OfflinePartitionLeaderElectionStrategy(false))
+  )
+  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, OnlineReplica)
+}
+```
+
 
 
 
