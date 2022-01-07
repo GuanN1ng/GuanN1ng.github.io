@@ -358,12 +358,12 @@ def createTopicWithAssignment(topic: String,
 主要写入了两部分内容：
 
 * 将topic单独的配置写入到zk中，节点路径为：`/config/topics/${topicName}`，内容为命令行传入的`--config`配置；
-* 将Topic的分区信息写入zk中，节点路径为：`/brokers/topics/${topicName}/partitions/${partition}`，内容为该Partition的副本信息；
+* 将Topic的分区信息写入zk中，节点路径为：`/brokers/topics/${topicName}`，内容为Topic的分区副本分配方案；
 
 
 ### TopicChange
 
-Topic数据写入ZK后，会调用KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
+Topic数据写入ZK后，会触发KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
 的事件队列中，等待处理，负责处理TopicChange的方法为processTopicChange()方法，源码如下：
 
 ```
@@ -404,15 +404,14 @@ private def processTopicChange(): Unit = {
 processTopicChange()方法会读取ZK对应节点下的数据，并为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，Partition和Replica的实例对象的创建则由方法onNewPartitionCreation()实现。
 
 ```
+//It does the following -
+// 1. Move the newly created partitions to the NewPartition state
+// 2. Move the newly created partitions from NewPartition->OnlinePartition state
 private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
   info(s"New partition creation callback for ${newPartitions.mkString(",")}")
   partitionStateMachine.handleStateChanges(newPartitions.toSeq, NewPartition)
   replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, NewReplica)
-  partitionStateMachine.handleStateChanges(
-    newPartitions.toSeq,
-    OnlinePartition,
-    Some(OfflinePartitionLeaderElectionStrategy(false))
-  )
+  partitionStateMachine.handleStateChanges(newPartitions.toSeq, OnlinePartition, Some(OfflinePartitionLeaderElectionStrategy(false)) )
   replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, OnlineReplica)
 }
 ```
@@ -512,17 +511,34 @@ Producer向Topic发送消息或Consumer从Topic读取消息前，均会向Broker
   }
 ```
 
-自动创建主题前，会先进行Topic Name的合法性校验，若当前Broker实例的角色为controller，则调用createTopicsInZk()方法完成主题创建，否则向当前集群的controller发送主题创建请求。
+自动创建主题前，会先进行Topic Name的合法性校验，若当前Broker实例的角色为controller，则调用createTopicsInZk()方法完成主题创建，否则向当前集群的controller发送CreateTopicRequest请求，
+CreateTopicRequest的处理流程见命令行创建主题流程，createTopicsInZk()方法实现如下：
 
+```
+  private def createTopicsInZk(
+    creatableTopics: Map[String, CreatableTopic],
+    controllerMutationQuota: ControllerMutationQuota
+  ): Seq[MetadataResponseTopic] = {
+    val topicErrors = new AtomicReference[Map[String, ApiError]]()
+    try {
+      //调用ZkAdminManager#createTopics创建主题
+      adminManager.get.createTopics(
+        timeout = 0,
+        validateOnly = false,
+        creatableTopics,
+        Map.empty,
+        controllerMutationQuota,
+        topicErrors.set
+      )
+      val creatableTopicResponses = Option(topicErrors.get) match {...}
+      creatableTopicResponses
+    } finally {
+      clearInflightRequests(creatableTopics)
+    }
+  }
+```
 
-
-
-
-
-
-
-
-
+可知，**自动创建同命令行创建方式实现一致，最终也是调用ZkAdminManager#createTopics()方法完成Topic创建**，源码分析将上方，这里不再复述。
 
 
 # ModifyTopic
