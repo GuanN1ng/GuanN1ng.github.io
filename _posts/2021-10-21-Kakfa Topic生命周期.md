@@ -234,12 +234,11 @@ CreateTopicRequest的处理流程见命令行创建主题流程，createTopicsIn
   }
 ```
 
-可知，**自动创建同命令行创建方式实现一致，最终也是调用ZkAdminManager#createTopics()方法完成Topic创建**。
-
+可以看到，createTopicsInZk()方法也是调用ZkAdminManager#createTopics()方法完成主题创建。
 
 ## ZkAdminManager#createTopics
 
-createTopics()方法源码如下：
+**无论是采用自动创建或命令行创建方式，最终均是调用ZkAdminManager#createTopics()方法完成Topic创建**。createTopics()方法源码如下：
 
 ```
 def createTopics(...): Unit = {
