@@ -113,311 +113,7 @@ controller节点收到CreateTopicsRequest后，由KafkaApis#handleCreateTopicsRe
   }
 ```
 
-handleCreateTopicsRequest()方法的作用是完成调用ZkAdminManager#createTopics()方法前的数据准备，createTopics()方法源码如下：
-
-```
-def createTopics(...): Unit = {
-  // 1. map over topics creating assignment and calling zookeeper
-  val brokers = metadataCache.getAliveBrokers()
-  val metadata = toCreate.values.map(topic =>
-    try {
-      //副本数与副本因子
-      val resolvedNumPartitions = if (topic.numPartitions == NO_NUM_PARTITIONS)
-        defaultNumPartitions else topic.numPartitions
-      val resolvedReplicationFactor = if (topic.replicationFactor == NO_REPLICATION_FACTOR)
-        defaultReplicationFactor else topic.replicationFactor
-
-      val assignments = if (topic.assignments.isEmpty) {
-        //未指定，计算副本分配方案
-        AdminUtils.assignReplicasToBrokers(brokers, resolvedNumPartitions, resolvedReplicationFactor)
-      } else {
-        //使用用户指定的分配方案
-        val assignments = new mutable.HashMap[Int, Seq[Int]]
-        topic.assignments.forEach { assignment =>
-          assignments(assignment.partitionIndex) = assignment.brokerIds.asScala.map(a => a: Int)
-        }
-        assignments
-      }
-
-      val configs = new Properties()
-      topic.configs.forEach(entry => configs.setProperty(entry.name, entry.value))
-      //创建参数校验
-      adminZkClient.validateTopicCreate(topic.name, assignments, configs)
-      validateTopicCreatePolicy(topic, resolvedNumPartitions, resolvedReplicationFactor, assignments)
-      maybePopulateMetadataAndConfigs(includeConfigsAndMetadata, topic.name, configs, assignments)
-      //将Topic数据写入zookeeper
-      adminZkClient.createTopicWithAssignment(topic.name, configs, assignments, validate = false, config.usesTopicId)
-      //填充topicId uuid
-      populateIds(includeConfigsAndMetadata, topic.name)
-      //元数据创建
-      CreatePartitionsMetadata(topic.name, assignments.keySet)
-
-    } catch {
-      ...// error
-    }).toBuffer
-    // 2. if timeout <= 0, validateOnly or no topics can proceed return immediately
-    // 3. else pass the assignments and errors to the delayed operation and set the keys
-    ...
-}
-```
-
-createTopics()方法的作用主要为以下三点：
-
-* 确定主题副本数与副本因子，若用户未指定参数，则使用默认值，分别是`num.partitions`和`default.replication.factor`的值；
-* 确定Topic的分区副本分配方案，若用户未指定，则通过计算得出，方法为AdminUtils#assignReplicasToBrokers()；
-* 将Topic数据写入Zookeeper。
-
-#### ReplicaAssignment
-
-若用户未指定主题的分区副本分配方案，则由AdminUtils#assignReplicasToBrokers()完成分配方案的计算，分配算法的目标有三个：
-
-* 主题所有的分区副本均匀的分布在各broker节点上；
-* 每个分区的所有副本(leader和follower)尽量分配到不同的broker节点；
-* 如果所有broker都有机架信息，尽可能将每个分区的副本分配到不同的机架(consumer消费时的preferredReadReplica);
-
-源码如下：
-
-```
-def assignReplicasToBrokers(...): Map[Int, Seq[Int]] = {
-  ...//param check
-  if (brokerMetadatas.forall(_.rack.isEmpty))
-    //所有broker节点均无机架信息
-    assignReplicasToBrokersRackUnaware(nPartitions, replicationFactor, brokerMetadatas.map(_.id), fixedStartIndex,startPartitionId)
-  else {
-    if (brokerMetadatas.exists(_.rack.isEmpty))
-      throw new AdminOperationException("Not all brokers have rack information for replica rack aware assignment.")
-    //所有broker节点均有机架信息  
-    assignReplicasToBrokersRackAware(nPartitions, replicationFactor, brokerMetadatas, fixedStartIndex,startPartitionId)
-  }
-}
-```
-
-分区副本分配方案的计算分为两类：无机架信息(rack.isEmpty)和有机架信息。
-
-##### 无机架信息
-
-当所有broker节点均无机架信息时，分配方案由assignReplicasToBrokersRackUnaware()实现，源码如下：
-
-```
-private def assignReplicasToBrokersRackUnaware(...): Map[Int, Seq[Int]] = {
-  //分配方案
-  val ret = mutable.Map[Int, Seq[Int]]()
-  //所有的broker节点
-  val brokerArray = brokerList.toArray
-  //fixedStartIndex = -1，startIndex为随机取一个broker
-  val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
-  //startPartitionId=-1 ,currentPartitionId=0
-  var currentPartitionId = math.max(0, startPartitionId)
-  //随机取一个分配步长
-  var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
-  //nPartitions分区数
-  for (_ <- 0 until nPartitions) {
-    if (currentPartitionId > 0 && (currentPartitionId % brokerArray.length == 0)) {
-      //防止 nPartitions 过大时,其中某些partition的分配完全一样，currentPartitionId为brokerArray.length整数倍时+1
-      nextReplicaShift += 1
-    }
-    //第一个分区副本的节点
-    val firstReplicaIndex = (currentPartitionId + startIndex) % brokerArray.length
-    val replicaBuffer = mutable.ArrayBuffer(brokerArray(firstReplicaIndex))
-    //该分区剩余副本分配
-    for (j <- 0 until replicationFactor - 1)
-      replicaBuffer += brokerArray(replicaIndex(firstReplicaIndex, nextReplicaShift, j, brokerArray.length))
-    ret.put(currentPartitionId, replicaBuffer)
-    currentPartitionId += 1
-  }
-  ret
-}
-
-//分区副本节点计算
-private def replicaIndex(firstReplicaIndex: Int, secondReplicaShift: Int, replicaIndex: Int, nBrokers: Int): Int = {
-  val shift = 1 + (secondReplicaShift + replicaIndex) % (nBrokers - 1)
-  (firstReplicaIndex + shift) % nBrokers
-}
-```
-
-分配算法主要分为两步：
-
-* 从所有在线broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
-* 以该Partition的第一个Replica所在broker为起点，按照步长依次分配该Partition的剩余Replica。
-
-例：假设一个Kafka集群有5个在线broker节点，其中一个Topic的Partition数为10，每个Partition有3个Replica，且最初随机选择的startIndex和nextReplicaShift节点均为0，计算过程如下：
-
-* P0的第一个副本在`(0+0)%5=0`，第二个副本在`(0+(1+(0+0)%4)))%5=1`，第三副本在`(0+(1+(0+1)%4)))%5=2`，完成后currentPartitionId+1=1，nextReplicaShift=0；
-* P1的第一个副本在`(1+0)%5=1`，第二个副本在`(1+(1+(0+0)%4)))%5=2`，第三副本在`(1+(1+(0+1)%4)))%5=3`，完成后currentPartitionId+1=2，nextReplicaShift=0；
-* ...
-* P4的第一个副本在`(4+0)%5=4`，第二个副本在`(4+(1+(0+0)%4)))%5=0`，第三副本在`(4+(1+(0+1)%4)))%5=1`，完成后currentPartitionId+1=5，nextReplicaShift=0；
-* 此时currentPartitionId=5满足条件，nextReplicaShift+1=1，P5的第一个副本在`(5+0)%5=0`，第二个副本在`(0+(1+(1+0)%4)))%5=2`，第三副本在`(0+(1+(1+1)%4)))%5=3`，完成后currentPartitionId+1=6，nextReplicaShift=1；
-
-最终分配结果如下：
-
-
-| broker-0 | broker-1  | broker-2 | broker-3  | broker-4  |
-|----------|-------|----------|----------|----------|
-|p0      |p1      |p2      |p3      |p4     | 
-|p5      |p6      |p7      |p8      |p9      |
-|p4      |p0      |p1      |p2      |p3      |
-|p8      |p9      |p5      |p6      |p7      |
-|p3      |p4      |p0      |p1      |p2      |
-|p7      |p8      |p9      |p5      |p6      |
-
-
-
-##### 有机架信息
-
-当所有节点均有机架信息(rack)时，分配方案由assignReplicasToBrokersRackAware()方法实现，该方法保证副本尽量在各机架及各节点间分配均匀，如果分区副本数等于或大于机架数，则将确保每个机架至少获得一个副本，否则，每个机架最多只能获得一个副本。
-实现如下：
-
-```
-  private def assignReplicasToBrokersRackAware(...): Map[Int, Seq[Int]] = {
-    /**
-     * 机架节点map，例
-     * rack1: 0, 1, 2
-     * rack2: 3, 4, 5
-     * rack3: 6, 7, 8
-     */
-    val brokerRackMap = brokerMetadatas.collect { case BrokerMetadata(id, Some(rack)) =>
-      id -> rack
-    }.toMap
-    val numRacks = brokerRackMap.values.toSet.size
-    /**
-     * 机架交替的broker列表,例
-     * 0, 3, 6, 1, 4, 7, 2, 5, 8
-     */
-    val arrangedBrokerList = getRackAlternatedBrokerList(brokerRackMap)
-    val numBrokers = arrangedBrokerList.size
-    //结果集
-    val ret = mutable.Map[Int, Seq[Int]]()
-    val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
-    var currentPartitionId = math.max(0, startPartitionId)
-    var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
-    for (_ <- 0 until nPartitions) {
-      if (currentPartitionId > 0 && (currentPartitionId % arrangedBrokerList.size == 0))
-        nextReplicaShift += 1
-      //循环分配每个分区的第一个副本  
-      val firstReplicaIndex = (currentPartitionId + startIndex) % arrangedBrokerList.size
-      val leader = arrangedBrokerList(firstReplicaIndex)
-      val replicaBuffer = mutable.ArrayBuffer(leader)
-      val racksWithReplicas = mutable.Set(brokerRackMap(leader))
-      val brokersWithReplicas = mutable.Set(leader)
-      var k = 0
-      for (_ <- 0 until replicationFactor - 1) {
-        var done = false
-        while (!done) {
-          val broker = arrangedBrokerList(replicaIndex(firstReplicaIndex, nextReplicaShift * numRacks, k, arrangedBrokerList.size))
-          val rack = brokerRackMap(broker)
-          // Skip this broker if
-          // 1. there is already a broker in the same rack that has assigned a replica AND there is one or more racks
-          //    that do not have any replica, or
-          // 2. the broker has already assigned a replica AND there is one or more brokers that do not have replica assigned
-          if ((!racksWithReplicas.contains(rack) || racksWithReplicas.size == numRacks)
-              && (!brokersWithReplicas.contains(broker) || brokersWithReplicas.size == numBrokers)) {
-            replicaBuffer += broker
-            racksWithReplicas += rack
-            brokersWithReplicas += broker
-            done = true
-          }
-          k += 1
-        }
-      }
-      ret.put(currentPartitionId, replicaBuffer)
-      currentPartitionId += 1
-    }
-    ret
-  }
-```
-
-算法实现与无机架信息的基本一致，只是需要将broker列表进一步处理，方便进行主要分为3步：
-
-* 1、构架机架信息交替变化的broker节点列表，见源码注释；
-* 2、从机架信息交替的broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
-* 3、分配每一个分区的其余副本，偏向于分配到没有任何该分区副本的机架上；
-
-
-#### Zookeeper写入
-
-Topic的数据准备好后，即可将Topic写入Zookeeper，源码如下：
-
-```
-def createTopicWithAssignment(topic: String,
-                              config: Properties,
-                              partitionReplicaAssignment: Map[Int, Seq[Int]],
-                              validate: Boolean = true,
-                              usesTopicId: Boolean = false): Unit = {
-  if (validate)
-    validateTopicCreate(topic, partitionReplicaAssignment, config)
-  info(s"Creating topic $topic with configuration $config and initial partition assignment $partitionReplicaAssignment")
-
-  // write out the config if there is any, this isn't transactional with the partition assignments
-  zkClient.setOrCreateEntityConfigs(ConfigType.Topic, topic, config)
-
-  // create the partition assignment
-  writeTopicPartitionAssignment(topic, partitionReplicaAssignment.map { case (k, v) => k -> ReplicaAssignment(v) }, isUpdate = false, usesTopicId)
-}
-```
-
-主要写入了两部分内容：
-
-* 将topic单独的配置写入到zk中，节点路径为：`/config/topics/${topicName}`，内容为命令行传入的`--config`配置；
-* 将Topic的分区信息写入zk中，节点路径为：`/brokers/topics/${topicName}`，内容为Topic的分区副本分配方案；
-
-
-### TopicChange
-
-Topic数据写入ZK后，会触发KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
-的事件队列中，等待处理，负责处理TopicChange的方法为processTopicChange()方法，源码如下：
-
-```
-private def processTopicChange(): Unit = {
-  if (!isActive) return
-  //获取/brokers/topics节点下的所有主题
-  val topics = zkClient.getAllTopicsInCluster(true)
-  //新增加的topic
-  val newTopics = topics -- controllerContext.allTopics
-  //被删除的topic
-  val deletedTopics = controllerContext.allTopics.diff(topics)
-  //更新缓存
-  controllerContext.setAllTopics(topics)
-  //为新建主题注册分区变动的Handler 节点  /brokers/topics/${topicName}
-  registerPartitionModificationsHandlers(newTopics.toSeq)
-  //获取主题分区分配方案
-  val addedPartitionReplicaAssignment = zkClient.getReplicaAssignmentAndTopicIdForTopics(newTopics)
-  deletedTopics.foreach(controllerContext.removeTopic)
-  processTopicIds(addedPartitionReplicaAssignment)
-
-  addedPartitionReplicaAssignment.foreach { case TopicIdReplicaAssignment(_, _, newAssignments) =>
-    newAssignments.foreach { case (topicAndPartition, newReplicaAssignment) =>
-      controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
-    }
-  }
-  info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
-    s"[$addedPartitionReplicaAssignment]")
-  if (addedPartitionReplicaAssignment.nonEmpty) {
-    val partitionAssignments = addedPartitionReplicaAssignment
-      .map { case TopicIdReplicaAssignment(_, _, partitionsReplicas) => partitionsReplicas.keySet }
-      .reduce((s1, s2) => s1.union(s2))
-    //创建分区副本
-    onNewPartitionCreation(partitionAssignments)
-  }
-}
-```
-
-processTopicChange()方法会读取ZK对应节点下的数据，并为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，Partition和Replica的实例对象的创建则由方法onNewPartitionCreation()实现。
-
-```
-//It does the following -
-// 1. Move the newly created partitions to the NewPartition state
-// 2. Move the newly created partitions from NewPartition->OnlinePartition state
-private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
-  info(s"New partition creation callback for ${newPartitions.mkString(",")}")
-  partitionStateMachine.handleStateChanges(newPartitions.toSeq, NewPartition)
-  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, NewReplica)
-  partitionStateMachine.handleStateChanges(newPartitions.toSeq, OnlinePartition, Some(OfflinePartitionLeaderElectionStrategy(false)) )
-  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, OnlineReplica)
-}
-```
-
-
-
+handleCreateTopicsRequest()方法的作用是完成数据准备，最终调用ZkAdminManager#createTopics()方法完成主题创建。
 
 
 ## 自动创建
@@ -538,7 +234,319 @@ CreateTopicRequest的处理流程见命令行创建主题流程，createTopicsIn
   }
 ```
 
-可知，**自动创建同命令行创建方式实现一致，最终也是调用ZkAdminManager#createTopics()方法完成Topic创建**，源码分析将上方，这里不再复述。
+可知，**自动创建同命令行创建方式实现一致，最终也是调用ZkAdminManager#createTopics()方法完成Topic创建**。
+
+
+## ZkAdminManager#createTopics
+
+createTopics()方法源码如下：
+
+```
+def createTopics(...): Unit = {
+  // 1. map over topics creating assignment and calling zookeeper
+  val brokers = metadataCache.getAliveBrokers()
+  val metadata = toCreate.values.map(topic =>
+    try {
+      //副本数与副本因子
+      val resolvedNumPartitions = if (topic.numPartitions == NO_NUM_PARTITIONS)
+        defaultNumPartitions else topic.numPartitions
+      val resolvedReplicationFactor = if (topic.replicationFactor == NO_REPLICATION_FACTOR)
+        defaultReplicationFactor else topic.replicationFactor
+
+      val assignments = if (topic.assignments.isEmpty) {
+        //未指定，计算副本分配方案
+        AdminUtils.assignReplicasToBrokers(brokers, resolvedNumPartitions, resolvedReplicationFactor)
+      } else {
+        //使用用户指定的分配方案
+        val assignments = new mutable.HashMap[Int, Seq[Int]]
+        topic.assignments.forEach { assignment =>
+          assignments(assignment.partitionIndex) = assignment.brokerIds.asScala.map(a => a: Int)
+        }
+        assignments
+      }
+
+      val configs = new Properties()
+      topic.configs.forEach(entry => configs.setProperty(entry.name, entry.value))
+      //创建参数校验
+      adminZkClient.validateTopicCreate(topic.name, assignments, configs)
+      validateTopicCreatePolicy(topic, resolvedNumPartitions, resolvedReplicationFactor, assignments)
+      maybePopulateMetadataAndConfigs(includeConfigsAndMetadata, topic.name, configs, assignments)
+      //将Topic数据写入zookeeper
+      adminZkClient.createTopicWithAssignment(topic.name, configs, assignments, validate = false, config.usesTopicId)
+      //填充topicId uuid
+      populateIds(includeConfigsAndMetadata, topic.name)
+      //元数据创建
+      CreatePartitionsMetadata(topic.name, assignments.keySet)
+
+    } catch {
+      ...// error
+    }).toBuffer
+    // 2. if timeout <= 0, validateOnly or no topics can proceed return immediately
+    // 3. else pass the assignments and errors to the delayed operation and set the keys
+    ...
+}
+```
+
+createTopics()方法的作用主要为以下三点：
+
+* 确定主题副本数与副本因子，若用户未指定参数，则使用默认值，分别是`num.partitions`和`default.replication.factor`的值；
+* 确定Topic的分区副本分配方案，若用户未指定，则通过计算得出，方法为AdminUtils#assignReplicasToBrokers()；
+* 将Topic数据写入Zookeeper。
+
+### ReplicaAssignment
+
+若用户未指定主题的分区副本分配方案，则由AdminUtils#assignReplicasToBrokers()完成分配方案的计算，分配算法的目标有三个：
+
+* 主题所有的分区副本均匀的分布在各broker节点上；
+* 每个分区的所有副本(leader和follower)尽量分配到不同的broker节点；
+* 如果所有broker都有机架信息，尽可能将每个分区的副本分配到不同的机架(consumer消费时的preferredReadReplica);
+
+源码如下：
+
+```
+def assignReplicasToBrokers(...): Map[Int, Seq[Int]] = {
+  ...//param check
+  if (brokerMetadatas.forall(_.rack.isEmpty))
+    //所有broker节点均无机架信息
+    assignReplicasToBrokersRackUnaware(nPartitions, replicationFactor, brokerMetadatas.map(_.id), fixedStartIndex,startPartitionId)
+  else {
+    if (brokerMetadatas.exists(_.rack.isEmpty))
+      throw new AdminOperationException("Not all brokers have rack information for replica rack aware assignment.")
+    //所有broker节点均有机架信息  
+    assignReplicasToBrokersRackAware(nPartitions, replicationFactor, brokerMetadatas, fixedStartIndex,startPartitionId)
+  }
+}
+```
+
+分区副本分配方案的计算分为两类：无机架信息(rack.isEmpty)和有机架信息。
+
+#### 无机架信息
+
+当所有broker节点均无机架信息时，分配方案由assignReplicasToBrokersRackUnaware()实现，源码如下：
+
+```
+private def assignReplicasToBrokersRackUnaware(...): Map[Int, Seq[Int]] = {
+  //分配方案
+  val ret = mutable.Map[Int, Seq[Int]]()
+  //所有的broker节点
+  val brokerArray = brokerList.toArray
+  //fixedStartIndex = -1，startIndex为随机取一个broker
+  val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
+  //startPartitionId=-1 ,currentPartitionId=0
+  var currentPartitionId = math.max(0, startPartitionId)
+  //随机取一个分配步长
+  var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
+  //nPartitions分区数
+  for (_ <- 0 until nPartitions) {
+    if (currentPartitionId > 0 && (currentPartitionId % brokerArray.length == 0)) {
+      //防止 nPartitions 过大时,其中某些partition的分配完全一样，currentPartitionId为brokerArray.length整数倍时+1
+      nextReplicaShift += 1
+    }
+    //第一个分区副本的节点
+    val firstReplicaIndex = (currentPartitionId + startIndex) % brokerArray.length
+    val replicaBuffer = mutable.ArrayBuffer(brokerArray(firstReplicaIndex))
+    //该分区剩余副本分配
+    for (j <- 0 until replicationFactor - 1)
+      replicaBuffer += brokerArray(replicaIndex(firstReplicaIndex, nextReplicaShift, j, brokerArray.length))
+    ret.put(currentPartitionId, replicaBuffer)
+    currentPartitionId += 1
+  }
+  ret
+}
+
+//分区副本节点计算
+private def replicaIndex(firstReplicaIndex: Int, secondReplicaShift: Int, replicaIndex: Int, nBrokers: Int): Int = {
+  val shift = 1 + (secondReplicaShift + replicaIndex) % (nBrokers - 1)
+  (firstReplicaIndex + shift) % nBrokers
+}
+```
+
+分配算法主要分为两步：
+
+* 从所有在线broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
+* 以该Partition的第一个Replica所在broker为起点，按照步长依次分配该Partition的剩余Replica。
+
+例：假设一个Kafka集群有5个在线broker节点，其中一个Topic的Partition数为10，每个Partition有3个Replica，且最初随机选择的startIndex和nextReplicaShift节点均为0，计算过程如下：
+
+* P0的第一个副本在`(0+0)%5=0`，第二个副本在`(0+(1+(0+0)%4)))%5=1`，第三副本在`(0+(1+(0+1)%4)))%5=2`，完成后currentPartitionId+1=1，nextReplicaShift=0；
+* P1的第一个副本在`(1+0)%5=1`，第二个副本在`(1+(1+(0+0)%4)))%5=2`，第三副本在`(1+(1+(0+1)%4)))%5=3`，完成后currentPartitionId+1=2，nextReplicaShift=0；
+* ...
+* P4的第一个副本在`(4+0)%5=4`，第二个副本在`(4+(1+(0+0)%4)))%5=0`，第三副本在`(4+(1+(0+1)%4)))%5=1`，完成后currentPartitionId+1=5，nextReplicaShift=0；
+* 此时currentPartitionId=5满足条件，nextReplicaShift+1=1，P5的第一个副本在`(5+0)%5=0`，第二个副本在`(0+(1+(1+0)%4)))%5=2`，第三副本在`(0+(1+(1+1)%4)))%5=3`，完成后currentPartitionId+1=6，nextReplicaShift=1；
+
+最终分配结果如下：
+
+
+| broker-0 | broker-1  | broker-2 | broker-3  | broker-4  |
+|----------|-------|----------|----------|----------|
+|p0      |p1      |p2      |p3      |p4     | 
+|p5      |p6      |p7      |p8      |p9      |
+|p4      |p0      |p1      |p2      |p3      |
+|p8      |p9      |p5      |p6      |p7      |
+|p3      |p4      |p0      |p1      |p2      |
+|p7      |p8      |p9      |p5      |p6      |
+
+
+
+#### 有机架信息
+
+当所有节点均有机架信息(rack)时，分配方案由assignReplicasToBrokersRackAware()方法实现，该方法保证副本尽量在各机架及各节点间分配均匀，如果分区副本数等于或大于机架数，则将确保每个机架至少获得一个副本，否则，每个机架最多只能获得一个副本。
+实现如下：
+
+```
+  private def assignReplicasToBrokersRackAware(...): Map[Int, Seq[Int]] = {
+    /**
+     * 机架节点map，例
+     * rack1: 0, 1, 2
+     * rack2: 3, 4, 5
+     * rack3: 6, 7, 8
+     */
+    val brokerRackMap = brokerMetadatas.collect { case BrokerMetadata(id, Some(rack)) =>
+      id -> rack
+    }.toMap
+    val numRacks = brokerRackMap.values.toSet.size
+    /**
+     * 机架交替的broker列表,例
+     * 0, 3, 6, 1, 4, 7, 2, 5, 8
+     */
+    val arrangedBrokerList = getRackAlternatedBrokerList(brokerRackMap)
+    val numBrokers = arrangedBrokerList.size
+    //结果集
+    val ret = mutable.Map[Int, Seq[Int]]()
+    val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
+    var currentPartitionId = math.max(0, startPartitionId)
+    var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
+    for (_ <- 0 until nPartitions) {
+      if (currentPartitionId > 0 && (currentPartitionId % arrangedBrokerList.size == 0))
+        nextReplicaShift += 1
+      //循环分配每个分区的第一个副本  
+      val firstReplicaIndex = (currentPartitionId + startIndex) % arrangedBrokerList.size
+      val leader = arrangedBrokerList(firstReplicaIndex)
+      val replicaBuffer = mutable.ArrayBuffer(leader)
+      val racksWithReplicas = mutable.Set(brokerRackMap(leader))
+      val brokersWithReplicas = mutable.Set(leader)
+      var k = 0
+      for (_ <- 0 until replicationFactor - 1) {
+        var done = false
+        while (!done) {
+          val broker = arrangedBrokerList(replicaIndex(firstReplicaIndex, nextReplicaShift * numRacks, k, arrangedBrokerList.size))
+          val rack = brokerRackMap(broker)
+          // Skip this broker if
+          // 1. there is already a broker in the same rack that has assigned a replica AND there is one or more racks
+          //    that do not have any replica, or
+          // 2. the broker has already assigned a replica AND there is one or more brokers that do not have replica assigned
+          if ((!racksWithReplicas.contains(rack) || racksWithReplicas.size == numRacks)
+              && (!brokersWithReplicas.contains(broker) || brokersWithReplicas.size == numBrokers)) {
+            replicaBuffer += broker
+            racksWithReplicas += rack
+            brokersWithReplicas += broker
+            done = true
+          }
+          k += 1
+        }
+      }
+      ret.put(currentPartitionId, replicaBuffer)
+      currentPartitionId += 1
+    }
+    ret
+  }
+```
+
+算法实现与无机架信息的基本一致，只是需要将broker列表进一步处理，方便进行主要分为3步：
+
+* 1、构架机架信息交替变化的broker节点列表，见源码注释；
+* 2、从机架信息交替的broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
+* 3、分配每一个分区的其余副本，偏向于分配到没有任何该分区副本的机架上；
+
+
+### Zookeeper写入
+
+Topic的数据准备好后，即可将Topic写入Zookeeper，源码如下：
+
+```
+def createTopicWithAssignment(topic: String,
+                              config: Properties,
+                              partitionReplicaAssignment: Map[Int, Seq[Int]],
+                              validate: Boolean = true,
+                              usesTopicId: Boolean = false): Unit = {
+  if (validate)
+    validateTopicCreate(topic, partitionReplicaAssignment, config)
+  info(s"Creating topic $topic with configuration $config and initial partition assignment $partitionReplicaAssignment")
+
+  // write out the config if there is any, this isn't transactional with the partition assignments
+  zkClient.setOrCreateEntityConfigs(ConfigType.Topic, topic, config)
+
+  // create the partition assignment
+  writeTopicPartitionAssignment(topic, partitionReplicaAssignment.map { case (k, v) => k -> ReplicaAssignment(v) }, isUpdate = false, usesTopicId)
+}
+```
+
+主要写入了两部分内容：
+
+* 将topic单独的配置写入到zk中，节点路径为：`/config/topics/${topicName}`，内容为命令行传入的`--config`配置；
+* 将Topic的分区信息写入zk中，节点路径为：`/brokers/topics/${topicName}`，内容为Topic的分区副本分配方案；
+
+
+## TopicChange
+
+Topic数据写入ZK后，会触发KafkaController为`/brokers/topics`节点注册的**TopicChangeHandler**，完成Topic创建的剩余工作，TopicChangeHandler会将**TopicChange**事件对象放入ControllerEventManager
+的事件队列中，等待处理，负责处理TopicChange的方法为processTopicChange()方法，源码如下：
+
+```
+private def processTopicChange(): Unit = {
+  if (!isActive) return
+  //获取/brokers/topics节点下的所有主题
+  val topics = zkClient.getAllTopicsInCluster(true)
+  //新增加的topic
+  val newTopics = topics -- controllerContext.allTopics
+  //被删除的topic
+  val deletedTopics = controllerContext.allTopics.diff(topics)
+  //更新缓存
+  controllerContext.setAllTopics(topics)
+  //为新建主题注册分区变动的Handler 节点  /brokers/topics/${topicName}
+  registerPartitionModificationsHandlers(newTopics.toSeq)
+  //获取主题分区分配方案
+  val addedPartitionReplicaAssignment = zkClient.getReplicaAssignmentAndTopicIdForTopics(newTopics)
+  deletedTopics.foreach(controllerContext.removeTopic)
+  processTopicIds(addedPartitionReplicaAssignment)
+
+  addedPartitionReplicaAssignment.foreach { case TopicIdReplicaAssignment(_, _, newAssignments) =>
+    newAssignments.foreach { case (topicAndPartition, newReplicaAssignment) =>
+      //更新缓存
+      controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
+    }
+  }
+  info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
+    s"[$addedPartitionReplicaAssignment]")
+  if (addedPartitionReplicaAssignment.nonEmpty) {
+    val partitionAssignments = addedPartitionReplicaAssignment
+      .map { case TopicIdReplicaAssignment(_, _, partitionsReplicas) => partitionsReplicas.keySet }
+      .reduce((s1, s2) => s1.union(s2))
+    //创建分区副本
+    onNewPartitionCreation(partitionAssignments)
+  }
+}
+```
+
+processTopicChange()方法会读取ZK对应节点下的数据，并更新本地缓存，同时为新建Topic注册`PartitionModificationsHandler`,监听Topic的分区变化，最后调用onNewPartitionCreation()方法开始进行状态转换。
+
+```
+//It does the following -
+// 1. Move the newly created partitions to the NewPartition state
+// 2. Move the newly created partitions from NewPartition->OnlinePartition state
+private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
+  info(s"New partition creation callback for ${newPartitions.mkString(",")}")
+  partitionStateMachine.handleStateChanges(newPartitions.toSeq, NewPartition)
+  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, NewReplica)
+  partitionStateMachine.handleStateChanges(newPartitions.toSeq, OnlinePartition, Some(OfflinePartitionLeaderElectionStrategy(false)) )
+  replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, OnlineReplica)
+}
+```
+
+### PartitionState
+
+
+### ReplicaState
 
 
 # ModifyTopic
