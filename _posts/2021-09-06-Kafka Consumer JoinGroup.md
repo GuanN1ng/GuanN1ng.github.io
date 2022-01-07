@@ -22,7 +22,7 @@ Groups are assigned to coordinators based on their group names.
 Kafka Broker端有一个内部主题**`_consumer_offsets`**，负责存储每个ConsumerGroup的消费位移，该主题默认情况下有50个partition，每个partition3个副本：
 
 ```
-bin/kafka-topics.sh  --zookeeper localhost:2181  --topic  __consumer_offsets  --describe
+bin/kafka-topics.sh  --bootstrap-server localhost:9092  --topic  __consumer_offsets  --describe
 Topic:__consumer_offsets	PartitionCount:50	ReplicationFactor:3	Configs:segment.bytes=104857600,cleanup.policy=compact,compression.type=producer
 	Topic: __consumer_offsets	Partition: 0	Leader: 5	Replicas: 4,6,5	Isr: 5
 	Topic: __consumer_offsets	Partition: 1	Leader: 5	Replicas: 5,4,6	Isr: 5
