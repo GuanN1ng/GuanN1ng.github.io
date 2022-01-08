@@ -18,8 +18,13 @@ Topic的创建共有两种方式：自动创建和通过脚本工具kafka-topics
 Kafka安装目下的bin目录中提供了很多脚本工具，其中kafka-topics.sh脚本可用来完成主题相关的操作，如创建主题：
 
 ```
-> bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 3 --partitions 1 --topic my-topic-name
-    --config max.message.bytes=64000
+# 指定topic分区数及副本因子
+bin/kafka-topics.sh --create --bootstrap-server localhost:9092  --topic my-topic-name  --replication-factor 3 --partitions 3 
+  --config max.message.bytes=64000
+
+# 指定副本分配方案
+bin/kafka-topics.sh --create --bootstrap-server localhost:9092  --topic my-topic-name  --replica-assignment 0:1:2,0:1:2,0:1:2
+  --config max.message.bytes=64000
 ```
 
 
@@ -715,6 +720,35 @@ Controller处理完TopicChange事件后，会向新建Replica所在Broker发送L
 这里不再对此部分进行源码分析(后续会进行分析)，至此消息Topic创建完成。
 
 # ModifyTopic
+
+Topic创建完成后，Kafka还提供了脚本工具对Topic进行修改，共分两种：
+
+* kafka-configs.sh，用于修改Topic相关的配置项(config)。
+  * 添加配置
+```
+bin/kafka-configs.sh --bootstrap-server broker_host:port --entity-type topics --entity-name my_topic_name --alter --add-config x=y
+```
+  * 删除配置
+```
+bin/kafka-configs.sh --bootstrap-server broker_host:port --entity-type topics --entity-name my_topic_name --alter --delete-config x
+```
+
+* kafka-topics.sh，用于对Topic进行扩容，即增加Topic的Partition数量(**不支持减少分区**)。
+  * 指定扩容后的Partition数量
+```
+bin/kafka-topics.sh --bootstrap-server broker_host:port --alter --topic my_topic_name 
+    --partitions 4
+```
+  * 指定扩容后的数量和具体的副本分配方案
+```
+bin/kafka-topics.sh --bootstrap-server broker_host:port --alter  --topic my-topic-name  
+   --replica-assignment 0:1:2,0:1:2,0:1:2,2:1:0  --partitions 4
+```
+
+本篇内容主要分析Topic如何进行分区扩容。
+
+## 分区扩容
+
 
 
 # RemoveTopic
