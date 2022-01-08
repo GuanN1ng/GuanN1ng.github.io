@@ -733,7 +733,7 @@ bin/kafka-configs.sh --bootstrap-server broker_host:port --entity-type topics --
 bin/kafka-configs.sh --bootstrap-server broker_host:port --entity-type topics --entity-name my_topic_name --alter --delete-config x
 ```
 
-* kafka-topics.sh，用于对Topic进行扩容，即增加Topic的Partition数量(**不支持减少分区**)。
+* kafka-topics.sh，用于对Topic进行扩容，即增加Topic的Partition数量。
   * 指定扩容后的Partition数量
 ```
 bin/kafka-topics.sh --bootstrap-server broker_host:port --alter --topic my_topic_name 
@@ -749,6 +749,191 @@ bin/kafka-topics.sh --bootstrap-server broker_host:port --alter  --topic my-topi
 
 ## 分区扩容
 
+**Kafka只支持增加Topic的分区数，不支持减少分区数，即只存在分区扩容，不存在缩容。**
+
+### CreatePartitionsRequest
+
+使用kafka-topics.sh脚本进行分区扩容，同样也是执行TopicCommand#main()方法，`--alter`会使程序调用TopicCommand.TopicService#alterTopic()方法，源码如下：
+
+```
+def alterTopic(opts: TopicCommandOptions): Unit = {
+  val topic = new CommandTopicPartition(opts)
+  val topics = getTopics(opts.topic, opts.excludeInternalTopics)
+  ensureTopicExists(topics, opts.topic, !opts.ifExists)
+
+  if (topics.nonEmpty) {
+    val topicsInfo = adminClient.describeTopics(topics.asJavaCollection).topicNameValues()
+    val newPartitions = topics.map { topicName =>
+      if (topic.hasReplicaAssignment) {
+        val startPartitionId = topicsInfo.get(topicName).get().partitions().size()
+        val newAssignment = {
+          val replicaMap = topic.replicaAssignment.get.drop(startPartitionId)
+          new util.ArrayList(replicaMap.map(p => p._2.asJava).asJavaCollection).asInstanceOf[util.List[util.List[Integer]]]
+        }
+        topicName -> NewPartitions.increaseTo(topic.partitions.get, newAssignment)
+      } else {
+        topicName -> NewPartitions.increaseTo(topic.partitions.get)
+      }
+    }.toMap
+    //执行Topic扩容
+    adminClient.createPartitions(newPartitions.asJava, new CreatePartitionsOptions().retryOnQuotaViolation(false)).all().get()
+  }
+}
+```
+
+分区扩容调用的是KafkaAdminClient#createPartitions()方法实现，源码如下：
+
+```
+public CreatePartitionsResult createPartitions(final Map<String, NewPartitions> newPartitions,
+                                               final CreatePartitionsOptions options) {
+    final Map<String, KafkaFutureImpl<Void>> futures = new HashMap<>(newPartitions.size());
+    final CreatePartitionsTopicCollection topics = new CreatePartitionsTopicCollection(newPartitions.size());
+    for (Map.Entry<String, NewPartitions> entry : newPartitions.entrySet()) {
+        ...//数据封装
+    }
+    if (!topics.isEmpty()) {
+        final long now = time.milliseconds();
+        final long deadline = calcDeadlineMs(now, options.timeoutMs());
+        //创建CreatePartitionsRequest
+        final Call call = getCreatePartitionsCall(options, futures, topics, Collections.emptyMap(), now, deadline);
+        //发送请求
+        runnable.call(call, now);
+    }
+    return new CreatePartitionsResult(new HashMap<>(futures));
+}
+```
+
+同Topic创建一样，通过脚本提交的扩容请求，最终被封装为CreatePartitionsRequest发送给Controller进行处理。
+
+### HandleCreatePartitionsRequest
+
+controller节点处理CreatePartitionsRequest的入口方法为KafkaApis#handleCreatePartitionsRequest()，handleCreatePartitionsRequest()方法中
+扩容的核心步骤是调用ZkAdminManager#createPartitions()方法实现，其源码如下：
+
+```
+def createPartitions(...): Unit = {
+  val allBrokers = adminZkClient.getBrokerMetadatas()
+  val allBrokerIds = allBrokers.map(_.id)
+
+  // 1. map over topics creating assignment and calling AdminUtils
+  val metadata = newPartitions.map { newPartition =>
+    val topic = newPartition.name
+    try {
+      val existingAssignment = zkClient.getFullReplicaAssignmentForTopics(immutable.Set(topic)).map {
+        case (topicPartition, assignment) =>
+          if (assignment.isBeingReassigned) {
+            //正在重新分配
+            throw new ReassignmentInProgressException(s"A partition reassignment is in progress for the topic '$topic'.")
+          }
+          topicPartition.partition -> assignment
+      }
+      if (existingAssignment.isEmpty)
+        throw new UnknownTopicOrPartitionException(s"The topic '$topic' does not exist.")
+
+      val oldNumPartitions = existingAssignment.size
+      val newNumPartitions = newPartition.count
+      val numPartitionsIncrement = newNumPartitions - oldNumPartitions
+      if (numPartitionsIncrement < 0) {
+        //不允许缩容
+        throw new InvalidPartitionsException(s"Topic currently has $oldNumPartitions partitions, which is higher than the requested $newNumPartitions.")
+      } else if (numPartitionsIncrement == 0) {
+        //分区数一致，无效操作
+        throw new InvalidPartitionsException(s"Topic already has $oldNumPartitions partitions.")
+      }
+      
+      val newPartitionsAssignment = Option(newPartition.assignments).map {...}
+      //验证新增分区的分配方案或自动计算，算法同主题创建一致
+      val assignmentForNewPartitions = adminZkClient.createNewPartitionsAssignment( topic, existingAssignment, allBrokers, newPartition.count, newPartitionsAssignment)
+      ...
+      //写入ZK
+      val updatedReplicaAssignment = adminZkClient.createPartitionsWithAssignment(topic, existingAssignment, assignmentForNewPartitions)
+      CreatePartitionsMetadata(topic, updatedReplicaAssignment.keySet)
+      
+    } catch {
+      ...// error
+    }
+  }
+  // 2. if timeout <= 0, validateOnly or no topics can proceed return immediately
+  // 3. else pass the assignments and errors to the delayed operation and set the keys
+  ...
+}
+
+```
+
+关于分区创建逻辑主要分为3步：
+
+* 1、参数验证，如扩容的分区数必须大于要修改Topic的原始分区数，Topic存在，指定的分区方案brokerId是否正确等。
+* 2、验证用户指定的分配方案或自动计算，自动计算的算法实现与创建Topic使用的一致；
+* 3、将扩容后的分区方案写入ZK；
+
+#### ZK写入
+
+实现将扩容后的分区分配方案写入ZK的方法为AdminZkClient#createPartitionsWithAssignment()，源码如下：
+
+```
+def createPartitionsWithAssignment(...): Map[Int, ReplicaAssignment] = {
+  //合并新增分区的分配方案和之前的分区分配方案
+  val combinedAssignment = existingAssignment ++ newPartitionAssignment
+  //写入ZK
+  writeTopicPartitionAssignment(topic, combinedAssignment, isUpdate = true)
+  combinedAssignment
+}
+```
+
+方法比较简单，将新增分区的分配方案和之前的分区分配方案合并，并将新的分配方案更新到ZK节点`/brokers/topics/${topicName}`中。
+
+### PartitionModifications
+
+新的分区分配方案写入ZK后，会触发创建主题时为ZK节点`/brokers/topics/${topicName}`注册的PartitionModificationsHandler#handleDataChange()方法，该方法会将
+事件**PartitionModifications**放入Controller的事件队列中，等待Controller处理。
+
+```
+class PartitionModificationsHandler(eventManager: ControllerEventManager, topic: String) extends ZNodeChangeHandler {
+  override val path: String = TopicZNode.path(topic)
+  //监听节点变化，放入PartitionModifications事件
+  override def handleDataChange(): Unit = eventManager.put(PartitionModifications(topic))
+}
+```
+
+负责处理PartitionModifications事件的方法为KafkaController#processPartitionModifications()，源码如下：
+
+```
+private def processPartitionModifications(topic: String): Unit = {
+  if (!isActive) return
+  val partitionReplicaAssignment = zkClient.getFullReplicaAssignmentForTopics(immutable.Set(topic))
+  val partitionsToBeAdded = partitionReplicaAssignment.filter { case (topicPartition, _) =>
+    controllerContext.partitionReplicaAssignment(topicPartition).isEmpty
+  }
+
+  if (topicDeletionManager.isTopicQueuedUpForDeletion(topic)) {
+    //Topic待删除
+    if (partitionsToBeAdded.nonEmpty) {
+      //回滚zk节点 /brokers/topics/${topicName} 中存储的分区分配方案
+      restorePartitionReplicaAssignment(topic, partitionReplicaAssignment)
+    } else {
+      // This can happen if existing partition replica assignment are restored to prevent increasing partition count during topic deletion
+      info("Ignoring partition change during topic deletion as no new partitions are added")
+    }
+  } else if (partitionsToBeAdded.nonEmpty) {
+    
+    partitionsToBeAdded.forKeyValue { (topicPartition, assignedReplicas) =>
+      //缓存更新
+      controllerContext.updatePartitionFullReplicaAssignment(topicPartition, assignedReplicas)
+    }
+    //分区创建
+    onNewPartitionCreation(partitionsToBeAdded.keySet)
+  }
+}
+```
+
+为Topic扩容前，需先判断**Topic是否为待删除状态**，若是，则回滚zk节点`/brokers/topics/${topicName}`中存储的分区分配方案，若否则调用onNewPartitionCreation()方法完成
+新增分区创建，并更新controllerContext。
+
+onNewPartitionCreation()方法的实现在创建Topic已分析过，这里不再复述。支持Topic的扩容已结束。
 
 
 # RemoveTopic
+
+```
+bin/kafka-topics.sh --bootstrap-server broker_host:port --delete --topic my_topic_name
+```
