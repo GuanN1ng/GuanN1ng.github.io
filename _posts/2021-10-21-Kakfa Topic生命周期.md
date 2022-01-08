@@ -542,11 +542,177 @@ private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
 }
 ```
 
-### Partition
+onNewPartitionCreation()方法总共分为4步：
+
+* 1、将待创建的分区状态置为NewPartition；
+* 2、将待创建的副本状态置为NewReplica;
+* 3、将分区状态从NewPartition转换为OnlinePartition；
+* 4、将副本状态从NewReplica转换为OnlineReplica状态。
+
+下面分别分析状态转换时的具体操作。
+
+### NewPartition
+
+新建分区状态由**NonExistentPartition**转换为**NewPartition**的源码如下：
+
+```
+case NewPartition =>
+  validPartitions.foreach { partition =>
+    stateChangeLog.info(s"Changed partition $partition state from ${partitionState(partition)} to $targetState with  assigned replicas ${controllerContext.partitionReplicaAssignment(partition).mkString(",")}")
+    controllerContext.putPartitionState(partition, NewPartition)
+  }
+  Map.empty
+```
+
+源码很简单，遍历所有状态为NonExistentPartition的分区，更新Partition对应的controller缓存的状态为NewPartition。
+
+### NewReplica
+
+新建Replica状态由**NonExistentReplica**转换为**NewReplica**的源码如下：
+
+```
+case NewReplica =>
+    validReplicas.foreach { replica =>
+      val partition = replica.topicPartition
+      val currentState = controllerContext.replicaState(replica)
+
+      controllerContext.partitionLeadershipInfo(partition) match {
+        case Some(leaderIsrAndControllerEpoch) =>
+          ...//省略 初次创建，leaderIsrAndControllerEpoch为空
+        case None =>
+          if (traceEnabled)
+            logSuccessfulTransition(stateLogger, replicaId, partition, currentState, NewReplica)
+          //更新缓存状态  
+          controllerContext.putReplicaState(replica, NewReplica)
+      }
+    }
+
+```
+
+### OnlinePartition
+
+执行分区状态由**NewPartition**转换为**OnlinePartition**的源码如下：
+
+```
+case OnlinePartition =>
+  //过滤状态为NewPartition的分区
+  val uninitializedPartitions = validPartitions.filter(partition => partitionState(partition) == NewPartition)
+  val partitionsToElectLeader = validPartitions.filter(partition => partitionState(partition) == OfflinePartition || partitionState(partition) == OnlinePartition)
+  if (uninitializedPartitions.nonEmpty) {
+    //为新建的 partition 初始化 leader 和 isr
+    val successfulInitializations = initializeLeaderAndIsrForPartitions(uninitializedPartitions)
+    successfulInitializations.foreach {
+      //更新缓存状态 
+      partition => controllerContext.putPartitionState(partition, OnlinePartition)
+    }
+  }
+  if (partitionsToElectLeader.nonEmpty) {
+    ...// other code
+  }
+```
+
+这一步的主要作用是初始化Partition的leader及ISR集合，核心方法为initializeLeaderAndIsrForPartitions()，源码如下：
+
+```
+private def initializeLeaderAndIsrForPartitions(partitions: Seq[TopicPartition]): Seq[TopicPartition] = {
+  val successfulInitializations = mutable.Buffer.empty[TopicPartition]
+  //partition - replica map
+  val replicasPerPartition = partitions.map(partition => partition -> controllerContext.partitionReplicaAssignment(partition))
+  val liveReplicasPerPartition = replicasPerPartition.map { case (partition, replicas) =>
+      //brokerOnline && !replicasOnOfflineDirs.getOrElse(brokerId, Set.empty).contains(topicPartition)
+      val liveReplicasForPartition = replicas.filter(replica => controllerContext.isReplicaOnline(replica, partition))
+      partition -> liveReplicasForPartition
+  }
+
+  val (partitionsWithoutLiveReplicas, partitionsWithLiveReplicas) = liveReplicasPerPartition.partition { case (_, liveReplicas) => liveReplicas.isEmpty }
+  //分区没有有效Replica
+  partitionsWithoutLiveReplicas.foreach { case (partition, _) =>
+    val failMsg = s"..."
+    logFailedStateChange(partition, NewPartition, OnlinePartition, new StateChangeFailedException(failMsg))
+  }
+  //分区初始化
+  val leaderIsrAndControllerEpochs = partitionsWithLiveReplicas.map { case (partition, liveReplicas) =>
+    //leader副本为副本列表的第一个，ISR集合为所有有效副本
+    val leaderAndIsr = LeaderAndIsr(liveReplicas.head, liveReplicas.toList)
+    val leaderIsrAndControllerEpoch = LeaderIsrAndControllerEpoch(leaderAndIsr, controllerContext.epoch)
+    partition -> leaderIsrAndControllerEpoch
+  }.toMap
+  val createResponses = try {
+    //分区节点写入ZK
+    zkClient.createTopicPartitionStatesRaw(leaderIsrAndControllerEpochs, controllerContext.epochZkVersion)
+  } catch {
+    ...// error
+  }
+  createResponses.foreach { createResponse =>
+    val code = createResponse.resultCode
+    val partition = createResponse.ctx.get.asInstanceOf[TopicPartition]
+    val leaderIsrAndControllerEpoch = leaderIsrAndControllerEpochs(partition)
+    if (code == Code.OK) {
+      //写入ZK成功，更新本地缓存
+      controllerContext.putPartitionLeadershipInfo(partition, leaderIsrAndControllerEpoch)
+      //1、向所有replica节点发送LeaderAndIsrRequest
+      //2、向所有在线broker发送UpdateMetadataRequest
+      controllerBrokerRequestBatch.addLeaderAndIsrRequestForBrokers(leaderIsrAndControllerEpoch.leaderAndIsr.isr,
+        partition, leaderIsrAndControllerEpoch, controllerContext.partitionFullReplicaAssignment(partition), isNew = true)
+      successfulInitializations += partition
+    } else {
+      logFailedStateChange(partition, NewPartition, OnlinePartition, code)
+    }
+  }
+  successfulInitializations
+}
+```
+
+新建主题分区的状态由**NewPartition**转换为**OnlinePartition**时需要完成4部分工作：
+
+* 1、完成leader副本及ISR副本初始化，**liveReplicas列表中的第一个副本将作为该分区的leader副本，所有的liveReplicas作为ISR集合**；
+```
+val leaderAndIsr = LeaderAndIsr(liveReplicas.head, liveReplicas.toList)
+```
+* 2、调用KafkaZkClient#createTopicPartitionStatesRaw()方法将leaderAndIsr信息写入ZK，包含3部分数据：
+  * 向ZK写入**`/brokers/topics/${topicName}/partitions/`**PERSISTENT节点；
+  * 向ZK写入**`/brokers/topics/${topicName}/partitions/${分区id}`**PERSISTENT节点；
+  * 向ZK写入**`/brokers/topics/${topicName}/partitions/${分区id}/state`**PERSISTENT节点；
+* 3、向Replica所属Broker节点发送LeaderAndIsrRequest；
+* 4、向所有在线Broker节点发送UpdateMetadataRequest；
+* 5、更新分区状态为OnlinePartition；
 
 
-### Replica
+### OnlineReplica
 
+最后一步，更新缓存中Replica的状态，将新建Replica状态由**NewReplica**转换为**OnlineReplica**。源码如下：
+
+```
+case OnlineReplica =>
+  validReplicas.foreach { replica =>
+    val partition = replica.topicPartition
+    val currentState = controllerContext.replicaState(replica)
+
+    currentState match {
+      case NewReplica =>
+        val assignment = controllerContext.partitionFullReplicaAssignment(partition)
+        if (!assignment.replicas.contains(replicaId)) {
+          error(s"Adding replica ($replicaId) that is not part of the assignment $assignment")
+          val newAssignment = assignment.copy(replicas = assignment.replicas :+ replicaId)
+          controllerContext.updatePartitionFullReplicaAssignment(partition, newAssignment)
+        }
+      ...//
+  //状态更新    
+  controllerContext.putReplicaState(replica, OnlineReplica)
+
+```
+
+## LeaderAndIsrRequest
+
+Controller处理完TopicChange事件后，会向新建Replica所在Broker发送LeaderAndIsrRequest，**完成Replica对应的本地日志创建及日志相关操作**,方法的调用链为：
+
+* KafkaApis#handleLeaderAndIsrRequest()
+* ReplicaManager#becomeLeaderOrFollower()
+* ReplicaManager#makeLeaders() or  ReplicaManager#makeFollowers()
+* Partition#makeLeader() or  Partition#makeFollower()
+* LogManager#getOrCreateLog()
+
+这里不再对此部分进行源码分析(后续会进行分析)，至此消息Topic创建完成。
 
 # ModifyTopic
 
