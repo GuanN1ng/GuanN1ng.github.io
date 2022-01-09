@@ -929,11 +929,160 @@ private def processPartitionModifications(topic: String): Unit = {
 为Topic扩容前，需先判断**Topic是否为待删除状态**，若是，则回滚zk节点`/brokers/topics/${topicName}`中存储的分区分配方案，若否则调用onNewPartitionCreation()方法完成
 新增分区创建，并更新controllerContext。
 
-onNewPartitionCreation()方法的实现在创建Topic已分析过，这里不再复述。支持Topic的扩容已结束。
+onNewPartitionCreation()方法的实现在创建Topic已分析过，这里不再复述。至此，Topic的扩容分析已结束。
 
 
 # RemoveTopic
 
+Kafka Topic的删除同样是使用`kafka-topics.sh`脚本完成，命令如下：
+
 ```
 bin/kafka-topics.sh --bootstrap-server broker_host:port --delete --topic my_topic_name
 ```
+
+同时，Broker端的配置项`delete.topic.enable`的值(1.0.0版本后默认为true)必须为true，否则将无法删除Topic。
+
+
+## SendDeleteTopicsRequest
+
+使用`kafka-topics.sh`脚本基于Topic Name进行主题删除操作的方法调用链为：TopicCommand#main()->TopicCommand.TopicService#deleteTopic()->KafkaAdminClient#deleteTopics()->
+KafkaAdminClient#handleDeleteTopicsUsingNames()，handleDeleteTopicsUsingNames()方法实现如下：
+
+```
+    private Map<String, KafkaFuture<Void>> handleDeleteTopicsUsingNames(final Collection<String> topicNames,
+                                                                        final DeleteTopicsOptions options) {
+        final Map<String, KafkaFutureImpl<Void>> topicFutures = new HashMap<>(topicNames.size());
+        final List<String> validTopicNames = new ArrayList<>(topicNames.size());
+        for (String topicName : topicNames) {
+            ...//topic name非空校验 topicName == null || topicName.isEmpty();
+        }
+        if (!validTopicNames.isEmpty()) {
+            final long now = time.milliseconds();
+            final long deadline = calcDeadlineMs(now, options.timeoutMs());
+            //创建DeleteTopicsRequest发送任务
+            final Call call = getDeleteTopicsCall(options, topicFutures, validTopicNames,Collections.emptyMap(), now, deadline);
+            //提交发送任务，发送请求
+            runnable.call(call, now);
+        }
+        return new HashMap<>(topicFutures);
+    }
+```
+
+可以看到，使用`kafka-topics.sh`脚本执行的任务最终均是通过向Controller发送不同的请求，让Controller完成任务处理。主题删除对应的请求类型为DeleteTopicsRequest。
+
+## HandleDeleteTopicsRequest
+
+Controller节点处理DeleteTopicsRequest的入口方法为KafkaApis#handleDeleteTopicsRequest()，handleDeleteTopicsRequest()方法主要作用是参数验证，如TopicName或TopicId以及是否
+允许删除Topic(delete.topic.enable)等，然后调用了ZkAdminManager#deleteTopics()方法，源码如下：
+
+```
+def deleteTopics(...): Unit = {
+  // 1. map over topics calling the asynchronous delete
+  val metadata = topics.map { topic =>
+      try {
+        controllerMutationQuota.record(metadataCache.numPartitions(topic).getOrElse(0).toDouble)
+        //添加删除主题节点
+        adminZkClient.deleteTopic(topic)
+        DeleteTopicMetadata(topic, Errors.NONE)
+      } catch {
+        ...//error
+      }
+  }
+
+  // 2. if timeout <= 0 or no topics can proceed return immediately
+  // 3. else pass the topics and errors to the delayed operation and set the keys
+  ...
+```
+
+方法的核心步骤是调用AdminZkClient#deleteTopic()方法，对zk节点进行操作。
+
+### ZK节点
+
+AdminZkClient#deleteTopic()方法源码如下：
+
+```
+def deleteTopic(topic: String): Unit = {
+  //ZK中有 '/brokers/topics/${topicName}'节点
+  if (zkClient.topicExists(topic)) {
+    try {
+      //创建主题删除节点
+      zkClient.createDeleteTopicPath(topic)
+    } catch {
+      ...//  
+    }
+  } else {
+    throw new UnknownTopicOrPartitionException(s"Topic `$topic` to delete does not exist")
+  }
+}
+```
+
+方法主要分两步：
+* 1、确认ZK中存在要删除的主题node:`/brokers/topics/${topicName}`;
+* 2、创建Topic删除节点：**`/admin/delete_topics/${topicName}`**;
+
+至此，DeleteTopicsRequest请求处理完成，将请求转换为了Topic删除的ZK节点。而节点的变动将会触发Controller为该节点注册的处理器。
+
+## TopicDeletion
+
+Controller选举成功后，会为`/admin/delete_topics`节点注册TopicDeletionHandler，监听该节点的变化，实现如下：
+
+```
+class TopicDeletionHandler(eventManager: ControllerEventManager) extends ZNodeChildChangeHandler {
+  override val path: String = DeleteTopicsZNode.path
+  //监听子节点变化，创建TopicDeletion事件
+  override def handleChildChange(): Unit = eventManager.put(TopicDeletion)
+}
+```
+
+监听到节点变化后，会向ControllerEventManager的事件队列中添加TopicDeletion事件，等待线程处理，处理方法为KafkaController#processTopicDeletion()：
+
+```
+  private def processTopicDeletion(): Unit = {
+    //当前broker为controller
+    if (!isActive) return
+    var topicsToBeDeleted = zkClient.getTopicDeletions.toSet
+    debug(s"Delete topics listener fired for topics ${topicsToBeDeleted.mkString(",")} to be deleted")
+    val nonExistentTopics = topicsToBeDeleted -- controllerContext.allTopics
+    if (nonExistentTopics.nonEmpty) {
+      //对应的主题不存在
+      warn(s"Ignoring request to delete non-existing topics ${nonExistentTopics.mkString(",")}")
+      //删除 `/admin/delete_topics/${topicName}` 节点
+      zkClient.deleteTopicDeletions(nonExistentTopics.toSeq, controllerContext.epochZkVersion)
+    }
+    topicsToBeDeleted --= nonExistentTopics
+    if (config.deleteTopicEnable) {
+      //`delete.topic.enable` 为 true
+      if (topicsToBeDeleted.nonEmpty) {
+        // mark topic ineligible for deletion if other state changes are in progress
+        topicsToBeDeleted.foreach { topic =>
+          val partitionReassignmentInProgress = controllerContext.partitionsBeingReassigned.map(_.topic).contains(topic)
+          if (partitionReassignmentInProgress) {
+            //主题正在进行分区重新分配，标记无法进行删除的主题
+            topicDeletionManager.markTopicIneligibleForDeletion(Set(topic),reason = "topic reassignment in progress")
+          }
+        }
+        //将主题添加到待删除队列
+        topicDeletionManager.enqueueTopicsForDeletion(topicsToBeDeleted)
+      }
+    } else {
+      // If delete topic is disabled remove entries under zookeeper path : /admin/delete_topics
+      info(s"Removing $topicsToBeDeleted since delete topic is disabled")
+      zkClient.deleteTopicDeletions(topicsToBeDeleted.toSeq, controllerContext.epochZkVersion)
+    }
+  }
+```
+processTopicDeletion()方法分为以下几步：
+
+* 确认当前Broker为集群Controller;
+* 确认主题元数据存在，若不存在，删除之前创建的`/admin/delete_topics/${topicName}` 节点；
+* 确认可进行主题删除，即`delete.topic.enable`配置true，若不为true，将`/admin/delete_topics`节点下的数据全部删除；
+* 若Topic正在进行分区重分配，调用TopicDeletionManager#markTopicIneligibleForDeletion()方法，否则调用TopicDeletionManager#enqueueTopicsForDeletion()方法。
+
+可知，负责处理Topic删除的是TopicDeletionManager对象。
+
+## TopicDeletionManager
+
+被选举为Controller角色的Broker会调用TopicDeletionManager#init()方法，完成TopicDeletionManager初始化，TopicDeletionManager对象负责处理Topic的
+删除。
+
+
