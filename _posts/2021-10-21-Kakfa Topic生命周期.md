@@ -1085,4 +1085,86 @@ processTopicDeletion()方法分为以下几步：
 被选举为Controller角色的Broker会调用TopicDeletionManager#init()方法，完成TopicDeletionManager初始化，TopicDeletionManager对象负责处理Topic的
 删除。
 
+ControllerContext对象中维护了两个Set集合，分别用来存放可被删除的Topic和无法删除的Topic，如下：
+
+```
+val topicsToBeDeleted = mutable.Set.empty[String]
+val topicsIneligibleForDeletion = mutable.Set.empty[String]
+```
+
+无法进行删除的Topic，如Topic分区正在重分配或托管Topic副本的Broker宕机等，会调用TopicDeletionManager#markTopicIneligibleForDeletion()方法会将Topic添加到topicsIneligibleForDeletion列表中：
+```
+  def markTopicIneligibleForDeletion(topics: Set[String], reason: => String): Unit = {
+    if (isDeleteTopicEnabled) {
+      val newTopicsToHaltDeletion = controllerContext.topicsToBeDeleted & topics
+      controllerContext.topicsIneligibleForDeletion ++= newTopicsToHaltDeletion
+      if (newTopicsToHaltDeletion.nonEmpty)
+        info(s"Halted deletion of topics ${newTopicsToHaltDeletion.mkString(",")} due to $reason")
+    }
+  }
+```
+
+可以删除的Topic则会调用TopicDeletionManager#enqueueTopicsForDeletion()方法被添加到topicsToBeDeleted列表中，并调用删除方法：
+
+```
+def enqueueTopicsForDeletion(topics: Set[String]): Unit = {
+  if (isDeleteTopicEnabled) {
+    //添加到topicsToBeDeleted列表
+    controllerContext.queueTopicDeletion(topics)
+    //执行删除
+    resumeDeletions()
+  }
+}
+```
+
+resumeDeletions()方法实现如下：
+
+```
+private def resumeDeletions(): Unit = {
+  //待删除的Topic列表
+  val topicsQueuedForDeletion = Set.empty[String] ++ controllerContext.topicsToBeDeleted
+  val topicsEligibleForRetry = mutable.Set.empty[String]
+  val topicsEligibleForDeletion = mutable.Set.empty[String]
+
+  topicsQueuedForDeletion.foreach { topic =>
+    if (controllerContext.areAllReplicasInState(topic, ReplicaDeletionSuccessful)) {
+      //所有主题副本删除完成，即Topic已删除完成，从controller的缓存和ZK中清除这个topic
+      completeDeleteTopic(topic)
+    } else if (!controllerContext.isAnyReplicaInState(topic, ReplicaDeletionStarted)) {
+      if (controllerContext.isAnyReplicaInState(topic, ReplicaDeletionIneligible)) {
+        //任一副本删除失败，状态ReplicaDeletionIneligible，添加到重试列表
+        topicsEligibleForRetry += topic
+      }
+    }
+    if (isTopicEligibleForDeletion(topic)) {
+      //Topic可删除
+      topicsEligibleForDeletion += topic
+    }
+  }
+  if (topicsEligibleForRetry.nonEmpty) {
+    //对删除失败的副本重试
+    retryDeletionForIneligibleReplicas(topicsEligibleForRetry)
+  }
+  if (topicsEligibleForDeletion.nonEmpty) {
+    //执行Topic删除
+    onTopicDeletion(topicsEligibleForDeletion)
+  }
+}
+```
+resumeDeletions()方法可分为以下几步：
+
+* 1、从ControllerContext.topicsToBeDeleted中获取待删除的Topic并遍历；
+* 2、若Topic的所有副本状态都等于ReplicaDeletionSuccessful，即主题已完成删除，执行completeDeleteTopic()方法；
+* 3、若Topic的任一副本状态为ReplicaDeletionIneligible，即存在副本删除失败，记录并调用retryDeletionForIneligibleReplicas()方法进行重试；
+* 4、判断Topic是否可进行删除，若可以，调用onTopicDeletion()方法删除：
+
+这里共有3个核心方法：**执行Topic删除的调用onTopicDeletion()、失败重试的retryDeletionForIneligibleReplicas()以及删除完成后completeDeleteTopic()。**
+
+### onTopicDeletion
+
+
+### completeDeleteTopic
+
+
+
 
