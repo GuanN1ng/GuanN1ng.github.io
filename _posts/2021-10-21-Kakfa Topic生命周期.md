@@ -1158,13 +1158,181 @@ resumeDeletions()方法可分为以下几步：
 * 3、若Topic的任一副本状态为ReplicaDeletionIneligible，即存在副本删除失败，记录并调用retryDeletionForIneligibleReplicas()方法进行重试；
 * 4、判断Topic是否可进行删除，若可以，调用onTopicDeletion()方法删除：
 
-这里共有3个核心方法：**执行Topic删除的调用onTopicDeletion()、失败重试的retryDeletionForIneligibleReplicas()以及删除完成后completeDeleteTopic()。**
+这里共有3个核心方法：**执行Topic删除的调用onTopicDeletion()和删除完成后completeDeleteTopic()。**
 
 ### onTopicDeletion
+
+onTopicDeletion源码如下：
+
+```
+  private def onTopicDeletion(topics: Set[String]): Unit = {
+    val unseenTopicsForDeletion = topics.diff(controllerContext.topicsWithDeletionStarted)
+    if (unseenTopicsForDeletion.nonEmpty) {
+      val unseenPartitionsForDeletion = unseenTopicsForDeletion.flatMap(controllerContext.partitionsForTopic)
+      //先将分区状态更新为OfflinePartition
+      partitionStateMachine.handleStateChanges(unseenPartitionsForDeletion.toSeq, OfflinePartition)
+      //再次更新分区状态为NonExistentPartition
+      partitionStateMachine.handleStateChanges(unseenPartitionsForDeletion.toSeq, NonExistentPartition)
+      // 将Topic添加至topicsWithDeletionStarted集合，记录开始执行删除的Topic
+      controllerContext.beginTopicDeletion(unseenTopicsForDeletion)
+    }
+    // send update metadata so that brokers stop serving data for topics to be deleted
+    //通知所有在线Broker,主题正在删除
+    //主题的分区leader被设置为 val LeaderDuringDelete: Int = -2，即分区副本将停止服务
+    client.sendMetadataUpdate(topics.flatMap(controllerContext.partitionsForTopic))
+    //执行分区删除
+    onPartitionDeletion(topics)
+  }
+```
+onTopicDeletion()方法的内容主要分为3部分：
+
+* 1、更新ControllerContext中待删除主题的分区状态，当前状态->OfflinePartition->NonExistentPartition；
+* 2、向所有Broker发送UpdateMetadataRequest，通知Topic正在执行删除操作，各分区的的Leader将被设置为LeaderDuringDelete(-2)，分区副本停止服务；
+* 3、调用onPartitionDeletion()方法，删除Topic的所有分区。
+
+
+onPartitionDeletion()方法实现如下：
+
+```
+private def onPartitionDeletion(topicsToBeDeleted: Set[String]): Unit = {
+  val allDeadReplicas = mutable.ListBuffer.empty[PartitionAndReplica]
+  val allReplicasForDeletionRetry = mutable.ListBuffer.empty[PartitionAndReplica]
+  val allTopicsIneligibleForDeletion = mutable.Set.empty[String]
+  //遍历待删除的主题
+  topicsToBeDeleted.foreach { topic =>
+    val (aliveReplicas, deadReplicas) = controllerContext.replicasForTopic(topic).partition { r =>
+      controllerContext.isReplicaOnline(r.replica, r.topicPartition)
+    }
+    //获取主题已成功删除的副本
+    val successfullyDeletedReplicas = controllerContext.replicasInState(topic, ReplicaDeletionSuccessful)
+    //未被删除的副本
+    val replicasForDeletionRetry = aliveReplicas.diff(successfullyDeletedReplicas)
+    //已死亡副本 broker下线 或 副本下线
+    allDeadReplicas ++= deadReplicas
+    allReplicasForDeletionRetry ++= replicasForDeletionRetry
+    if (deadReplicas.nonEmpty) {
+      allTopicsIneligibleForDeletion += topic
+    }
+  }
+  // move dead replicas directly to failed state
+  replicaStateMachine.handleStateChanges(allDeadReplicas, ReplicaDeletionIneligible)
+  replicaStateMachine.handleStateChanges(allReplicasForDeletionRetry, OfflineReplica)
+  replicaStateMachine.handleStateChanges(allReplicasForDeletionRetry, ReplicaDeletionStarted)
+
+  if (allTopicsIneligibleForDeletion.nonEmpty) {
+    //存在副本死亡，无法进行Topic删除 将Topic添加到topicsIneligibleForDeletion
+    markTopicIneligibleForDeletion(allTopicsIneligibleForDeletion, reason = "offline replicas")
+  }
+}
+```
+
+方法内容可分为3部分：
+
+* 1、获取待删除Topic中的DeadReplica(如Replica所在Broker下线)，若有则将DeadReplica状态更新为`ReplicaDeletionIneligible`，并将其Topic添加入
+  ControllerContext中的topicsIneligibleForDeletion集合，即Topic无法删除(无法删除DeadReplica);
+
+* 2、将待删除Replica的状态状态更新为OfflineReplica，并向Replica节点发送StopReplicaRequest(deletePartition = false)，停止分区副本同步
+```
+case OfflineReplica =>
+  validReplicas.foreach { replica =>
+    //发送StopReplicaRequest
+    controllerBrokerRequestBatch.addStopReplicaRequestForBrokers(Seq(replicaId), replica.topicPartition, deletePartition = false)
+  }
+  val (replicasWithLeadershipInfo, replicasWithoutLeadershipInfo) = validReplicas.partition { replica =>
+    controllerContext.partitionLeadershipInfo(replica.topicPartition).isDefined
+  }
+  //将副本从ISR移除
+  val updatedLeaderIsrAndControllerEpochs = removeReplicasFromIsr(replicaId, replicasWithLeadershipInfo.map(_.topicPartition))
+  updatedLeaderIsrAndControllerEpochs.forKeyValue { (partition, leaderIsrAndControllerEpoch) =>
+    ...// 省略
+    val replica = PartitionAndReplica(partition, replicaId)
+    controllerContext.putReplicaState(replica, OfflineReplica)
+  }
+  ...// 省略
+```
+
+* 3、将待删除Replica的状态状态更新为ReplicaDeletionStarted，并**再次发送StopReplicaRequest(deletePartition = true)，删除分区元数据**
+```
+case ReplicaDeletionStarted =>
+  validReplicas.foreach { replica =>=
+    //更新缓存状态
+    controllerContext.putReplicaState(replica, ReplicaDeletionStarted)
+    //向Broker发送StopReplicaRequest，完成Replica删除
+    controllerBrokerRequestBatch.addStopReplicaRequestForBrokers(Seq(replicaId), replica.topicPartition, deletePartition = true)
+  }
+```
+
+
+#### TopicDeletionStopReplicaResponseReceived事件
+
+发送删除副本的StopReplicaRequest时，会注册一个回调函数，如下：
+
+```
+  private def sendStopReplicaRequests(controllerEpoch: Int, stateChangeLog: StateChangeLogger): Unit = {
+    ... //other code
+    //响应回调
+    def responseCallback(brokerId: Int, isPartitionDeleted: TopicPartition => Boolean)
+                        (response: AbstractResponse): Unit = {
+      ...//
+      if (partitionErrorsForDeletingTopics.nonEmpty) //Errors.NONE 
+        sendEvent(TopicDeletionStopReplicaResponseReceived(brokerId, stopReplicaResponse.error,partitionErrorsForDeletingTopics))
+    }
+    ...//other code
+```
+
+sendEvent()方法会将TopicDeletionStopReplicaResponseReceived事件放入ControllerEventManager的事件队列，KafkaController处理TopicDeletionStopReplicaResponseReceived事件
+调用的方法为processTopicDeletionStopReplicaResponseReceived()，实现如下：
+
+```
+private def processTopicDeletionStopReplicaResponseReceived(...): Unit = {
+  if (!isActive) return
+  val partitionsInError = if (requestError != Errors.NONE)
+    partitionErrors.keySet
+  else
+    partitionErrors.filter { case (_, error) => error != Errors.NONE }.keySet
+  //删除失败的副本
+  val replicasInError = partitionsInError.map(PartitionAndReplica(_, replicaId))
+  // move all the failed replicas to ReplicaDeletionIneligible
+  //将副本状态更新为ReplicaDeletionIneligible
+  topicDeletionManager.failReplicaDeletion(replicasInError)
+  if (replicasInError.size != partitionErrors.size) {
+    // some replicas could have been successfully deleted
+    val deletedReplicas = partitionErrors.keySet.diff(partitionsInError)
+    //将副本状态更新为 ReplicaDeletionSuccessful
+    topicDeletionManager.completeReplicaDeletion(deletedReplicas.map(PartitionAndReplica(_, replicaId)))
+  }
+}
+```
+
+processTopicDeletionStopReplicaResponseReceived()负责处理StopReplicaResponse，若副本删除失败，则将副本状态修改为ReplicaDeletionIneligible，否则副本删除
+完成，状态修改为ReplicaDeletionSuccessful。
 
 
 ### completeDeleteTopic
 
+当一个Topic的所有副本状态均已转换位ReplicaDeletionSuccessful后，主题删除完成，下一轮的resumeDeletions()方法将会调用completeDeleteTopic()，完成主题删除的
+最后一步，源码如下：
 
+```
+  private def completeDeleteTopic(topic: String): Unit = {
+    //取消Topic zknode监听器
+    client.mutePartitionModifications(topic)
+    
+    val replicasForDeletedTopic = controllerContext.replicasInState(topic, ReplicaDeletionSuccessful)
+    //replica状态 ReplicaDeletionSuccessful =>  NonExistentReplica
+    replicaStateMachine.handleStateChanges(replicasForDeletedTopic.toSeq, NonExistentReplica)
+    //ZK节点删除
+    client.deleteTopic(topic, controllerContext.epochZkVersion)
+    //缓存元数据删除
+    controllerContext.removeTopic(topic)
+  }
+```
 
+方法主要分为4部分内容：
 
+* 1、取消被删除Topic的ZK节点监听处理器，ZNode路径为`/brokers/topics/${TopicName}`；
+* 2、将状态为ReplicaDeletionSuccessful的副本状态修改为NonExistentReplica；
+* 3、删除zk中的数据包括：**`/brokers/topics/${TopicName}`、`/config/topics/${TopicName}` 、`/admin/delete_topics/${TopicName}`**；
+* 4、清理缓存中Topic元数据。
+
+至此，Topic删除完成。
