@@ -297,172 +297,6 @@ createTopics()方法的作用主要为以下三点：
 * 确定Topic的分区副本分配方案，若用户未指定，则通过计算得出，方法为AdminUtils#assignReplicasToBrokers()；
 * 将Topic数据写入Zookeeper。
 
-### ReplicaAssignment
-
-若用户未指定主题的分区副本分配方案，则由AdminUtils#assignReplicasToBrokers()完成分配方案的计算，分配算法的目标有三个：
-
-* 主题所有的分区副本均匀的分布在各broker节点上；
-* 每个分区的所有副本(leader和follower)尽量分配到不同的broker节点；
-* 如果所有broker都有机架信息，尽可能将每个分区的副本分配到不同的机架(consumer消费时的preferredReadReplica);
-
-源码如下：
-
-```
-def assignReplicasToBrokers(...): Map[Int, Seq[Int]] = {
-  ...//param check
-  if (brokerMetadatas.forall(_.rack.isEmpty))
-    //所有broker节点均无机架信息
-    assignReplicasToBrokersRackUnaware(nPartitions, replicationFactor, brokerMetadatas.map(_.id), fixedStartIndex,startPartitionId)
-  else {
-    if (brokerMetadatas.exists(_.rack.isEmpty))
-      throw new AdminOperationException("Not all brokers have rack information for replica rack aware assignment.")
-    //所有broker节点均有机架信息  
-    assignReplicasToBrokersRackAware(nPartitions, replicationFactor, brokerMetadatas, fixedStartIndex,startPartitionId)
-  }
-}
-```
-
-分区副本分配方案的计算分为两类：无机架信息(rack.isEmpty)和有机架信息。
-
-#### 无机架信息
-
-当所有broker节点均无机架信息时，分配方案由assignReplicasToBrokersRackUnaware()实现，源码如下：
-
-```
-private def assignReplicasToBrokersRackUnaware(...): Map[Int, Seq[Int]] = {
-  //分配方案
-  val ret = mutable.Map[Int, Seq[Int]]()
-  //所有的broker节点
-  val brokerArray = brokerList.toArray
-  //fixedStartIndex = -1，startIndex为随机取一个broker
-  val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
-  //startPartitionId=-1 ,currentPartitionId=0
-  var currentPartitionId = math.max(0, startPartitionId)
-  //随机取一个分配步长
-  var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerArray.length)
-  //nPartitions分区数
-  for (_ <- 0 until nPartitions) {
-    if (currentPartitionId > 0 && (currentPartitionId % brokerArray.length == 0)) {
-      //防止 nPartitions 过大时,其中某些partition的分配完全一样，currentPartitionId为brokerArray.length整数倍时+1
-      nextReplicaShift += 1
-    }
-    //第一个分区副本的节点
-    val firstReplicaIndex = (currentPartitionId + startIndex) % brokerArray.length
-    val replicaBuffer = mutable.ArrayBuffer(brokerArray(firstReplicaIndex))
-    //该分区剩余副本分配
-    for (j <- 0 until replicationFactor - 1)
-      replicaBuffer += brokerArray(replicaIndex(firstReplicaIndex, nextReplicaShift, j, brokerArray.length))
-    ret.put(currentPartitionId, replicaBuffer)
-    currentPartitionId += 1
-  }
-  ret
-}
-
-//分区副本节点计算
-private def replicaIndex(firstReplicaIndex: Int, secondReplicaShift: Int, replicaIndex: Int, nBrokers: Int): Int = {
-  val shift = 1 + (secondReplicaShift + replicaIndex) % (nBrokers - 1)
-  (firstReplicaIndex + shift) % nBrokers
-}
-```
-
-分配算法主要分为两步：
-
-* 从所有在线broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
-* 以该Partition的第一个Replica所在broker为起点，按照步长依次分配该Partition的剩余Replica。
-
-例：假设一个Kafka集群有5个在线broker节点，其中一个Topic的Partition数为10，每个Partition有3个Replica，且最初随机选择的startIndex和nextReplicaShift节点均为0，计算过程如下：
-
-* P0的第一个副本在`(0+0)%5=0`，第二个副本在`(0+(1+(0+0)%4)))%5=1`，第三副本在`(0+(1+(0+1)%4)))%5=2`，完成后currentPartitionId+1=1，nextReplicaShift=0；
-* P1的第一个副本在`(1+0)%5=1`，第二个副本在`(1+(1+(0+0)%4)))%5=2`，第三副本在`(1+(1+(0+1)%4)))%5=3`，完成后currentPartitionId+1=2，nextReplicaShift=0；
-* ...
-* P4的第一个副本在`(4+0)%5=4`，第二个副本在`(4+(1+(0+0)%4)))%5=0`，第三副本在`(4+(1+(0+1)%4)))%5=1`，完成后currentPartitionId+1=5，nextReplicaShift=0；
-* 此时currentPartitionId=5满足条件，nextReplicaShift+1=1，P5的第一个副本在`(5+0)%5=0`，第二个副本在`(0+(1+(1+0)%4)))%5=2`，第三副本在`(0+(1+(1+1)%4)))%5=3`，完成后currentPartitionId+1=6，nextReplicaShift=1；
-
-最终分配结果如下：
-
-
-| broker-0 | broker-1  | broker-2 | broker-3  | broker-4  |
-|----------|-------|----------|----------|----------|
-|p0      |p1      |p2      |p3      |p4     | 
-|p5      |p6      |p7      |p8      |p9      |
-|p4      |p0      |p1      |p2      |p3      |
-|p8      |p9      |p5      |p6      |p7      |
-|p3      |p4      |p0      |p1      |p2      |
-|p7      |p8      |p9      |p5      |p6      |
-
-
-
-#### 有机架信息
-
-当所有节点均有机架信息(rack)时，分配方案由assignReplicasToBrokersRackAware()方法实现，该方法保证副本尽量在各机架及各节点间分配均匀，如果分区副本数等于或大于机架数，则将确保每个机架至少获得一个副本，否则，每个机架最多只能获得一个副本。
-实现如下：
-
-```
-  private def assignReplicasToBrokersRackAware(...): Map[Int, Seq[Int]] = {
-    /**
-     * 机架节点map，例
-     * rack1: 0, 1, 2
-     * rack2: 3, 4, 5
-     * rack3: 6, 7, 8
-     */
-    val brokerRackMap = brokerMetadatas.collect { case BrokerMetadata(id, Some(rack)) =>
-      id -> rack
-    }.toMap
-    val numRacks = brokerRackMap.values.toSet.size
-    /**
-     * 机架交替的broker列表,例
-     * 0, 3, 6, 1, 4, 7, 2, 5, 8
-     */
-    val arrangedBrokerList = getRackAlternatedBrokerList(brokerRackMap)
-    val numBrokers = arrangedBrokerList.size
-    //结果集
-    val ret = mutable.Map[Int, Seq[Int]]()
-    val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
-    var currentPartitionId = math.max(0, startPartitionId)
-    var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(arrangedBrokerList.size)
-    for (_ <- 0 until nPartitions) {
-      if (currentPartitionId > 0 && (currentPartitionId % arrangedBrokerList.size == 0))
-        nextReplicaShift += 1
-      //循环分配每个分区的第一个副本  
-      val firstReplicaIndex = (currentPartitionId + startIndex) % arrangedBrokerList.size
-      val leader = arrangedBrokerList(firstReplicaIndex)
-      val replicaBuffer = mutable.ArrayBuffer(leader)
-      val racksWithReplicas = mutable.Set(brokerRackMap(leader))
-      val brokersWithReplicas = mutable.Set(leader)
-      var k = 0
-      for (_ <- 0 until replicationFactor - 1) {
-        var done = false
-        while (!done) {
-          val broker = arrangedBrokerList(replicaIndex(firstReplicaIndex, nextReplicaShift * numRacks, k, arrangedBrokerList.size))
-          val rack = brokerRackMap(broker)
-          // Skip this broker if
-          // 1. there is already a broker in the same rack that has assigned a replica AND there is one or more racks
-          //    that do not have any replica, or
-          // 2. the broker has already assigned a replica AND there is one or more brokers that do not have replica assigned
-          if ((!racksWithReplicas.contains(rack) || racksWithReplicas.size == numRacks)
-              && (!brokersWithReplicas.contains(broker) || brokersWithReplicas.size == numBrokers)) {
-            replicaBuffer += broker
-            racksWithReplicas += rack
-            brokersWithReplicas += broker
-            done = true
-          }
-          k += 1
-        }
-      }
-      ret.put(currentPartitionId, replicaBuffer)
-      currentPartitionId += 1
-    }
-    ret
-  }
-```
-
-算法实现与无机架信息的基本一致，只是需要将broker列表进一步处理，方便进行主要分为3步：
-
-* 1、构架机架信息交替变化的broker节点列表，见源码注释；
-* 2、从机架信息交替的broker列表中随机选取一个起始位置，循环分配每个Partition的第一个Replica；
-* 3、分配每一个分区的其余副本，偏向于分配到没有任何该分区副本的机架上；
-
-
 ### Zookeeper写入
 
 Topic的数据准备好后，即可将Topic写入Zookeeper，源码如下：
@@ -842,7 +676,7 @@ def createPartitions(...): Unit = {
       }
       
       val newPartitionsAssignment = Option(newPartition.assignments).map {...}
-      //验证新增分区的分配方案或自动计算，算法同主题创建一致
+      //验证新增分区的分配方案或自动计算分区方案
       val assignmentForNewPartitions = adminZkClient.createNewPartitionsAssignment( topic, existingAssignment, allBrokers, newPartition.count, newPartitionsAssignment)
       ...
       //写入ZK
@@ -863,7 +697,7 @@ def createPartitions(...): Unit = {
 关于分区创建逻辑主要分为3步：
 
 * 1、参数验证，如扩容的分区数必须大于要修改Topic的原始分区数，Topic存在，指定的分区方案brokerId是否正确等。
-* 2、验证用户指定的分配方案或自动计算，自动计算的算法实现与创建Topic使用的一致；
+* 2、验证用户指定的分配方案或自动计算分区副本分配方案；
 * 3、将扩容后的分区方案写入ZK；
 
 #### ZK写入
@@ -926,8 +760,8 @@ private def processPartitionModifications(topic: String): Unit = {
 }
 ```
 
-为Topic扩容前，需先判断**Topic是否为待删除状态**，若是，则回滚zk节点`/brokers/topics/${topicName}`中存储的分区分配方案，若否则调用onNewPartitionCreation()方法完成
-新增分区创建，并更新controllerContext。
+Topic扩容前，需先判断**Topic是否为待删除状态**，若是，则回滚zk节点`/brokers/topics/${topicName}`中存储的分区分配方案，若否则调用onNewPartitionCreation()方法完成
+新增分区创建，并更新ControllerContext。
 
 onNewPartitionCreation()方法的实现在创建Topic已分析过，这里不再复述。至此，Topic的扩容分析已结束。
 
