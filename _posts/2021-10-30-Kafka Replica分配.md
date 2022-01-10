@@ -6,7 +6,7 @@ categories: Kafka
 ---
 
 Kafka中每个有效的Partition都有1个或多个Replica构成该分区的副本集合，为保障高可用，每个分区的Replicas应均匀的分布在集群的各Broker节点中，防止单Broker故障宕机导致的整个Partition不可用。
-Replica分配规则即可以通过脚本工具手动指定，也可以由Kafka自动计算得出。本篇内容将讲解如何完成Replica的分配。
+Replica分配方案即可以通过脚本工具手动指定，也可以由Kafka自动计算得出。本篇内容将讲解如何完成Replica的分配。
 
 需要进行Replica分配的共有3种情况：
 
