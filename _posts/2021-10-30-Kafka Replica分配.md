@@ -323,4 +323,4 @@ bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 --reassignmen
 ```
 
 replicas数组的长度表示修改后的副本数量，数组内的每个元素表示副本所在的Broker节点id。如上示例中，表示主题my_topic_name的P0分区共有4个副本，分别分配在
-broker-0,broker-1,broker-2以及broker-3中。该命令的执行流程及相关源码分析放在副本管理介绍。
+broker-0,broker-1,broker-2以及broker-3中。该命令的执行流程及相关源码分析放在后续的副本管理分析。
