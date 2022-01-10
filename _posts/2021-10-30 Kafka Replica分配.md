@@ -1,6 +1,6 @@
 ---
 layout: post 
-title:  Kafka Replica分配规则
+title:  Kafka Replica分配
 date:   2021-10-30 11:47:55 
 categories: Kafka
 ---
@@ -12,7 +12,7 @@ Replica分配规则即可以通过脚本工具手动指定，也可以由Kafka�
 
 * 1、新建Topic；
 * 2、对Topic进行分区扩容(对一个正常运行的Topic,Kafka只支持增加分区数，不允许减少分区数)；
-* 3、增加或减少指定Partition的Replica数；
+* 3、修改指定Partition的Replica数或进行副本迁移；
 
 
 # CreateTopic
@@ -46,7 +46,7 @@ bin/kafka-topics.sh --create --bootstrap-server localhost:9092  --topic my-topic
   --config max.message.bytes=64000
 ```
 
-[Kafka Topic生命周期]()中分析过主题创建的流程，若用户未指定主题的分区副本分配方案，则调用AdminUtils#assignReplicasToBrokers()方法完成分配方案的计算，分配算法的目标有三个：
+[Kafka Topic生命周期](https://guann1ng.github.io/kafka/2021/10/21/Kafka-Topic%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/) 中分析过主题创建的流程，若用户未指定主题的分区副本分配方案，则调用AdminUtils#assignReplicasToBrokers()方法完成分配方案的计算，分配算法的目标有三个：
 
 * 主题所有的分区副本均匀的分布在各broker节点上；
 * 每个分区的所有副本(leader和follower)应分配到不同的broker节点；
@@ -218,6 +218,109 @@ private def replicaIndex(firstReplicaIndex: Int, secondReplicaShift: Int, replic
 
 # Topic分区扩容
 
+对Topic进行分区扩容同样有两种方式：指定扩容后分区副本分配方案和只指定扩容后分区数，副本分配由Kafka计算两种。
+
+## 用户指定replicaAssignment
+
+指定扩容后的分区数量和具体的副本分配方案，命令如下：
+
+```
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter  --topic my-topic-name  
+   --replica-assignment 0:1:2,0:1:2,0:1:2,2:1:0  --partitions 4
+```
+
+`--replica-assignment 0:1:2,0:1:2,0:1:2,2:1:0`参数表示Topic共有4个Partition(P0、P1、P2、P3)且每个分区都有3个Replica，且均匀的分布在BrokerId为0，1，2的Broker节点上。分配情况如下：
+
+| broker-0 | broker-1 | broker-2 |
+|----------|----------|----------|
+| p0       | p0       | p0       |
+| p1       | p1       | p1       |
+| p2       | p2       | p2       |
+| p3       | p3       | p3       |
 
 
-# 增加或减少分区Replica
+## Kafka计算replicaAssignment
+
+仅指定扩容后的Partition数量，命令如下:
+
+```
+bin/kafka-topics.sh --bootstrap-server broker_host:port --alter --topic my_topic_name 
+    --partitions 4
+```
+
+此时，Kafka会调用AdminZkClient#createNewPartitionsAssignment()完成**新增分区**(**不会改动之前的分区副本分配**)的副本分配方案计算，源码如下：
+
+```
+def createNewPartitionsAssignment(...): Map[Int, ReplicaAssignment] = {
+  //获取P0分区的所有副本
+  val existingAssignmentPartition0 = existingAssignment.getOrElse(0,throw new AdminOperationException(...)).replicas
+
+  val partitionsToAdd = numPartitions - existingAssignment.size
+  //只能增加分区数
+  if (partitionsToAdd <= 0)
+    throw new InvalidPartitionsException(...)
+  
+  //用户未指定时，不会执行
+  replicaAssignment.foreach { proposedReplicaAssignment =>
+    //验证用户指定的副本分配方案
+    validateReplicaAssignment(proposedReplicaAssignment, existingAssignmentPartition0.size, allBrokers.map(_.id).toSet)
+  }
+  
+  val proposedAssignmentForNewPartitions = replicaAssignment.getOrElse {
+    //计算副本分配方案
+    //startIndex为P0分区第一个副本所在Broker的id
+    val startIndex = math.max(0, allBrokers.indexWhere(_.id >= existingAssignmentPartition0.head))
+    AdminUtils.assignReplicasToBrokers(allBrokers, partitionsToAdd, existingAssignmentPartition0.size,
+      startIndex, existingAssignment.size)
+  }
+
+  proposedAssignmentForNewPartitions.map { case (tp, replicas) =>
+    tp -> ReplicaAssignment(replicas, List(), List())
+  }
+}
+```
+
+可以看到，和创建Topic时一样，副本分配方案的计算同样是调用AdminUtils.assignReplicasToBrokers()完成，但方法入参不一致：
+
+* 新增Partition的**replicationFactor等于P0分区的副本数**；
+* **fixedStartIndex**不再为Broker列表下标的随机值，而是**P0分区第一个副本所在节点**；
+* startPartitionId为当前已有分区集合的大小；
+
+后两个参数的变动主要是提升新增副本的分配随机性、均匀性。
+
+
+# 修改副本数量或副本迁移
+
+Topic创建完成后，若需要对已存在的Partition的Replicas进行数量修改(增加或减少)或重分配(迁移)，可通过`kafka-reassign-partitions.sh`脚本工具实现。命令如下：
+
+```
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 --reassignment-json-file custom-reassignment.json --execute
+```
+
+命令中的custom-reassignment.json文件格式如下：
+
+```
+{
+    "version":1,
+    "partitions":[
+        {
+            "topic":"my_topic_name",
+            "partition":0,
+            "replicas":[0,1,2,3]
+        },
+        {
+            "topic":"my_topic_name",
+            "partition":1,
+            "replicas":[1,2,3,0]
+        },
+        {
+            "topic":"my_topic_name",
+            "partition":2,
+            "replicas":[2,3,0,1]
+        }
+    ]
+}
+```
+
+replicas数组的长度表示修改后的副本数量，数组内的每个元素表示副本所在的Broker节点id。如上示例中，表示主题my_topic_name的P0分区共有4个副本，分别分配在
+broker-0,broker-1,broker-2以及broker-3中。该命令的执行流程及相关源码分析放在副本管理介绍。
