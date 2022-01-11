@@ -797,7 +797,7 @@ private def onBrokerStartup(newBrokers: Seq[Int]): Unit = {
 
 ### Broker节点下线
 
-Broker节点下线可分为正常下线(调用 shutdown API)和突然掉线(服务宕机或ZK网络连接失败)，两种情况都会因为`/brokers/ids/${id}`节点的消失触发onBrokerFailure()方法，但Broker正常下线
+Broker节点下线可分为正常下线(kill -s TERM $PID或 kill -15 $PID )和突然掉线(服务宕机或ZK网络连接失败)，两种情况都会因为`/brokers/ids/${id}`节点的消失触发onBrokerFailure()方法，但Broker正常下线
 时还会向集群Controller发送**ControlledShutdownRequest**，该请求由KafkaApis#handleControlledShutdownRequest()方法进行处理。
 
 #### handleControlledShutdownRequest

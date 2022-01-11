@@ -28,13 +28,13 @@ bin/kafka-topics.sh --create --bootstrap-server localhost:9092  --topic my-topic
   --config max.message.bytes=64000
 ```
 
-`--replica-assignment 0:1:2,0:1:2,0:1:2`参数表示Topic共有三个Partition(P0、P1、P2)且每个分区都有3个Replica，且均匀的分布在BrokerId为0，1，2的Broker节点上。分配情况如下：
+`--replica-assignment 0:1:2,1:2:0,2:0:1`参数表示Topic共有三个Partition(P0、P1、P2)且每个分区都有3个Replica，且均匀的分布在BrokerId为0，1，2的Broker节点上。分配情况如下：
 
 | broker-0 | broker-1 | broker-2 |
 |----------|----------|----------|
-| p0       | p0       | p0       |
-| p1       | p1       | p1       |
-| p2       | p2       | p2       |
+| p0-1     | p0-2     | p0-3     |
+| p1-3     | p1-1     | p1-2     |
+| p2-2     | p2-3     | p2-1     |
 
 
 ## Kafka计算replicaAssignment
