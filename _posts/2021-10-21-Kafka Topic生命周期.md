@@ -1096,6 +1096,8 @@ case ReplicaDeletionStarted =>
   }
 ```
 
+可见**删除副本时需发送两次StopReplicaRequest**。
+
 
 #### TopicDeletionStopReplicaResponseReceived事件
 
