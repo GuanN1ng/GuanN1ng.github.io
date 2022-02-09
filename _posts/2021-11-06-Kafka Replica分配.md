@@ -1,7 +1,7 @@
 ---
 layout: post 
 title:  Kafka Replica分配
-date:   2021-10-30 11:47:55 
+date:   2021-11-06 11:47:55 
 categories: Kafka
 ---
 
@@ -12,7 +12,7 @@ Replica分配方案即可以通过脚本工具手动指定，也可以由Kafka�
 
 * 1、新建Topic；
 * 2、对Topic进行分区扩容(对一个正常运行的Topic,Kafka只支持增加分区数，不允许减少分区数)；
-* 3、修改指定Partition的Replica数或进行副本迁移；
+* 3、修改指定Partition的Replica数或进行副本重分配；
 
 
 # CreateTopic
@@ -289,9 +289,9 @@ def createNewPartitionsAssignment(...): Map[Int, ReplicaAssignment] = {
 后两个参数的变动主要是提升新增副本的分配随机性、均匀性。
 
 
-# 修改副本数量或副本迁移
+# 分区副本重分配
 
-Topic创建完成后，若需要对已存在的Partition的Replicas进行数量修改(增加或减少)或重分配(迁移)，可通过`kafka-reassign-partitions.sh`脚本工具实现。命令如下：
+Topic创建完成后，若需要对已存在的Partition的Replicas进行重分配(增加或减少副本或迁移副本)，可通过`kafka-reassign-partitions.sh`脚本工具实现。命令如下：
 
 ```
 bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 --reassignment-json-file custom-reassignment.json --execute
@@ -323,4 +323,229 @@ bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 --reassignmen
 ```
 
 replicas数组的长度表示修改后的副本数量，数组内的每个元素表示副本所在的Broker节点id。如上示例中，表示主题my_topic_name的P0分区共有4个副本，分别分配在
-broker-0,broker-1,broker-2以及broker-3中。该命令的执行流程及相关源码分析放在后续的副本管理分析。
+broker-0,broker-1,broker-2以及broker-3中。`kafka-reassign-partitions.sh`脚本的内容如下：
+
+```
+exec $(dirname $0)/kafka-run-class.sh kafka.admin.ReassignPartitionsCommand "$@"
+```
+
+通过调用kafka.admin.ReassignPartitionsCommand#main()方法执行，主要内容是将json文件中的分配方案封装为**`AlterPartitionReassignmentsRequest`**请求并发送给controller
+节点进行处理。controller节点收到AlterPartitionReassignmentsRequest请求后，会将新的分配方案写入**`/admin/reassign_partitions`ZK节点**中，触发controller为该节点注册的
+PartitionReassignmentHandler，进行后续副本重分配工作。
+
+```
+class PartitionReassignmentHandler(eventManager: ControllerEventManager) extends ZNodeChangeHandler {
+  override val path: String = ReassignPartitionsZNode.path
+  //创建ZkPartitionReassignment事件
+  override def handleCreation(): Unit = eventManager.put(ZkPartitionReassignment)
+}
+```
+
+## ZkPartitionReassignment
+
+PartitionReassignmentHandler监听到**`/admin/reassign_partitions`ZK节点**的变化后，会创建**ZkPartitionReassignment**事件放入事件队列中，等待controller进行处理，
+处理方法如下：
+
+```
+private def processZkPartitionReassignment(): Set[TopicPartition] = {
+  // We need to register the watcher if the path doesn't exist in order to detect future
+  // reassignments and we get the `path exists` check for free
+  if (isActive && zkClient.registerZNodeChangeHandlerAndCheckExistence(partitionReassignmentHandler)) {
+    val reassignmentResults = mutable.Map.empty[TopicPartition, ApiError]
+    val partitionsToReassign = mutable.Map.empty[TopicPartition, ReplicaAssignment]
+    //从/admin/reassign_partitions节点读取分区分配方案
+    zkClient.getPartitionReassignment.forKeyValue { (tp, targetReplicas) =>
+      //封装重分配方案
+      maybeBuildReassignment(tp, Some(targetReplicas)) match {
+        case Some(context) => partitionsToReassign.put(tp, context)
+        case None => reassignmentResults.put(tp, new ApiError(Errors.NO_REASSIGNMENT_IN_PROGRESS))
+      }
+    }
+    //执行重分配任务
+    reassignmentResults ++= maybeTriggerPartitionReassignment(partitionsToReassign)
+    val (partitionsReassigned, partitionsFailed) = reassignmentResults.partition(_._2.error == Errors.NONE)
+    if (partitionsFailed.nonEmpty) {
+      warn(s"Failed reassignment through zk with the following errors: $partitionsFailed")
+      maybeRemoveFromZkReassignment((tp, _) => partitionsFailed.contains(tp))
+    }
+    partitionsReassigned.keySet
+  } else {
+    Set.empty
+  }
+}
+```
+
+进行分区副本重分配前需确保当前节点仍为controller节点，以及`/admin/reassign_partitions`节点仍存在，否则放弃执行重分配任务。maybeBuildReassignment()方法实现如下：
+
+```
+private def maybeBuildReassignment(topicPartition: TopicPartition,
+                                   targetReplicasOpt: Option[Seq[Int]]): Option[ReplicaAssignment] = {
+  //缓存中的分区分配方案
+  val replicaAssignment = controllerContext.partitionFullReplicaAssignment(topicPartition)
+  if (replicaAssignment.isBeingReassigned) {
+    //分区有待进行的重分配，覆盖旧方案进行覆()
+    val targetReplicas = targetReplicasOpt.getOrElse(replicaAssignment.originReplicas)
+    Some(replicaAssignment.reassignTo(targetReplicas))
+  } else {
+    targetReplicasOpt.map { targetReplicas =>
+      replicaAssignment.reassignTo(targetReplicas)
+    }
+  }
+}
+```
+
+**当目标分区存在待执行的重分配方案时，直接丢弃旧方案，使用新的分配方案进行覆盖**。
+
+## TriggerPartitionReassignment
+
+分区副本重分配任务由方法KafkaController#maybeTriggerPartitionReassignment()方法触发执行，源码如下：
+
+```
+private def maybeTriggerPartitionReassignment(reassignments: Map[TopicPartition, ReplicaAssignment]): Map[TopicPartition, ApiError] = {
+  reassignments.map { case (tp, reassignment) =>
+    val topic = tp.topic
+    val apiError = if (topicDeletionManager.isTopicQueuedUpForDeletion(topic)) {
+      //对应的主题将被删除，不执行重新分配
+      info(s"Skipping reassignment of $tp since the topic is currently being deleted")
+      new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION, "The partition does not exist.")
+    } else {
+      val assignedReplicas = controllerContext.partitionReplicaAssignment(tp)
+      if (assignedReplicas.nonEmpty) {
+        try {
+          //执行副本重分配
+          onPartitionReassignment(tp, reassignment)
+          ApiError.NONE
+        } catch {
+          ...// error
+        }
+      } else {
+        //本地缓存中不存在对应的分区
+        new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION, "The partition does not exist.")
+      }
+    }
+    tp -> apiError
+  }
+}
+```
+
+maybeTriggerPartitionReassignment()方法可分为两部分内容：
+
+* 1、重分配副本对应的主题为待删除状态或ControllerContext缓存中不存在对应的分区，则不进行副本重分配；
+* 2、调用onPartitionReassignment()方法执行副本重分配。
+
+## 执行副本分配任务
+
+副本重分配由方法onPartitionReassignment()实现，执行过程中涉及到以下几种副本集合：
+
+* RS = current assigned replica set，方法执行过程中，分区当前的副本列表；
+* ORS = Original replica set for partition，该分区的原始副本列表；
+* TRS = Reassigned (target) replica set，新的(目标)副本列表；
+* AR = The replicas we are adding as part of this reassignment，从ORS->TRS，需要添加的副本列表，即AR = TRS - ORS；
+* RR = The replicas we are removing as part of this reassignment，从ORS->TRS，需要移除的副本列表，即RR = ORS - TRS。
+
+onPartitionReassignment()源码如下：
+
+```
+/**
+ * This callback is invoked:
+ * 1. By the AlterPartitionReassignments API
+ * 2. By the reassigned partitions listener which is triggered when the /admin/reassign/partitions znode is created
+ * 3. When an ongoing reassignment finishes - this is detected by a change in the partition's ISR znode
+ * 4. Whenever a new broker comes up which is part of an ongoing reassignment
+ * 5. On controller startup/failover
+  * @param topicPartition 目标主题分区
+ * @param reassignment 副本分配方案
+ */
+private def onPartitionReassignment(topicPartition: TopicPartition, reassignment: ReplicaAssignment): Unit = {
+  // While a reassignment is in progress, deletion is not allowed
+  //进行分区副本分配，标记主题不可删除
+  topicDeletionManager.markTopicIneligibleForDeletion(Set(topicPartition.topic), reason = "topic reassignment in progress")
+  //更新ZK和controllerContext中的内容，并标记分区为正在进行副本分配
+  updateCurrentReassignment(topicPartition, reassignment)
+  //需新建的副本
+  val addingReplicas = reassignment.addingReplicas
+  //待移除的副本
+  val removingReplicas = reassignment.removingReplicas
+
+  if (!isReassignmentComplete(topicPartition, reassignment)) {
+    //重分配未完成 ，新的副本方案不在ISR中 targetReplicas.subsetOf(isr)
+    // A1. Send LeaderAndIsr request to every replica in ORS + TRS (with the new RS, AR and RR).
+    //向Replica节点发送LeaderAndIsrRequest
+    updateLeaderEpochAndSendRequest(topicPartition, reassignment)
+    // A2. replicas in AR -> NewReplica
+    //副本状态机，将新建副本状态更新为NewReplica
+    startNewReplicasForReassignedPartition(topicPartition, addingReplicas)
+  } else {
+    //新的副本已在ISR集合中
+    // B1. replicas in AR -> OnlineReplica
+    replicaStateMachine.handleStateChanges(addingReplicas.map(PartitionAndReplica(topicPartition, _)), OnlineReplica)
+    // B2. Set RS = TRS, AR = [], RR = [] in memory.
+    val completedReassignment = ReplicaAssignment(reassignment.targetReplicas)
+    controllerContext.updatePartitionFullReplicaAssignment(topicPartition, completedReassignment)
+    // B3. Send LeaderAndIsr request with a potential new leader (if current leader not in TRS) and
+    //   a new RS (using TRS) and same isr to every broker in ORS + TRS or TRS
+    moveReassignedPartitionLeaderIfRequired(topicPartition, completedReassignment)
+    // B4. replicas in RR -> Offline (force those replicas out of isr)
+    // B5. replicas in RR -> NonExistentReplica (force those replicas to be deleted)
+    stopRemovedReplicasOfReassignedPartition(topicPartition, removingReplicas)
+    // B6. Update ZK with RS = TRS, AR = [], RR = [].
+    updateReplicaAssignmentForPartition(topicPartition, completedReassignment)
+    // B7. Remove the ISR reassign listener and maybe update the /admin/reassign_partitions path in ZK to remove this partition from it.
+    removePartitionFromReassigningPartitions(topicPartition, completedReassignment)
+    // B8. After electing a leader in B3, the replicas and isr information changes, so resend the update metadata request to every broker
+    sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, Set(topicPartition))
+    // signal delete topic thread if reassignment for some partitions belonging to topics being deleted just completed
+    topicDeletionManager.resumeDeletionForTopics(Set(topicPartition.topic))
+  }
+}
+```
+
+
+### 阶段一：副本方案元数据更新
+
+负责完成副本方案元数据更新的方法为updateCurrentReassignment()，若ORS={1,2,3} and TRS={3，4,5,6}，此阶段需将新的副本集合RS=ORS+TRS={1,2,3，4,5,6}更新到内存和ZK中，
+源码如下：
+
+```
+ private def updateCurrentReassignment(topicPartition: TopicPartition, reassignment: ReplicaAssignment): Unit = {
+    //获取内存中分区的当前副本方案
+    val currentAssignment = controllerContext.partitionFullReplicaAssignment(topicPartition)
+    //新的副本方案与当前方案不一致，即需进行重分配
+    if (currentAssignment != reassignment) {
+      // U1. Update assignment state in zookeeper
+      updateReplicaAssignmentForPartition(topicPartition, reassignment)
+      // U2. Update assignment state in memory
+      controllerContext.updatePartitionFullReplicaAssignment(topicPartition, reassignment)
+
+      // If there is a reassignment already in progress, then some of the currently adding replicas
+      // may be eligible for immediate removal, in which case we need to stop the replicas.
+      val unneededReplicas = currentAssignment.replicas.diff(reassignment.replicas)
+      if (unneededReplicas.nonEmpty)
+        stopRemovedReplicasOfReassignedPartition(topicPartition, unneededReplicas)
+    }
+    ...// 低版本(小于2.7)的代码
+    controllerContext.partitionsBeingReassigned.add(topicPartition)
+  }
+```
+
+内容可分为两部分：
+* 1、若新的副本方案与当前主题分区的副本方案不一致，进行数据更新：
+  * 1.1、更新ZK节点数据，将Topic新的分区副本方案写入**`/brokers/topics/${topic}`**节点中；
+  * 1.2、更新内存(ControllerContext)中的分区副本信息；
+  * 1.3、该分区有正在进行的副本重分配任务(副本重分配过程非同步)，当前方案中可能有需要立即删除的副本，停止对应的Replica，nowState->OfflineReplica->ReplicaDeletionStarted->ReplicaDeletionSuccessful->NonExistentReplica。
+* 2、将正在进行重分配的TopicPartition添加到partitionsBeingReassigned中，partitionsBeingReassigned中记录当前正在进行重分配的所有TopicPartition。
+
+### 阶段二：创建副本
+
+
+
+### 
+
+
+
+
+
+
+
+
+
