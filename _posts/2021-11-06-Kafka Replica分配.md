@@ -469,41 +469,18 @@ private def onPartitionReassignment(topicPartition: TopicPartition, reassignment
 
   if (!isReassignmentComplete(topicPartition, reassignment)) {
     //重分配未完成 ，新的副本方案不在ISR中 targetReplicas.subsetOf(isr)
-    // A1. Send LeaderAndIsr request to every replica in ORS + TRS (with the new RS, AR and RR).
-    //向Replica节点发送LeaderAndIsrRequest
-    updateLeaderEpochAndSendRequest(topicPartition, reassignment)
-    // A2. replicas in AR -> NewReplica
-    //副本状态机，将新建副本状态更新为NewReplica
-    startNewReplicasForReassignedPartition(topicPartition, addingReplicas)
+    ...// 阶段二 源码分析见下方
   } else {
-    //新的副本已在ISR集合中
-    // B1. replicas in AR -> OnlineReplica
-    replicaStateMachine.handleStateChanges(addingReplicas.map(PartitionAndReplica(topicPartition, _)), OnlineReplica)
-    // B2. Set RS = TRS, AR = [], RR = [] in memory.
-    val completedReassignment = ReplicaAssignment(reassignment.targetReplicas)
-    controllerContext.updatePartitionFullReplicaAssignment(topicPartition, completedReassignment)
-    // B3. Send LeaderAndIsr request with a potential new leader (if current leader not in TRS) and
-    //   a new RS (using TRS) and same isr to every broker in ORS + TRS or TRS
-    moveReassignedPartitionLeaderIfRequired(topicPartition, completedReassignment)
-    // B4. replicas in RR -> Offline (force those replicas out of isr)
-    // B5. replicas in RR -> NonExistentReplica (force those replicas to be deleted)
-    stopRemovedReplicasOfReassignedPartition(topicPartition, removingReplicas)
-    // B6. Update ZK with RS = TRS, AR = [], RR = [].
-    updateReplicaAssignmentForPartition(topicPartition, completedReassignment)
-    // B7. Remove the ISR reassign listener and maybe update the /admin/reassign_partitions path in ZK to remove this partition from it.
-    removePartitionFromReassigningPartitions(topicPartition, completedReassignment)
-    // B8. After electing a leader in B3, the replicas and isr information changes, so resend the update metadata request to every broker
-    sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, Set(topicPartition))
-    // signal delete topic thread if reassignment for some partitions belonging to topics being deleted just completed
+    ...// 阶段三 源码分析见下方
+    //清除Topic不可删除状态
     topicDeletionManager.resumeDeletionForTopics(Set(topicPartition.topic))
   }
 }
 ```
 
-
 ### 阶段一：副本方案元数据更新
 
-负责完成副本方案元数据更新的方法为updateCurrentReassignment()，若ORS={1,2,3} and TRS={3，4,5,6}，此阶段需将新的副本集合RS=ORS+TRS={1,2,3，4,5,6}更新到内存和ZK中，
+负责完成副本方案元数据更新的方法为updateCurrentReassignment()，设ORS={1,2,3} and TRS={3,4,5,6}，此阶段需将新的副本集合RS=ORS+TRS={3,4,5,6,1,2}更新到内存和ZK中，
 源码如下：
 
 ```
@@ -530,22 +507,68 @@ private def onPartitionReassignment(topicPartition: TopicPartition, reassignment
 
 内容可分为两部分：
 * 1、若新的副本方案与当前主题分区的副本方案不一致，进行数据更新：
-  * 1.1、更新ZK节点数据，将Topic新的分区副本方案写入**`/brokers/topics/${topic}`**节点中；
-  * 1.2、更新内存(ControllerContext)中的分区副本信息；
+  * 1.1、更新ZK节点数据，将RS集合写入**`/brokers/topics/${topic}`**节点中；
+  * 1.2、更新内存(ControllerContext)中的分区副本信息为RS集合；
   * 1.3、该分区有正在进行的副本重分配任务(副本重分配过程非同步)，当前方案中可能有需要立即删除的副本，停止对应的Replica，nowState->OfflineReplica->ReplicaDeletionStarted->ReplicaDeletionSuccessful->NonExistentReplica。
 * 2、将正在进行重分配的TopicPartition添加到partitionsBeingReassigned中，partitionsBeingReassigned中记录当前正在进行重分配的所有TopicPartition。
 
-### 阶段二：创建副本
+### 阶段二：创建副本并同步ISR
+
+此阶段主要分为两步，源码如下：
+
+```
+// A1. Send LeaderAndIsr request to every replica in ORS + TRS (with the new RS, AR and RR).
+updateLeaderEpochAndSendRequest(topicPartition, reassignment)
+// A2. replicas in AR -> NewReplica
+startNewReplicasForReassignedPartition(topicPartition, addingReplicas)
+```
+
+此时，ORS={1,2,3} and TRS={3,4,5,6}，RS=ORS+TRS={3,4,5,6,1,2}，AR={4,5,6}，RR={1,2}
+
+* updateLeaderEpochAndSendRequest()方法将会向当前RS集合({3,4,5,6,1,2})中的所有副本发送LeaderAndIsrRequest，并更新ZK中leader的epoch；
+* startNewReplicasForReassignedPartition()方法会调用ReplicaStateMachine将AR集合中的副本(4，5，6)置为NewReplica状态，状态转化详见[Kafka 分区状态机与副本状态机](https://guann1ng.github.io/kafka/2021/10/30/Kafka-%E5%88%86%E5%8C%BA%E7%8A%B6%E6%80%81%E6%9C%BA%E4%B8%8E%E5%89%AF%E6%9C%AC%E7%8A%B6%E6%80%81%E6%9C%BA/) 。
+
+### 阶段三：完成副本重分配
+
+阶段二完成后，新的副本列表TRS={3,4,5,6}已全部处于ISR集合中，此时开始完成副本重分配的收尾工作，源码如下：
+
+```
+//新的副本已在ISR集合中
+// B1. replicas in AR -> OnlineReplica
+replicaStateMachine.handleStateChanges(addingReplicas.map(PartitionAndReplica(topicPartition, _)), OnlineReplica)
+// B2. Set RS = TRS, AR = [], RR = [] in memory.
+val completedReassignment = ReplicaAssignment(reassignment.targetReplicas)
+controllerContext.updatePartitionFullReplicaAssignment(topicPartition, completedReassignment)
+// B3. Send LeaderAndIsr request with a potential new leader (if current leader not in TRS) and
+//   a new RS (using TRS) and same isr to every broker in ORS + TRS or TRS
+moveReassignedPartitionLeaderIfRequired(topicPartition, completedReassignment)
+// B4. replicas in RR -> Offline (force those replicas out of isr)
+// B5. replicas in RR -> NonExistentReplica (force those replicas to be deleted)
+stopRemovedReplicasOfReassignedPartition(topicPartition, removingReplicas)
+// B6. Update ZK with RS = TRS, AR = [], RR = [].
+updateReplicaAssignmentForPartition(topicPartition, completedReassignment)
+// B7. Remove the ISR reassign listener and maybe update the /admin/reassign_partitions path in ZK to remove this partition from it.
+removePartitionFromReassigningPartitions(topicPartition, completedReassignment)
+// B8. After electing a leader in B3, the replicas and isr information changes, so resend the update metadata request to every broker
+sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, Set(topicPartition))
+```
+
+可见，此阶段主要分为8步，假设ORS={1,2,3} and TRS={3,4,5,6}，此时新的副本集合RS=ORS+TRS={3,4,5,6,1,2}，AR={4,5,6}，RR={1,2}：
+
+* B1、将AR集合中的副本(4,5,6)状态更新为OnlineReplica；
+* B2、更新内存(ControllerContext)中的副本方案为目标值TRS={3,4,5,6}；
+* B3、完成新的分区副本Leader选举：
+  * 若旧的Leader副本不在新的副本方案中，则触发一次Leader选举，选举策略为ReassignPartitionLeaderElectionStrategy(第一个在线且在ISR集合中的副本作为Leader)；
+  * 旧的Leader副本仍存在于新的副本方案中：
+    * leader副本在线，更新leader副本epoch，并发送LeaderAndIsrRequest;
+    * leader副本不在线，触发一次Leader选举，选举策略为ReassignPartitionLeaderElectionStrategy；
+* B4&B5、删除RR集合中的副本，使用ReplicaStateMachine进行状态转换，过程为OfflineReplica->ReplicaDeletionStarted->ReplicaDeletionSuccessful->NonExistentReplica，
+详见[Kafka 分区状态机与副本状态机](https://guann1ng.github.io/kafka/2021/10/30/Kafka-%E5%88%86%E5%8C%BA%E7%8A%B6%E6%80%81%E6%9C%BA%E4%B8%8E%E5%89%AF%E6%9C%AC%E7%8A%B6%E6%80%81%E6%9C%BA/) 。
+* B6、更新ZK节点数据，将TRS={3,4,5,6}集合写入**`/brokers/topics/${topic}`**节点中；
+* B7、更新ZK中`/admin/reassign_partitions`节点数据，移除已经成功迁移的TopicPartition，以及将该TopicPartition从partitionsBeingReassigned中移除；
+* B8、B3中leader选举之后，该分区的Replica和ISR信息将会变动，发送UpdateMetadataRequest给所有的broker。
 
 
-
-### 
-
-
-
-
-
-
-
+至此，Controller节点中分区副本重分配的源码分析已结束。
 
 
