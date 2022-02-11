@@ -42,127 +42,127 @@ public static class LeaderAndIsrPartitionState implements Message {
 LeaderAndIsrRequest请求处理的入口方法为KafkaApis#handleLeaderAndIsrRequest()，对请求处理的部分由ReplicaManager#becomeLeaderOrFollower()方法完成。源码如下：
 
 ```
-  def becomeLeaderOrFollower(correlationId: Int,
-                             leaderAndIsrRequest: LeaderAndIsrRequest,
-                             onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): LeaderAndIsrResponse = {
-    val startMs = time.milliseconds()
-    //同步代码块
-    replicaStateChangeLock synchronized {
-      val controllerId = leaderAndIsrRequest.controllerId
-      //分区副本信息
-      val requestPartitionStates = leaderAndIsrRequest.partitionStates.asScala
+def becomeLeaderOrFollower(correlationId: Int,
+                           leaderAndIsrRequest: LeaderAndIsrRequest,
+                           onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): LeaderAndIsrResponse = {
+  val startMs = time.milliseconds()
+  //同步代码块
+  replicaStateChangeLock synchronized {
+    val controllerId = leaderAndIsrRequest.controllerId
+    //分区副本信息
+    val requestPartitionStates = leaderAndIsrRequest.partitionStates.asScala
 
-      val topicIds = leaderAndIsrRequest.topicIds()
-      def topicIdFromRequest(topicName: String): Option[Uuid] = {
-        val topicId = topicIds.get(topicName)
-        // if invalid topic ID return None
-        if (topicId == null || topicId == Uuid.ZERO_UUID)
-          None
-        else
-          Some(topicId)
-      }
-      val response = {
-        if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
-          //请求中的controller epoch已过期 controller已重新选举
-          leaderAndIsrRequest.getErrorResponse(0, Errors.STALE_CONTROLLER_EPOCH.exception)
-        } else {
-          val responseMap = new mutable.HashMap[TopicPartition, Errors]
-          controllerEpoch = leaderAndIsrRequest.controllerEpoch
-          //本实例需处理的分区
-          val partitions = new mutable.HashSet[Partition]()
-          //本地副本为 leader 的 Partition 列表
-          val partitionsToBeLeader = new mutable.HashMap[Partition, LeaderAndIsrPartitionState]()
-          //本地副本为 follower 的 Partition 列表
-          val partitionsToBeFollower = new mutable.HashMap[Partition, LeaderAndIsrPartitionState]()
-          //
-          val topicIdUpdateFollowerPartitions = new mutable.HashSet[Partition]()
+    val topicIds = leaderAndIsrRequest.topicIds()
+    def topicIdFromRequest(topicName: String): Option[Uuid] = {
+      val topicId = topicIds.get(topicName)
+      // if invalid topic ID return None
+      if (topicId == null || topicId == Uuid.ZERO_UUID)
+        None
+      else
+        Some(topicId)
+    }
+    val response = {
+      if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
+        //请求中的controller epoch已过期 controller已重新选举
+        leaderAndIsrRequest.getErrorResponse(0, Errors.STALE_CONTROLLER_EPOCH.exception)
+      } else {
+        val responseMap = new mutable.HashMap[TopicPartition, Errors]
+        controllerEpoch = leaderAndIsrRequest.controllerEpoch
+        //本实例需处理的分区
+        val partitions = new mutable.HashSet[Partition]()
+        //本地副本为 leader 的 Partition 列表
+        val partitionsToBeLeader = new mutable.HashMap[Partition, LeaderAndIsrPartitionState]()
+        //本地副本为 follower 的 Partition 列表
+        val partitionsToBeFollower = new mutable.HashMap[Partition, LeaderAndIsrPartitionState]()
+        //
+        val topicIdUpdateFollowerPartitions = new mutable.HashSet[Partition]()
 
-          //按照分区遍历
-          requestPartitionStates.foreach { partitionState =>
-            val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
-            //若分区不存在，初始化分区
-            val partitionOpt = getPartition(topicPartition) match {
-              case HostedPartition.Offline =>
-                //分区已离线
-                responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
-                None
-              case HostedPartition.Online(partition) =>
-                Some(partition)
-              case HostedPartition.None =>
-                //本地不存在，创建分区
-                val partition = Partition(topicPartition, time, this)
-                allPartitions.putIfNotExists(topicPartition, HostedPartition.Online(partition))
-                Some(partition)
-            }
-
-            // Next check the topic ID and the partition's leader epoch
-            partitionOpt.foreach { partition =>
-              val currentLeaderEpoch = partition.getLeaderEpoch
-              val requestLeaderEpoch = partitionState.leaderEpoch
-              val requestTopicId = topicIdFromRequest(topicPartition.topic)
-              val logTopicId = partition.topicId
-
-              if (!hasConsistentTopicId(requestTopicId, logTopicId)) {
-                //TopicId异常
-                responseMap.put(topicPartition, Errors.INCONSISTENT_TOPIC_ID)
-              } else if (requestLeaderEpoch > currentLeaderEpoch) {
-                //leader epoch有效
-                if (partitionState.replicas.contains(localBrokerId)) {
-                  partitions += partition
-                  if (partitionState.leader == localBrokerId) {
-                    //leader副本位于该broker节点
-                    partitionsToBeLeader.put(partition, partitionState)
-                  } else {
-                    partitionsToBeFollower.put(partition, partitionState)
-                  }
-                } else {
-                  //分区副本列表中没有位于该broker上的副本，返回异常
-                  responseMap.put(topicPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-                }
-              } else if (requestLeaderEpoch < currentLeaderEpoch) {
-                //leader epoc异常
-                responseMap.put(topicPartition, Errors.STALE_CONTROLLER_EPOCH)
-              } else {
-               ...// TopicId处理
-              }
-            }
+        //按照分区遍历
+        requestPartitionStates.foreach { partitionState =>
+          val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
+          //若分区不存在，初始化分区
+          val partitionOpt = getPartition(topicPartition) match {
+            case HostedPartition.Offline =>
+              //分区已离线
+              responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
+              None
+            case HostedPartition.Online(partition) =>
+              Some(partition)
+            case HostedPartition.None =>
+              //本地不存在，创建分区
+              val partition = Partition(topicPartition, time, this)
+              allPartitions.putIfNotExists(topicPartition, HostedPartition.Online(partition))
+              Some(partition)
           }
 
-          val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
-          val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty) {
-            //设置leader副本
-            makeLeaders(controllerId, controllerEpoch, partitionsToBeLeader, correlationId, responseMap,
-              highWatermarkCheckpoints, topicIdFromRequest)
-          } else
-            Set.empty[Partition]
-          val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty) {
-            //设置follower副本
-            makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, correlationId, responseMap,
-              highWatermarkCheckpoints, topicIdFromRequest)
-          } else
-            Set.empty[Partition]
-          ...
+          // Next check the topic ID and the partition's leader epoch
+          partitionOpt.foreach { partition =>
+            val currentLeaderEpoch = partition.getLeaderEpoch
+            val requestLeaderEpoch = partitionState.leaderEpoch
+            val requestTopicId = topicIdFromRequest(topicPartition.topic)
+            val logTopicId = partition.topicId
 
-          // We initialize highwatermark thread after the first LeaderAndIsr request. This ensures that all the partitions
-          // have been completely populated before starting the checkpointing there by avoiding weird race conditions
-          startHighWatermarkCheckPointThread()
-
-          maybeAddLogDirFetchers(partitions, highWatermarkCheckpoints, topicIdFromRequest)
-          //清理无效线程
-          replicaFetcherManager.shutdownIdleFetcherThreads()
-          replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
-
-          //处理__consumer_offset和__transaction_state 的 leaderAndIsr 信息
-          onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
-
-          val data = new LeaderAndIsrResponseData().setErrorCode(Errors.NONE.code)
-            ...// 响应数据处理
-          new LeaderAndIsrResponse(data, leaderAndIsrRequest.version)
+            if (!hasConsistentTopicId(requestTopicId, logTopicId)) {
+              //TopicId异常
+              responseMap.put(topicPartition, Errors.INCONSISTENT_TOPIC_ID)
+            } else if (requestLeaderEpoch > currentLeaderEpoch) {
+              //leader epoch有效
+              if (partitionState.replicas.contains(localBrokerId)) {
+                partitions += partition
+                if (partitionState.leader == localBrokerId) {
+                  //leader副本位于该broker节点
+                  partitionsToBeLeader.put(partition, partitionState)
+                } else {
+                  partitionsToBeFollower.put(partition, partitionState)
+                }
+              } else {
+                //分区副本列表中没有位于该broker上的副本，返回异常
+                responseMap.put(topicPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+              }
+            } else if (requestLeaderEpoch < currentLeaderEpoch) {
+              //leader epoc异常
+              responseMap.put(topicPartition, Errors.STALE_CONTROLLER_EPOCH)
+            } else {
+             ...// TopicId处理
+            }
+          }
         }
+
+        val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
+        val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty) {
+          //设置leader副本
+          makeLeaders(controllerId, controllerEpoch, partitionsToBeLeader, correlationId, responseMap,
+            highWatermarkCheckpoints, topicIdFromRequest)
+        } else
+          Set.empty[Partition]
+        val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty) {
+          //设置follower副本
+          makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, correlationId, responseMap,
+            highWatermarkCheckpoints, topicIdFromRequest)
+        } else
+          Set.empty[Partition]
+        ...
+
+        // We initialize highwatermark thread after the first LeaderAndIsr request. This ensures that all the partitions
+        // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+        startHighWatermarkCheckPointThread()
+
+        maybeAddLogDirFetchers(partitions, highWatermarkCheckpoints, topicIdFromRequest)
+        //清理无效线程
+        replicaFetcherManager.shutdownIdleFetcherThreads()
+        replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
+
+        //处理__consumer_offset和__transaction_state 的 leaderAndIsr 信息
+        onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
+
+        val data = new LeaderAndIsrResponseData().setErrorCode(Errors.NONE.code)
+          ...// 响应数据处理
+        new LeaderAndIsrResponse(data, leaderAndIsrRequest.version)
       }
-      response
     }
+    response
   }
+}
 ```
 
 除去相关参数如controllerEpoch、leaderEpoch、topicId及TopicPartition等参数的验证及处理，becomeLeaderOrFollower()方法总共包含三部分内容：
@@ -221,7 +221,7 @@ private def makeLeaders(controllerId: Int,
 方法内容分两点：
 
 * 调用ReplicaFetcherManager#removeFetcherForPartitions()方法，移除partitionsToBeLeader集合中TopicPartition的副本同步线程；
-* 遍历TopicPartition集合，调用Partition#makeLeader()方法将该TopicPartition的本地副本标记为leader。
+* 遍历TopicPartition集合，调用Partition#makeLeader()方法将该TopicPartition的本地副本设置为leader。
 
 #### makeLeader
 
@@ -299,14 +299,96 @@ def makeLeader(partitionState: LeaderAndIsrPartitionState,
 }
 ```
 
+本地Replica设置为leader可分以下几步：
 
-
-
+* 1、调用updateAssignmentAndIsr()方法更新内存中的分区数据，包括新的副本方案、ISR集合、远程副本集合；
+* 2、若本地之前没有分区的副本，调用createLogIfNotExists()创建本地副本日志；
+* 3、缓存Leader副本信息(只有leader副本所在broker需要)，包括leaderEpoch、zkVersion、leaderEpochStartOffsetOpt；
+* 4、更新follower副本(本地为leader,即所有远程副本)的lastFetchTimeMs and lastFetchLeaderLogEndOffset；
+* 5、若本地Replica为新的Leader(上一次选举时不是)，更新follower副本的同步信息；
+* 6、检查一下是否需要更新本地副本日志的HW值。
 
 
 ### makeFollowers
 
+makeFollowers()方法会将给定的分区集合的本地副本设置为follower副本，源码如下：
 
+```
+private def makeFollowers(controllerId: Int,
+                          controllerEpoch: Int,
+                          partitionStates: Map[Partition, LeaderAndIsrPartitionState],
+                          correlationId: Int,
+                          responseMap: mutable.Map[TopicPartition, Errors],
+                          highWatermarkCheckpoints: OffsetCheckpoints,
+                          topicIds: String => Option[Uuid]) : Set[Partition] = {
+
+  partitionStates.forKeyValue { (partition, partitionState) =>
+    responseMap.put(partition.topicPartition, Errors.NONE)
+  }
+
+  val partitionsToMakeFollower: mutable.Set[Partition] = mutable.Set()
+  try {
+    partitionStates.forKeyValue { (partition, partitionState) =>
+      val newLeaderBrokerId = partitionState.leader
+      try {
+        if (metadataCache.hasAliveBroker(newLeaderBrokerId)) {
+          //leader副本节点存活 Only change partition state when the leader is available
+          //将 Partition 的本地副本设置为 follower
+          if (partition.makeFollower(partitionState, highWatermarkCheckpoints, topicIds(partitionState.topicName)))
+            partitionsToMakeFollower += partition
+        } else {
+          // Create the local replica even if the leader is unavailable. This is required to ensure that we include
+          // the partition's high watermark in the checkpoint file (see KAFKA-1647)
+          partition.createLogIfNotExists(isNew = partitionState.isNew, isFutureReplica = false,
+            highWatermarkCheckpoints, topicIds(partitionState.topicName))
+        }
+      } catch {
+        case e: KafkaStorageException =>
+          //offline log directory
+          markPartitionOffline(partition.topicPartition)
+          responseMap.put(partition.topicPartition, Errors.KAFKA_STORAGE_ERROR)
+      }
+    }
+
+    // Stopping the fetchers must be done first in order to initialize the fetch
+    // position correctly.
+    replicaFetcherManager.removeFetcherForPartitions(partitionsToMakeFollower.map(_.topicPartition))
+
+    partitionsToMakeFollower.foreach { partition =>
+      //完成期间的日志读写请求
+      completeDelayedFetchOrProduceRequests(partition.topicPartition)
+    }
+
+    if (isShuttingDown.get()) {
+    } else {
+      //初始化副本同步信息
+      val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map { partition =>
+        val leaderNode = partition.leaderReplicaIdOpt.flatMap(leaderId => metadataCache.
+          getAliveBrokerNode(leaderId, config.interBrokerListenerName)).getOrElse(Node.noNode())
+        val leader = new BrokerEndPoint(leaderNode.id(), leaderNode.host(), leaderNode.port())
+        val log = partition.localLogOrException
+        val fetchOffset = initialFetchOffset(log)
+        partition.topicPartition -> InitialFetchState(topicIds(partition.topic), leader, partition.getLeaderEpoch, fetchOffset)
+      }.toMap
+      //启动副本同步
+      replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
+    }
+  } catch {
+    case e: Throwable =>
+      // Re-throw the exception for it to be caught in KafkaApis
+      throw e
+  }
+  partitionsToMakeFollower
+}
+```
+
+处理流程概述如下：
+
+* 1、确保leader副本broker节点在线，否则停止将本地副本设置为follower，但若有需要，仍需完成本地副本日志的创建；
+* 2、调用Partition#makeFollower()方法，将本地副本设置为follower(若无则创建本地副本日志)，并更新内存中的分区副本方案；
+* 3、停止分区副本的同步线程，转为follower期间不再进行同步操作，确保之后初始化同步信息时数据正确；
+* 4、完成延迟的消息日志读写请求；
+* 5、构建新的同步信息并开始副本同步。
 
 
 # Replica下线及删除-StopReplicaRequest
@@ -499,5 +581,5 @@ stopPartitions()方法源码如下：
 调用LogManager#asyncDelete()方法开始副本日志删除操作。
 
 
-本篇内容没有分析Kafka内容主题__consumer_offset和__transaction_state相关的副本操作，感兴趣的可自行翻看，涉及方法为RequestHandlerHelper#onLeadershipChange()、GroupCoordinator#onResignation()以及
+本篇内容没有分析Kafka内部主题__consumer_offset和__transaction_state相关的副本操作，感兴趣的可自行翻看，涉及方法为RequestHandlerHelper#onLeadershipChange()、GroupCoordinator#onResignation()以及
 TransactionCoordinator#onResignation()方法。
