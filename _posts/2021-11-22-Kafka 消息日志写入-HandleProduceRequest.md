@@ -1,11 +1,11 @@
 ---
 layout: post
-title:  "Kafka HandleProduceRequest"
-date:   2021-08-22 14:25:10
+title:  Kafka 消息日志写入-HandleProduceRequest
+date:   2021-11-22 14:25:10
 categories: Kafka
 ---
 
-[Kafka Producer 消息发送](https://guann1ng.github.io/kafka/2021/08/16/Kafka-Producer-%E6%B6%88%E6%81%AF%E5%8F%91%E9%80%81/)分析了KafkaProducer如何将消息发送至Broker，本篇内容将继续分析Kafka Broker端是如何处理ProducerRequest。
+[Kafka Producer 消息发送](https://guann1ng.github.io/kafka/2021/08/16/Kafka-Producer-%E6%B6%88%E6%81%AF%E5%8F%91%E9%80%81/)分析了KafkaProducer会将消息封装为ProduceRequest发送至Broker，本篇内容将继续分析Kafka Broker端是如何处理ProducerRequest。
 
 ## KafkaApis
 

@@ -509,7 +509,7 @@ private def onPartitionReassignment(topicPartition: TopicPartition, reassignment
 * 1、若新的副本方案与当前主题分区的副本方案不一致，进行数据更新：
   * 1.1、更新ZK节点数据，将RS集合写入**`/brokers/topics/${topic}`**节点中；
   * 1.2、更新内存(ControllerContext)中的分区副本信息为RS集合；
-  * 1.3、该分区有正在进行的副本重分配任务(副本重分配过程非同步)，当前方案中可能有需要立即删除的副本，停止对应的Replica，nowState->OfflineReplica->ReplicaDeletionStarted->ReplicaDeletionSuccessful->NonExistentReplica。
+  * 1.3、该分区有正在进行的副本重分配任务，当前方案中可能有需要立即删除的副本，停止对应的Replica，nowState->OfflineReplica->ReplicaDeletionStarted->ReplicaDeletionSuccessful->NonExistentReplica。
 * 2、将正在进行重分配的TopicPartition添加到partitionsBeingReassigned中，partitionsBeingReassigned中记录当前正在进行重分配的所有TopicPartition。
 
 ### 阶段二：创建副本并同步ISR

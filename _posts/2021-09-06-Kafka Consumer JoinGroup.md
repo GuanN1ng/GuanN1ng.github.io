@@ -5,7 +5,7 @@ date:   2021-09-06 14:41:42
 categories: Kafka
 ---
 
-[KafkaConsumer 概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/)中介绍了消费者组及消费位移的概念以及分区分配的算法，KafkaConsumer需要完成JoinGroup、TopicPartition分区分配等工作，才可进行消息的拉取及消费，那么组内不同消费者间
+[KafkaConsumer 概述](https://guann1ng.github.io/kafka/2021/09/02/Kafka-Consumer%E6%A6%82%E8%BF%B0/) 中介绍了消费者组及消费位移的概念以及分区分配的算法，KafkaConsumer需要完成JoinGroup、TopicPartition分区分配等工作，才可进行消息的拉取及消费，那么组内不同消费者间
 是如何相互协同完成这些工作的呢？这一切都在两个角色：ConsumerCoordinator和GroupCoordinator间完成。下面将从源码来分析ConsumerCoordinator和GroupCoordinator的作用，以及一个KafkaConsumer如何完成JoinGroup。
 
 
