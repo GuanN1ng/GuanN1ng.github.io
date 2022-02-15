@@ -107,49 +107,6 @@ addFetcherForPartitions()的主要作用是**完成同步线程ReplicaFetcherThr
 |replica.fetch.response.max.bytes| fetch响应返回的最大字节数，**并不绝对**，若拉取的第一条消息大于该值但小于message.max.bytes (broker config) or max.message.bytes (topic config)，仍然会返回 |10 * 1024 * 1024|
 
 
-
-# 初始化同步信息-PartitionFetchState
-
-创建完线程后，会调用addPartitionsToFetcherThread()方法，该方法又调用AbstractFetcherThread#addPartitions()方法为线程添加分区同步信息，方法源码如下：
-
-```
-  def addPartitions(initialFetchStates: Map[TopicPartition, InitialFetchState]): Set[TopicPartition] = {
-    partitionMapLock.lockInterruptibly()
-    try {
-      //从同步失败集合中移除分区
-      failedPartitions.removeAll(initialFetchStates.keySet)
-      //遍历集合
-      initialFetchStates.forKeyValue { (tp, initialFetchState) =>
-        //获取该分区当前同步状态
-        val currentState = partitionStates.stateValue(tp)
-        //根据当前状态和提供的initialFetchState获取有效的同步状态
-        val updatedState = partitionFetchState(tp, initialFetchState, currentState)
-        //将该分区放到同步信息集合末尾 LinkedHashMap
-        partitionStates.updateAndMoveToEnd(tp, updatedState)
-      }
-      //唤醒所有等待线程
-      partitionMapCond.signalAll()
-      initialFetchStates.keySet
-    } finally partitionMapLock.unlock()
-  }
-```
-
-addPartitions()方法会为待同步分区完成同步状态初始化，其过程如下：
-
-* 将待同步分区从同步失败分区集合中删除；
-* 调用partitionFetchState()方法为所有分区构建同步状态并更新同步状态至同步列表队尾(LinkedHashMap)；
-* 唤醒所有等待状态中的同步线程；
-
-partitionFetchState()方法会根据分区当前状态和提供的initialFetchState创建有效的同步状态，实现如下：
-
-```
-
-```
-
-
-
-
-
 # 线程任务-doWork
 
 完成ReplicaFetcherThread创建并启动后，开始执行副本同步任务，ReplicaFetcherThread#doWork()方法源码如下：
