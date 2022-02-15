@@ -1,6 +1,6 @@
 ---
 layout: post 
-title:  Kafka Broker 概述
+title:  Kafka Broker 启动与停止
 date:   2021-10-15 16:21:59 
 categories: Kafka
 ---

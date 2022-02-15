@@ -44,7 +44,7 @@ fetchMessages()方法实现如下：
     def readFromLog(): Seq[(TopicIdPartition, LogReadResult)] = {
       //日志读取
       val result = readFromLocalLog( replicaId = replicaId, fetchOnlyFromLeader = fetchOnlyFromLeader, fetchIsolation = fetchIsolation, fetchMaxBytes = fetchMaxBytes, hardMaxBytesLimit = hardMaxBytesLimit, readPartitionInfo = fetchInfos, quota = quota, clientMetadata = clientMetadata)
-      //更新同步请求进度  
+      //更新follower同步请求进度  
       if (isFromFollower) updateFollowerFetchState(replicaId, result)
       else result
     }
