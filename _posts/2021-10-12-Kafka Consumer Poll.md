@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  Kafka Poll
+title:  Kafka Consumer Poll
 date:   2021-10-12 17:18:31
 categories: Kafka
 ---

@@ -4,19 +4,14 @@ title:  Kafka 消息日志读取-HandleFetchRequest
 date:   2021-11-30 23:25:10
 categories: Kafka
 ---
-## handleFetchRequest
 
-Broker端处理FetchRequest的入口为KafkaApis#handleFetchRequest方法，相关方法调用链为：
+[Kafka Consumer Poll](https://guann1ng.github.io/kafka/2021/10/12/Kafka-Consumer-Poll/) 中分析了KafkaConsumer向Broker发送FetchRequest请求拉取消息并对响应进行处理的源码，本篇内容
+将继续Broker端处理FetchRequest的源码分析。
 
-* KafkaApis#handleFetchRequest
-* ReplicaManager#fetchMessages
-* Partition#readRecords
-* LocalLog#read
-* LogSegment#read
+Broker端处理FetchRequest的入口为KafkaApis#handleFetchRequest方法，KafkaApis#handleFetchRequest()中更多的逻辑是参数验证及响应定义，其中消息日志的读取通过调用
+ReplicaManager#fetchMessages()方法完成。
 
-KafkaApis#handleFetchRequest()中更多的逻辑是参数验证及响应定义，下面从ReplicaManager#fetchMessages()方法开始分析。
-
-### ReplicaManager#fetchMessages
+# ReplicaManager#fetchMessages
 
 fetchMessages()方法实现如下：
 
@@ -29,13 +24,13 @@ fetchMessages()方法实现如下：
     //消费者拉取消息请求 
     val isFromConsumer = !(isFromFollower || replicaId == Request.FutureLocalReplicaId)
     
-    //
+    //消息拉取上限
     val fetchIsolation = if (!isFromConsumer)
-      FetchLogEnd //同步请求，上限为log结尾
+      FetchLogEnd //副本同步请求，上限为log结尾
     else if (isolationLevel == IsolationLevel.READ_COMMITTED)
-      FetchTxnCommitted  //  consumer隔离级别READ_COMMITTED 消息读取位置上限为LOS
+      FetchTxnCommitted  //  consumer隔离级别READ_COMMITTED 
     else
-      FetchHighWatermark   
+      FetchHighWatermark   //读未提交  上限为HW
 
     //判断是否必须从leader副本拉取数据  follower副本的同步请求必须从leader副本读取，consumer2.4后支持从follower副本拉取
     val fetchOnlyFromLeader = isFromFollower || (isFromConsumer && clientMetadata.isEmpty)
@@ -48,7 +43,7 @@ fetchMessages()方法实现如下：
       if (isFromFollower) updateFollowerFetchState(replicaId, result)
       else result
     }
-    //执行
+    //执行消息日志读取
     val logReadResults = readFromLog()
 
     // check if this fetch request can be satisfied right away
@@ -97,7 +92,7 @@ fetchMessages()方法执行流程如下：
 * 调用readFromLocalLog()方法读取消息；
 * 判断是否立即返回，否则通过延时操作延时返回。
 
-#### readFromLocalLog
+## readFromLocalLog
 
 readFromLocalLog()方法可分为两部分内容：
 * read()方法定义；
@@ -130,7 +125,7 @@ readFromLocalLog()方法可分为两部分内容：
   }
 ```
 
-##### read
+### read
 
 read()方法源码如下：
 
@@ -203,7 +198,7 @@ read()方法源码如下：
 read()方法主要是调用Partition#readRecords()方法读取数据，并将读取结果封装为LogReadResult返回。进行分区消息读取前，还会**调用findPreferredReadReplica()方法判断是否有更适合当前consumer读取消息的分区，即PreferredReadReplica**，
 若获取到PreferredReadReplica，则直接返回，下一次KafkaConsumer调用poll()方法拉取消息，则会发送Fetch请求至PreferredReadReplica。
 
-##### findPreferredReadReplica
+### findPreferredReadReplica
 
 findPreferredReadReplica()实现如下：
 
@@ -293,7 +288,7 @@ static Comparator<ReplicaView> comparator() {
 
 可以看到PreferredReadReplica的获取**依赖于机架信息的配置**，KafkaConsumer端的配置为`client.rack`，Broker机架配置项为`broker.rack`。
 
-### Partition#readRecords
+# Partition#readRecords
 
 完成待读取的TopicPartition的副本选择后，即可执行消息读取的下一阶段：调用Partition#readRecords()方法，源码如下：
 
@@ -326,7 +321,7 @@ static Comparator<ReplicaView> comparator() {
   }
 ```
 
-### LocalLog#read
+# LocalLog#read
 
 LocalLog是消息日志的抽象，每个LocalLog对象相应的也管理者一个或多个LogSegment，read()方法源码如下：
 
@@ -394,7 +389,7 @@ read()方法核心功能有两点：
 * 根据Fetch请求的startOffset获取相应的LogSegment对象，确认offset有效后，调用LogSegment#read()方法读取消息；
 * 若KafkaConsumer的事务隔离级别为READ_COMMIT，调用addAbortedTransactions()方法将读取消息范围内的中止的事务信息添加到读取结果中一起返回给consumer。
 
-#### addAbortedTransactions
+## addAbortedTransactions
 
 添加中止事务信息的源码实现如下：
 
@@ -512,7 +507,7 @@ LogSegment#read()方法的主要功能是进行文件读取，主要分为两步
   }
 ```
 
-#### LogSegment#translateOffset
+## LogSegment#translateOffset
 
 因为消息日志的偏移量索引是**稀疏索引**，所以根据offset获取相应的物理文件位置分为两步：
 
@@ -566,7 +561,7 @@ Broker将日志偏移量索引文件映射到内存中进行二分查找，并�
 
 
 
-##### FileRecords#searchForOffsetWithSize
+### FileRecords#searchForOffsetWithSize
 
 searchForOffsetWithSize()方法将**通过偏移量索引指向的物理位置向后遍历查找**，直至找到targetOffset的准确物理位置信息。
 
@@ -585,7 +580,7 @@ public LogOffsetPosition searchForOffsetWithSize(long targetOffset, int starting
 
 
 
-#### FileRecords#slice
+## FileRecords#slice
 
 文件IO实现如下：
 
