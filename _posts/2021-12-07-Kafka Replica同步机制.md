@@ -10,18 +10,18 @@ FetchRequest获取最新的消息并写入本地副本日志中，保证数据�
 
 # 概念
 
-* AR：TopicPartition的所有Replica(All Replica);
-* ISR：与leader副本**保持一定程度同步**的副本(包括leader副本在内)组成的副本集合即ISR(In-Sync Replicas);
-* OSR：于leader副本同步滞后过多的副本组成的副本集合即OSR(Out-of-Sync Replicas）。
-
-即 AR=ISR+OSR。
-
 * LogStartOffset：当前日志文件中第一条消息的offset;
 * LEO：LEO是Log End Offset缩写，它标识当前日志文件中下一条待写入消息offset；
-* HW：HW是High Watermark缩写，消费者客户端只能拉取到这个offset前的消息；
+* HW：HW是High Watermark缩写，表示消费者客户端只能拉取到这个offset前的消息，ISR集合中最小的LEO；
 
 ![日志偏移量含义](https://raw.githubusercontent.com/GuanN1ng/diagrams/main/com.guann1n9.diagrams/kakfa/hw%26leo.png)
 
+
+* AR：TopicPartition的所有Replica(All Replica);
+* ISR：与leader副本**保持一定程度同步**的副本(包括leader副本在内)组成的副本集合即ISR(In-Sync Replicas)，ISR集合内的follower副本与leader副本的HW值一致，客户端消息写入时，只有ISR集合内的所有副本均完成写入，该消息才算被提交;
+* OSR：于leader副本同步滞后过多(replica.lag.time.max.ms)的副本组成的副本集合即OSR(Out-of-Sync Replicas）。
+
+即 AR=ISR+OSR。
 
 # 副本同步
 
@@ -314,7 +314,7 @@ logAppendInfoOpt.foreach { logAppendInfo =>
 * 调用processPartitionData()方法完成响应的数据处理；
 * 更新副本同步状态；
 
-#### processPartitionData
+##### processPartitionData
 
 processPartitionData()源码如下：
 
@@ -361,8 +361,74 @@ processPartitionData()源码如下：
 该方法主要是将拉取的消息追加到本地日志中，并完成LEO、HW及LSO(follower副本无需保存实际的logSegment的base offset and physical position)的更新。
 
 
+## OFFSET_OUT_OF_RANGE异常
 
+负责处理OFFSET_OUT_OF_RANGE异常的方法是AbstractFetcherThread#handleOutOfRangeError()，源码如下：
 
+```
+  private def handleOutOfRangeError(topicPartition: TopicPartition,
+                                    fetchState: PartitionFetchState,
+                                    requestEpoch: Optional[Integer]): Boolean = {
+    try {
+      //处理异常，并创建新的同步状态
+      val newFetchState = fetchOffsetAndTruncate(topicPartition, fetchState.topicId, fetchState.currentLeaderEpoch)
+      //更新同步状态
+      partitionStates.updateAndMoveToEnd(topicPartition, newFetchState)
+      false
+    } catch {
+      ...//error
+    }
+  }
+```
 
+fetchOffsetAndTruncate()方法源码如下：
 
+```
+  protected def fetchOffsetAndTruncate(topicPartition: TopicPartition, topicId: Option[Uuid], currentLeaderEpoch: Int): PartitionFetchState = {
+    //本地副本的LEO
+    val replicaEndOffset = logEndOffset(topicPartition)
+
+    //向leader replica发送ListOffsetsRequest(timeStamp=ListOffsetsRequest.LATEST_TIMESTAMP)请求，
+    //获取leader副本的LEO
+    val leaderEndOffset = fetchLatestOffsetFromLeader(topicPartition, currentLeaderEpoch)
+
+    if (leaderEndOffset < replicaEndOffset) {
+      //leader副本的LEO小于本地副本的LEO
+      //截断日志 ends with the greatest offset < leaderEndOffset.
+      truncate(topicPartition, OffsetTruncationState(leaderEndOffset, truncationCompleted = true))
+
+      fetcherLagStats.getAndMaybePut(topicPartition).lag = 0
+      PartitionFetchState(topicId, leaderEndOffset, Some(0), currentLeaderEpoch,
+        state = Fetching, lastFetchedEpoch = latestEpoch(topicPartition))
+    } else {
+   
+      //向leader replica发送ListOffsetsRequest(timeStamp=ListOffsetsRequest.EARLIEST_TIMESTAMP)请求，
+      //获取leader副本的最小日志偏移量
+      val leaderStartOffset = fetchEarliestOffsetFromLeader(topicPartition, currentLeaderEpoch)
+      //取当前副本LEO与leader副本最小日志偏移量的最大值
+      val offsetToFetch = Math.max(leaderStartOffset, replicaEndOffset)
+      // Only truncate log when current leader's log start offset is greater than follower's log end offset.
+      if (leaderStartOffset > replicaEndOffset) {
+        //删除日志中的所有数据并从leaderStartOffset开始同步
+        truncateFullyAndStartAt(topicPartition, leaderStartOffset)
+      }
+
+      val initialLag = leaderEndOffset - offsetToFetch
+      fetcherLagStats.getAndMaybePut(topicPartition).lag = initialLag
+      PartitionFetchState(topicId, offsetToFetch, Some(initialLag), currentLeaderEpoch,
+        state = Fetching, lastFetchedEpoch = latestEpoch(topicPartition))
+    }
+  }
+```
+
+出现OFFSET_OUT_OF_RANGE异常的情况共有三种：
+
+* **follower副本的LEO超过leader副本的LEO**：当配置`unclean.leader.election.enable`为true，表示启用副本leader的unclean election，即允许OSR集合中的副本当选为leader，此时若一个follower宕机，同时leader在不断追加消息，follower重启后，在它完全赶上leader的LEO之前，ISR中的所有副本都关闭了,则该follower被选举为新的Leader，
+  并开始写入来自客户端的消息。old leader重启后，成为follower，此时可能会发现当前leader的LEO落后于自己的LEO，副本同步发生OFFSET_OUT_OF_RANGE异常，**此时需要对本地日志进行截断操作，将offset大于等于leaderEndOffset的数据和索引删除**。
+
+* **follower副本的LEO小于leader副本的最小的offset**：即follower副本下线时间过长，重启后其LEO已经小于了leaderStartOffset(Leader副本已删除旧的日志，可配置)，
+此时**调用truncateFullyAndStartAt()方法将该log的数据全部清空,创建新的LogSegment并从leaderStartOffset开始进行副本同步**;
+
+* unclean leader election(脏选举发生)时，如果old leader的HW大于new leader的LEO，当old leader将其偏移量截断到其HW并开始从new leader同步消息时，将抛出OffsetOutOfRangeException，fetchOffsetAndTruncate()方法处理过程中，new leader持续写入数据,即会出现leader LEO大于Follower LEO的情况。
+此时，**kafka不做任何处理，下次重试即可恢复正常，但会出现数据不一致问题**，需用户自行关注。
 
