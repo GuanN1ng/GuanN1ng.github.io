@@ -131,10 +131,11 @@ read()方法源码如下：
 
 ```
   def read(tp: TopicIdPartition, fetchInfo: PartitionData, limitBytes: Int, minOneMessage: Boolean): LogReadResult = {
+   //日志读取的起始偏移量
     val offset = fetchInfo.fetchOffset
     val partitionFetchSize = fetchInfo.maxBytes
     val followerLogStartOffset = fetchInfo.logStartOffset
-
+    //最多可读字节数
     val adjustedMaxBytes = math.min(fetchInfo.maxBytes, limitBytes)
     try {
       
@@ -171,8 +172,10 @@ read()方法源码如下：
           minOneMessage = minOneMessage)
 
         val fetchDataInfo = if (shouldLeaderThrottle(quota, partition, replicaId)) {
+          //分区被限流 返回空集
           FetchDataInfo(readInfo.fetchedData.fetchOffsetMetadata, MemoryRecords.EMPTY)
         } else if (!hardMaxBytesLimit && readInfo.fetchedData.firstEntryIncomplete) {
+          //低版本，不返回RecordTooLargeException
           FetchDataInfo(readInfo.fetchedData.fetchOffsetMetadata, MemoryRecords.EMPTY)
         } else {
           readInfo.fetchedData
@@ -219,12 +222,11 @@ findPreferredReadReplica()实现如下：
         None
       else {
         replicaSelectorOpt.flatMap { replicaSelector =>
-          //可用的ISR副本节点
           val replicaEndpoints = metadataCache.getPartitionReplicaEndpoints(partition.topicPartition, new ListenerName(clientMetadata.listenerName))
-          //获取可供读取的副本集合
+          //遍历所有远程副本
           val replicaInfos = partition.remoteReplicas
             // Exclude replicas that don't have the requested offset (whether or not if they're in the ISR)
-            //follower副本日志位移小于consumer消费进度
+            //follower副本日志的LEO大于consumer的fetchOffset and  LSO小于consumer的fetchOffset  保证可读
             .filter(replica => replica.logEndOffset >= fetchOffset && replica.logStartOffset <= fetchOffset)
             .map(replica => new DefaultReplicaView(
               replicaEndpoints.getOrElse(replica.brokerId, Node.noNode()),
@@ -249,6 +251,10 @@ findPreferredReadReplica()实现如下：
     }
   }
 ```
+findPreferredReadReplica()方法过滤出leader节点缓存的所有可读取(LEO>FetchOffset && LSO(logStartOffset<FetchOffset)的远程副本，并与leader副本构成可选集，调用
+**RackAwareReplicaSelector#select()**方法完成副本选择。
+
+#### Consumer最优读取副本选择
 
 select()方法实现如下：
 
@@ -259,7 +265,7 @@ public Optional<ReplicaView> select(TopicPartition topicPartition,
     //kafkaConsuemr发送的消息携带了机架信息                                
     if (clientMetadata.rackId() != null && !clientMetadata.rackId().isEmpty()) {
         Set<ReplicaView> sameRackReplicas = partitionView.replicas().stream()
-                
+                //过滤机架信息相同的副本
                 .filter(replicaInfo -> clientMetadata.rackId().equals(replicaInfo.endpoint().rack()))
                 .collect(Collectors.toSet());
         if (sameRackReplicas.isEmpty()) {
@@ -286,7 +292,7 @@ static Comparator<ReplicaView> comparator() {
 }
 ```
 
-可以看到PreferredReadReplica的获取**依赖于机架信息的配置**，KafkaConsumer端的配置为`client.rack`，Broker机架配置项为`broker.rack`。
+可以看到PreferredReadReplica的获取**依赖于机架信息的配置**，KafkaConsumer端的配置为`client.rack`，Broker机架配置项为`broker.rack`,若在同一机架有多个副本，按照LEO、上次同步时间timeSinceLastCaughtUpMs以及brokerId排序获取。
 
 # Partition#readRecords
 
@@ -328,6 +334,21 @@ LocalLog是消息日志的抽象，每个LocalLog对象相应的也管理者一�
 ```
   def read(startOffset: Long,
            maxLength: Int,
+           isolation: FetchIsolation,
+           minOneMessage: Boolean): FetchDataInfo = {
+    checkLogStartOffset(startOffset)
+    //隔离级别
+    val maxOffsetMetadata = isolation match {
+      case FetchLogEnd => localLog.logEndOffsetMetadata //副本同步
+      case FetchHighWatermark => fetchHighWatermarkMetadata  //读未提交
+      case FetchTxnCommitted => fetchLastStableOffsetMetadata //读已提交
+    }
+    localLog.read(startOffset, maxLength, minOneMessage, maxOffsetMetadata, isolation == FetchTxnCommitted)
+  }
+
+
+  def read(startOffset: Long,
+           maxLength: Int,
            minOneMessage: Boolean,
            maxOffsetMetadata: LogOffsetMetadata,
            includeAbortedTxns: Boolean): FetchDataInfo = {
@@ -340,17 +361,17 @@ LocalLog是消息日志的抽象，每个LocalLog对象相应的也管理者一�
       var segmentOpt = segments.floorSegment(startOffset)
 
       // return error on attempt to read beyond the log end offset
+      // startOffset > endOffset，脏选举可能出现
+      //segmentOpt.isEmpty  旧的日志已被删除
       if (startOffset > endOffset || segmentOpt.isEmpty)
         throw new OffsetOutOfRangeException(...)
-      //消息读取的起始offset验证
+      //隔离级别日志读取上限验证
       if (startOffset == maxOffsetMetadata.messageOffset)
         emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
       else if (startOffset > maxOffsetMetadata.messageOffset)
         emptyFetchDataInfo(convertToOffsetMetadataOrThrow(startOffset), includeAbortedTxns)
       else {
-        // Do the read on the segment with a base offset less than the target offset
-        // but if that segment doesn't contain any messages with an offset greater than that
-        // continue to read from successive segments until we get some messages or we reach the end of the log
+        //从基本偏移量小于目标偏移量的日志段开始读取，但如果该段不包含任何偏移量大于该偏移量的消息，则继续从后续日志段读取，直到收到一些消息或到达日志末尾
         var fetchDataInfo: FetchDataInfo = null
         while (fetchDataInfo == null && segmentOpt.isDefined) {
           val segment = segmentOpt.get
@@ -389,7 +410,7 @@ read()方法核心功能有两点：
 * 根据Fetch请求的startOffset获取相应的LogSegment对象，确认offset有效后，调用LogSegment#read()方法读取消息；
 * 若KafkaConsumer的事务隔离级别为READ_COMMIT，调用addAbortedTransactions()方法将读取消息范围内的中止的事务信息添加到读取结果中一起返回给consumer。
 
-## addAbortedTransactions
+## 读取事务状态信息
 
 添加中止事务信息的源码实现如下：
 
@@ -421,7 +442,7 @@ read()方法核心功能有两点：
 ```
 
 
-#### TransactionIndex#collectAbortedTxns
+### TransactionIndex#collectAbortedTxns
 
 中止事务信息的查找依赖于事务索引，索引存储在`offset.txnindex`形式的文件中。事务索引中维护关于对应LogSegment的中止事务的元数据，包括**中止事务的开始和结束偏移量以及中止时的最后一个LSO**。
 事务索引主要用于为在READ_COMMITTED隔离级别下的KafkaConsumer查找给定偏移量范围内的中止事务信息。
@@ -467,7 +488,7 @@ private[log] class AbortedTxn(val buffer: ByteBuffer) {
   }
 ```
 
-### LogSegment#read
+# LogSegment#read
 
 LogSegment#read()方法的主要功能是进行文件读取，主要分为两步：
 
@@ -523,7 +544,7 @@ LogSegment#read()方法的主要功能是进行文件读取，主要分为两步
   }
 ```
 
-##### OffsetIndex#lookup
+### offset索引查找
 
 Broker将日志偏移量索引文件映射到内存中进行二分查找，并读取出该位置索引的内容。
 
@@ -561,7 +582,7 @@ Broker将日志偏移量索引文件映射到内存中进行二分查找，并�
 
 
 
-### FileRecords#searchForOffsetWithSize
+### 文件物理获取
 
 searchForOffsetWithSize()方法将**通过偏移量索引指向的物理位置向后遍历查找**，直至找到targetOffset的准确物理位置信息。
 
