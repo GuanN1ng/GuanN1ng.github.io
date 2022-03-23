@@ -5,6 +5,8 @@ date:   2022-03-11 19:12:53
 categories: 全链路压测
 ---
 
+# 背景
+
 JDK中的java.lang.Thread类有两个Map结构的成员属性：threadLocals和inheritableThreadLocals，用于维护线程的本地变量，定义如下：
 
 ```
@@ -15,8 +17,8 @@ ThreadLocal.ThreadLocalMap threadLocals = null;
 ThreadLocal.ThreadLocalMap inheritableThreadLocals = null;
 ```
 
-其中inheritableThreadLocals通过java.lang.**InheritableThreadLocal**进行维护，即ThreadLocalMap中的key为InheritableThreadLocal对象。**用于父子线程间的线程变量传递**，
-当，实现如下：
+其中inheritableThreadLocals使用**java.lang.InheritableThreadLocal**进行维护，**用于完成父子线程间的线程变量传递**。当创建线程时，会将父线程的inheritableThreadLocals
+复制并赋值给新建线程的inheritableThreadLocals，完成变量传递(**此处为浅拷贝，可自行继承InheritableThreadLocal，重写childValue方法，实现深拷贝**)，实现如下：
 
 ```
 private void init(ThreadGroup g, Runnable target, String name, long stackSize, AccessControlContext acc, boolean inheritThreadLocals) {
@@ -30,4 +32,21 @@ private void init(ThreadGroup g, Runnable target, String name, long stackSize, A
     ...//other code
 }
 ```
+
+**父线程的inheritableThreadLocals仅在子线程第一次初始化时才会被复制到子线程中**，对于使用线程池的场景下，由于线程被复用，后续提交任务的线程的inheritableThreadLocals并不会被执行任务的线程所
+继承，若任务执行需要依赖inheritableThreadLocals中的对象，则会导致错乱。
+
+# TransmittableThreadLocal
+
+[TransmittableThreadLocal(TTL)](https://github.com/alibaba/transmittable-thread-local )是阿里开源的，用于解决异步执行时线程上下文传递问题的组件，在InheritableThreadLocal基础上，实现了线程复用场景下的线程变量传递功能。
+
+
+
+
+
+
+
+
+
+
 
