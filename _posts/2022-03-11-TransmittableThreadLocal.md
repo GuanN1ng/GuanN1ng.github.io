@@ -2,7 +2,7 @@
 layout: post
 title:  TransmittableThreadLocal
 date:   2022-03-11 19:12:53
-categories: 全链路压测
+categories: APM
 ---
 
 # 背景
@@ -38,7 +38,7 @@ private void init(ThreadGroup g, Runnable target, String name, long stackSize, A
 
 # TransmittableThreadLocal
 
-[TransmittableThreadLocal(TTL)](https://github.com/alibaba/transmittable-thread-local )是阿里开源的，用于解决异步执行时线程上下文传递问题的组件，在InheritableThreadLocal基础上，实现了线程复用场景下的线程变量传递功能。
+[TransmittableThreadLocal(TTL)](https://github.com/alibaba/transmittable-thread-local )是阿里开源的，用于解决异步执行时线程上下文传递问题的组件，在InheritableThreadLocal基础上，实现了线程复用(线程池)场景下的线程变量传递功能。
 
 
 
