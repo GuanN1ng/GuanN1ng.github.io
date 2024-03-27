@@ -1,6 +1,6 @@
 ---
 layout: post 
-title:  Java Agent机制
+title:  Java Agent
 date:   2022-03-05 21:26:20 
 categories: APM
 ---
@@ -14,8 +14,11 @@ JDK 1.5后引入了java.lang.instrument包，[官网文档](https://docs.oracle.
 
 ## Instrumentation
 
-Instrumentation是Java提供的基于JVMTI的接口，**JVMTI**(JVM Tool Interfac)是JVM暴露出来的一些**基于事件驱动**的供用户扩展的接口集合，通过Instrumentation中的相关API，
-用户能够查看并操作Java的类定义及添加jar文件至指定ClassLoader（BootstrapClassLoader或SystemClassLoader）的classpath下。主要API列表如下：
+Instrumentation是Java提供的基于JVMTI的接口，**JVMTI**(JVM Tool Interfac)是JVM暴露出来的一些**基于事件驱动**的供用户扩展的接口集合，Instrumentation中的API主要包含三部分功能：
+* 添加或移除ClassFileTransFormer；
+* 对已完成加载的类进行retransform或redefine；
+* 添加jar文件至指定ClassLoader（BootstrapClassLoader或SystemClassLoader）的classpath。
+主要API列表如下：
 
 ```java
     /**
@@ -97,61 +100,94 @@ ClassFileTransformer是一个接口类，只有一个方法transform， 通过In
 
 # Java Agent
 
-Java Agent一般以jar包的形式存在，主要包含两部分内容：实现代码和配置文件。实现代码主要包含JavaAgent的启动入口类、用户实现的ClassFileTransformer以及部分业务代码。
+Java Agent是指依赖Instrumentation机制实现的一个独立的jar包，主要包含两部分内容：实现代码和配置文件。实现代码主要包含JavaAgent的启动入口类、用户实现的ClassFileTransformer以及部分业务代码。
 配置文件是指位于Jar包META-INF目录下的MANIFEST.MF文件。
 
-## 启动类及启动方式
+## 启动方法及启动方式
 
-Java Agent被允许有两种启动类：premain及agentmain，
+Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。
 
+### premain
 
+当Java Agent是一个可执行的JAR文件，并**通过-javaagent参数被添加到目标应用的启动参数中时**，JVM会在执行目标应用jar文件的main方法执行之前调用探针的premain方法，执行完探针逻辑。premain的声明
+形式如下：
 
+```java
 
+public static void premain(String agentArgs, Instrumentation inst) {
+    // 在 premain 方法中执行 Java Agent 的逻辑
+    System.out.println("Java Agent premain method called");
+}
+```
 
+### agentmain 
 
+若目标应用已启动，则可通过在其他Java进程中调用固定的JAVA API为指定Java进程动态的添加（attach）探针。此时，JVM则会调用对应探针的agentmain方法来加载探针。agentmain的声明
+形式如下：
 
+```java
+public static void agentmain(String agentArgs, Instrumentation inst) {
+    // 在 agentmain 方法中执行 Java Agent 的逻辑
+    System.out.println("Java Agent agentmain method called");
+}
+```
+
+动态Attach探针的代码如下：
+```java
+public static void main(String[] args) throws Exception {
+    String pid = "1234"; // 目标 Java 进程的 PID
+    String agentPath = "/path/to/your/agent.jar"; // Java Agent JAR 文件的路径
+    VirtualMachine vm = VirtualMachine.attach(pid);
+    vm.loadAgent(agentPath, "argument to agentmain method");
+    vm.detach();
+}
+```
 
 ## MANIFEST.MF
 
-MANIFEST.MF文件中，和探针相关的配置如下：
-
-* Premain-Class：
-* Agentmain-Class：
-* Can-Redefine-Classes：
-* Can-Retransform-Classes：
-
-示例文件如下：
+Java Agent的jar包内需在 META-INF目录下创建MANIFEST.MF文件，其中需声明探针相关的配置，示例文件如下：
 
 ```
 Manifest-Version: 1.0
 Premain-Class: xxxx
 Agentmain-Class: xxxx
-Archiver-Version: Plexus Archiver
-Built-By: admin
 Can-Redefine-Classes: true
 Can-Retransform-Classes: true
 Created-By: Apache Maven 3.8.4
 Build-Jdk: 1.8.0_301
 ```
 
+* Premain-Class：premain方法所在的Class全路径
+* Agentmain-Class：agentmain方法所在的Class全路径，可与premain方法声明在同一个类中
+* Can-Redefine-Classes：声明Java Agent是否具有重新定义类（Redefine Classes）的能力
+* Can-Retransform-Classes：声明Java Agent是否具有重新转换类（Retransform Classes）的能力
+
 如使用maven打包，可在pom.xml中添加如下内容，自动生成MANIFEST.MF文件。
 
 ```
-<transformers>
-    <transformer
-            implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-        <manifestEntries>
-            <Premain-Class>${PremainClass}</Premain-Class>
-            <Agentmain-Class>${AgentmainClass}</Agentmain-Class>
-            <Can-Redefine-Classes>true</Can-Redefine-Classes>
-            <Can-Retransform-Classes>true</Can-Retransform-Classes>
-        </manifestEntries>
-    </transformer>
-</transformers>
+<configuration>
+    ...
+    <transformers>
+        <transformer
+                implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+            <manifestEntries>
+                <Premain-Class>${PremainClass}</Premain-Class>
+                <Agentmain-Class>${AgentmainClass}</Agentmain-Class>
+                <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                <Can-Retransform-Classes>true</Can-Retransform-Classes>
+            </manifestEntries>
+        </transformer>
+    </transformers>
+    ...
+</configuration>
 
 ```
 
+## ClassFileTransformer
 
-## 字节码修改类库
+
+常见的Java字节码级别操作的库有ASM、Byte Buddy和 Javassist，ASM提供了最底层的字节码操作能力，而Byte Buddy和Javassist则提供了更高级别的抽象和更方便的API。
+
+
 
 
