@@ -1,6 +1,6 @@
 ---
 layout: post 
-title:  Java Agent
+title:  Java Agent机制
 date:   2022-03-05 21:26:20 
 categories: APM
 ---
@@ -15,7 +15,8 @@ JDK 1.5后引入了java.lang.instrument包，[官网文档](https://docs.oracle.
 ## Instrumentation
 
 Instrumentation是Java提供的基于JVMTI的接口，**JVMTI**(JVM Tool Interfac)是JVM暴露出来的一些**基于事件驱动**的供用户扩展的接口集合，Instrumentation中的API主要包含三部分功能：
-* 添加或移除ClassFileTransFormer；
+* 添加或移除ClassFileTransFormer;
+  * addTransformer方法有一个重载方法，带有一个布尔类型的参数`canRetransform`。这个参数的含义是指是否对已加载的类调用该transformer进行重新转换;
 * 对已完成加载的类进行retransform或redefine；
 * 添加jar文件至指定ClassLoader（BootstrapClassLoader或SystemClassLoader）的classpath。
 主要API列表如下：
@@ -105,7 +106,8 @@ Java Agent是指依赖Instrumentation机制实现的一个独立的jar包，主�
 
 ## 启动方法及启动方式
 
-Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。
+Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。premain和agentmain方法最重要的功能是调用
+方法入参Instrumentation的addTransformer方法完成用户自定义的ClassFileTransformer的注册。
 
 ### premain
 
@@ -117,6 +119,7 @@ Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两�
 public static void premain(String agentArgs, Instrumentation inst) {
     // 在 premain 方法中执行 Java Agent 的逻辑
     System.out.println("Java Agent premain method called");
+    inst.addTransformer(/* 用户自定义classTransformer*/,true);
 }
 ```
 
@@ -129,6 +132,7 @@ public static void premain(String agentArgs, Instrumentation inst) {
 public static void agentmain(String agentArgs, Instrumentation inst) {
     // 在 agentmain 方法中执行 Java Agent 的逻辑
     System.out.println("Java Agent agentmain method called");
+    inst.addTransformer(/* 用户自定义classTransformer*/,false)
 }
 ```
 
@@ -184,6 +188,8 @@ Build-Jdk: 1.8.0_301
 ```
 
 ## ClassFileTransformer
+
+
 
 
 常见的Java字节码级别操作的库有ASM、Byte Buddy和 Javassist，ASM提供了最底层的字节码操作能力，而Byte Buddy和Javassist则提供了更高级别的抽象和更方便的API。
