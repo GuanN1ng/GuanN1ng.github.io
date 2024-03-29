@@ -86,7 +86,7 @@ Instrumentation中提供了两种对类定义进行修改的方式，retransform
 
 ## ClassFileTransformer
 
-ClassFileTransformer是一个接口类，只有一个方法transform， 通过Instrumentation#addTransformer注册ClassFileTransformer的实现类后，
+ClassFileTransformer是一个接口类，有一个默认方法transform， 通过Instrumentation#addTransformer注册ClassFileTransformer的实现类后，
 后续JVM运行中**当发生类加载、类重定义(redefined)、类转换(retransformed)的行为后，JVM会回调所有已注册的ClassFileTransformer的transform方法**，完成类修改动作。
 
 ```
@@ -106,7 +106,7 @@ Java Agent是指依赖Instrumentation机制实现的一个独立的jar包，主�
 
 ## 启动方法及启动方式
 
-Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。premain和agentmain方法最重要的功能是调用
+Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。premain和agentmain方法最重要的功能是通过
 方法入参Instrumentation的addTransformer方法完成用户自定义的ClassFileTransformer的注册。
 
 ### premain
@@ -189,10 +189,79 @@ Build-Jdk: 1.8.0_301
 
 ## ClassFileTransformer
 
+用户通过实现ClassFileTransformer接口，重写transform方法完成对class字节码的修改。transform方法声明如下：
+```
+    byte[]  //修改后的class字节码
+    transform(  
+                //当前class的classloader，若class由BootstrapClassLoader加载，则为null
+                ClassLoader         loader,
+                //class的全限定名，分隔符为"/"   例 java/util/List            
+                String              className,
+                //若本次调用是由class redefine触发的,则为重定义的类，否则为 null
+                Class<?>            classBeingRedefined,
+                //类的保护域
+                ProtectionDomain    protectionDomain,
+                //当前class的字节码
+                byte[]              classfileBuffer)
+        throws IllegalClassFormatException;
+```
 
+debug视图如下：
 
+![transform invoke](image%2Fclass_redefined.png)
 
 常见的Java字节码级别操作的库有ASM、Byte Buddy和 Javassist，ASM提供了最底层的字节码操作能力，而Byte Buddy和Javassist则提供了更高级别的抽象和更方便的API。
+有如下一段简单的代码：
+```
+package com.example.demo.config;
+
+public class AgentDemo {
+    
+    public void demo(){
+        System.out.println("biz code");
+    }
+}
+```
+下面分别使用ASM、Byte Buddy和 Javassist实现在demo方法中添加一行start和end的输出，修改后的class逻辑应如下：
+```
+package com.example.demo.config;
+
+public class AgentDemo {
+    
+    public void demo(){
+        System.out.println("start");
+        System.out.println("biz code");
+        System.out.println("end");
+    }
+}
+```
+
+### ASM
+
+ASM的maven依赖如下：
+
+```
+<dependency>
+    <groupId>org.ow2.asm</groupId>
+    <artifactId>asm</artifactId>
+    <version>9.3</version>
+</dependency>
+```
+
+方法实现如下：
+
+```
+
+
+```
+
+
+### Byte Buddy
+
+
+
+
+### Javassist
 
 
 
