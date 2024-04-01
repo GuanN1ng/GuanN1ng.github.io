@@ -238,8 +238,28 @@ public class AgentDemo {
 
 ### ASM
 
-ASM的maven依赖如下：
+ASM类库中的核心类主要有四个：
+* ClassReader：读取并解析ClassFile内容，针对遇到的每个字段、方法和字节码指令调用给定ClassVisitor的相应访问方法
+```
+#构造方法
+public ClassReader(byte[] classFile)
+public ClassReader(final String className)
 
+#注册ClassVisitor，后续ClassReader会调用ClassVisitor的相关方法
+public void accept(final ClassVisitor classVisitor, final int parsingOptions)
+```
+* ClassVisitor：抽象类，定义了一系列访问类数据的方法，由ClassReader调用，用户可继承ClassVisitor覆写其方法逻辑，以实现指定业务，如对方法进行修改，则需覆写visitMethod方法。
+```
+# 方法调用顺序
+visit [ visitSource ] [ visitModule ][ visitNestHost ][ visitOuterClass ] ( visitAnnotation | visitTypeAnnotation | visitAttribute )* ( visitNestMember | [ * visitPermittedSubclass ] | visitInnerClass | visitRecordComponent | visitField | visitMethod )* visitEnd
+```
+
+* MethodVisitor：封装了一系列用于生成或修改class方法的API，通过ClassVisitor#visitMethod方法获取，如visitInsn，访问方法的一条指令
+* ClassWriter：以二进制形式生成编译后的类，调用toByteArray方法来获取
+
+其余还有FieldVisitor、ModuleVisitor、AnnotationVisitor等，可自行了解。
+
+ASM maven依赖如下：
 ```
 <dependency>
     <groupId>org.ow2.asm</groupId>
@@ -248,7 +268,7 @@ ASM的maven依赖如下：
 </dependency>
 ```
 
-方法实现如下：
+代码功能实现：
 
 ```
 
