@@ -271,6 +271,13 @@ ASM maven依赖如下：
 代码功能实现：
 
 ```
+//1、实现 ClassFileTransformer类，通过transform方法获取className 或 byte[] classfileBuffer
+
+//2、创建ClassReader，并注册自定义 ClassVisitor
+
+//3、获取MethodVisitor，对方法进行修改
+
+//4、返回修改后的class字节数组
 
 
 ```
