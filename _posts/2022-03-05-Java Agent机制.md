@@ -271,24 +271,73 @@ ASM maven依赖如下：
 代码功能实现：
 
 ```
-//1、实现 ClassFileTransformer类，通过transform方法获取className 或 byte[] classfileBuffer
+//实现ClassFileTransformer 
+//修改 com.example.demo.config.AgentDemo#demo方法
+public class AsmClassTransformer implements ClassFileTransformer {
+    
+    @Override
+    public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
+        String classReference = className.replace("/", ".");
+        if(!"com.example.demo.config.AgentDemo".equals(classReference)){
+            //非目标类，返回
+            return classfileBuffer;
+        }
+        //构建ClassReader   ClassWriter
+        ClassReader classReader = new ClassReader(classfileBuffer);
+        ClassWriter classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        //注册ClassVisitor
+        classReader.accept(new AsmMethodVisitor(Opcodes.ASM8,classWriter), ClassReader.EXPAND_FRAMES);
+        return classWriter.toByteArray();
+    }
+    
+    public class AsmMethodVisitor extends ClassVisitor {
 
-//2、创建ClassReader，并注册自定义 ClassVisitor
+        public AsmMethodVisitor(int api, ClassVisitor classVisitor) {
+            super(api, classVisitor);
+        }
 
-//3、获取MethodVisitor，对方法进行修改
+        @Override
+        public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+            //获取mv
+            MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+            if(!"demo".equals(name)){
+                //非目标方法，返回
+                return mv;
+            }
+            //修改方法体
+            return new MethodVisitor(this.api, mv) {
+                //visitCode方法 进入方法时被调用
+                @Override
+                public void visitCode() {
+                    mv.visitFieldInsn(Opcodes.GETSTATIC,"java/lang/System","out","Ljava/io/PrintStream;");
+                    mv.visitLdcInsn("start");
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL,"java/io/PrintStream","println","(Ljava/lang/String;)V");
+                    super.visitCode();
+                }
 
-//4、返回修改后的class字节数组
-
-
+                @Override
+                public void visitInsn(int opcode) {
+                    //方法返回前修改
+                    if(opcode != Opcodes.ARETURN && opcode != Opcodes.RETURN ) {
+                        return;
+                    }
+                    mv.visitFieldInsn(Opcodes.GETSTATIC,"java/lang/System","out","Ljava/io/PrintStream;");
+                    mv.visitLdcInsn("end");
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL,"java/io/PrintStream","println","(Ljava/lang/String;)V");
+                    super.visitInsn(opcode);
+                }
+            };
+        }
+    }
+}
 ```
+
+### Javassist
+
+
 
 
 ### Byte Buddy
-
-
-
-
-### Javassist
 
 
 
