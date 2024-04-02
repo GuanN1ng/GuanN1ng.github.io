@@ -208,7 +208,7 @@ Build-Jdk: 1.8.0_301
 
 debug视图如下：
 
-![transform invoke](image%2Fclass_redefined.png)
+![transform invoke](https://raw.githubusercontent.com/GuanN1ng/GuanN1ng.github.io/main/_posts/image/class_redefined.png)
 
 常见的Java字节码级别操作的库有ASM、Byte Buddy和 Javassist，ASM提供了最底层的字节码操作能力，而Byte Buddy和Javassist则提供了更高级别的抽象和更方便的API。
 有如下一段简单的代码：
