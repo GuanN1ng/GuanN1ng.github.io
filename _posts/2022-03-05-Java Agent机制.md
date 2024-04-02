@@ -337,7 +337,47 @@ public class AsmClassTransformer implements ClassFileTransformer {
 
 ### Javassist
 
+Javassist是一个轻量级的Java字节码操作库，相比于ASM，主要优势在于其简单易用的API，但Javassist相对较慢的性能可能是其在某些场景下的劣势。核心代码介绍如下：
+* ClassPool：Javassist中用于存储和管理CtClass对象的容器。它提供了查找、创建、修改CtClass对象的方法；
+* CtClass：CtClass对象代表了一个Java类。通过类池（ClassPool）可获取CtClass对象，CtClass提供了一批访问class信息的API，如获取指定方法getDeclaredMethod；
+* CtMethod：标识Java类中的一个方法，通过`CtClass.getDeclaredMethod(methodName)`获取，提供了访问及修改方法的API；
+* CtField：标识Java类中的一个属性，通过`CtClass.getDeclaredField(fieldName)`获取，提供了访问及修改属性的API。
 
+代码功能实现如下：
+
+```
+public class JavasisstClassTransformer implements ClassFileTransformer {
+
+    private static final ClassPool  classPool = ClassPool.getDefault();
+
+    @Override
+    public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
+        String classReference = className.replace("/", ".");
+        if (!"com.example.demo.config.AgentDemo".equals(classReference)) {
+            //非目标类，返回
+            return classfileBuffer;
+        }
+        try {
+            //添加当前classLoader的classPath到ClassPool中，防止NotFoundException
+            classPool.appendClassPath(new LoaderClassPath(loader));
+            //获取目标类
+            CtClass ctClass = classPool.get(classReference);
+            //获取目标方法
+            CtMethod targetMethod = ctClass.getDeclaredMethod("demo");
+            //插入自定义代码
+            targetMethod.insertBefore("System.out.println(\"start\");");
+            targetMethod.insertAfter("System.out.println(\"end\");");
+            byte[] bytecode = ctClass.toBytecode();
+            //Removes this CtClass object from the ClassPool. After this method is called, any method cannot be called on the removed CtClass object
+            //接触class冻结
+            ctClass.detach();
+            return bytecode;
+        } catch (Exception e) {
+            return classfileBuffer;
+        }
+    }
+}
+```
 
 
 ### Byte Buddy
