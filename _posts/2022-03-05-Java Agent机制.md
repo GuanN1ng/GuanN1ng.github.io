@@ -343,6 +343,16 @@ Javassist是一个轻量级的Java字节码操作库，相比于ASM，主要优�
 * CtMethod：标识Java类中的一个方法，通过`CtClass.getDeclaredMethod(methodName)`获取，提供了访问及修改方法的API；
 * CtField：标识Java类中的一个属性，通过`CtClass.getDeclaredField(fieldName)`获取，提供了访问及修改属性的API。
 
+maven依赖为：
+
+```
+<dependency>
+    <groupId>javassist</groupId>
+    <artifactId>javassist</artifactId>
+    <version>3.12.1.GA</version>
+</dependency>
+```
+
 代码功能实现如下：
 
 ```
