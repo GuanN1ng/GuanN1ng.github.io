@@ -392,7 +392,7 @@ public class JavasisstClassTransformer implements ClassFileTransformer {
 
 ### Byte Buddy
 
-Byte Buddy提供了两种层面的类增强方式：
+Byte Buddy提供了两种增强方式：
 * 方法代理，即为每个目标方法增强都会生成一个新的代理类，通过代理类实现对目标方法增强，skywalking即使用此种增强；
 * 修改Class字节码，直接修改原有Class的字节码，不会生成新的代理类，OpenTelemetry使用此种方式。
 
@@ -526,3 +526,4 @@ com.example.demo.config.AgentDemo
 
 AgentDemo的反编译代码如下：
 
+![byte buddy字节码修改](https://raw.githubusercontent.com/GuanN1ng/GuanN1ng.github.io/main/_posts/image/byte%20buddy%E5%AD%97%E8%8A%82%E7%A0%81.png)
