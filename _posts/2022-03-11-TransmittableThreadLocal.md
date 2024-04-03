@@ -40,6 +40,35 @@ private void init(ThreadGroup g, Runnable target, String name, long stackSize, A
 
 [TransmittableThreadLocal(TTL)](https://github.com/alibaba/transmittable-thread-local )是阿里开源的，用于解决异步执行时线程上下文传递问题的组件，在InheritableThreadLocal基础上，实现了线程复用(线程池)场景下的线程变量传递功能。
 
+## 使用
+
+TTL的使用方式大致可分为两种：编码时直接使用TTL的API和javaagent方式，采用javaagent方式时，无需对项目代码进行修改，TTL Agent会自动增强相关目标类，具体可从`com.alibaba.ttl.threadpool.agent.TtlAgent#premain`方法进行源码阅读，
+且类增强的工具类库为Javassist（探针工作逻辑可见[Java Agent机制](https://guann1ng.github.io/apm/2022/03/05/Java-Agent%E6%9C%BA%E5%88%B6/)）。
+
+### 原生API
+
+使用原生API时，首先需在项目中添加依赖，maven依赖如下：
+
+```
+<dependency>
+    <groupId>com.alibaba</groupId>
+    <artifactId>transmittable-thread-local</artifactId>
+    <version>2.14.5</version>
+</dependency>
+```
+
+
+
+
+
+
+
+### Java Agent
+
+
+
+## 实现原理
+
 
 
 
