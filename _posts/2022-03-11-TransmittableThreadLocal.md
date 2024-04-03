@@ -43,7 +43,7 @@ private void init(ThreadGroup g, Runnable target, String name, long stackSize, A
 ## 使用
 
 TTL的使用方式大致可分为两种：编码时直接使用TTL的API和javaagent方式，采用javaagent方式时，无需对项目代码进行修改，TTL Agent会自动增强相关目标类，具体可从`com.alibaba.ttl.threadpool.agent.TtlAgent#premain`方法进行源码阅读，
-且类增强的工具类库为Javassist（探针工作逻辑可见[Java Agent机制](https://guann1ng.github.io/apm/2022/03/05/Java-Agent%E6%9C%BA%E5%88%B6/)）。
+类增强使用的工具类库为Javassist（探针工作逻辑可见[Java Agent机制](https://guann1ng.github.io/apm/2022/03/05/Java-Agent%E6%9C%BA%E5%88%B6/)）。
 
 ### 原生API
 
@@ -82,6 +82,7 @@ executorService = TtlExecutors.getTtlExecutorService(executorService);
 的顺序调整至第一个。防止因类已被加载导致的遗漏。
 
 ## 实现原理
+
 
 
 
