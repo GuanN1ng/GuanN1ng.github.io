@@ -104,7 +104,7 @@ ClassFileTransformer是一个接口类，有一个默认方法transform， 通�
 Java Agent是指依赖Instrumentation机制实现的一个独立的jar包，主要包含两部分内容：实现代码和配置文件。实现代码主要包含JavaAgent的启动入口类、用户实现的ClassFileTransformer以及部分业务代码。
 配置文件是指位于Jar包META-INF目录下的MANIFEST.MF文件。
 
-## 启动方法及启动方式
+## 启动方式
 
 Java Agent的启动类一般需声明两个方法：premain 和 agentmain，两种方法分别对应着探针的两种启动方式，通过命令行加载（-javaagent） 和 通过JAVA API动态加载。premain和agentmain方法最重要的功能是通过
 方法入参Instrumentation的addTransformer方法完成用户自定义的ClassFileTransformer的注册。
@@ -379,7 +379,7 @@ public class JavasisstClassTransformer implements ClassFileTransformer {
             targetMethod.insertAfter("System.out.println(\"end\");");
             byte[] bytecode = ctClass.toBytecode();
             //Removes this CtClass object from the ClassPool. After this method is called, any method cannot be called on the removed CtClass object
-            //接触class冻结
+            //解除class冻结
             ctClass.detach();
             return bytecode;
         } catch (Exception e) {
@@ -392,6 +392,79 @@ public class JavasisstClassTransformer implements ClassFileTransformer {
 
 ### Byte Buddy
 
+Byte Buddy提供了两种层面的类增强方式：
+* 方法代理，即为每个目标方法增强都会生成一个新的代理类，通过代理类实现对目标方法增强，skywalking即使用此种增强；
+* 修改Class字节码，直接修改原有Class的字节码，不会生成新的代理类，OpenTelemetry使用此种方式。
+
+maven依赖
+
+```
+<dependency>
+    <groupId>net.bytebuddy</groupId>
+    <artifactId>byte-buddy</artifactId>
+    <version>1.14.13</version>
+</dependency>
+```
+
+#### 方法代理
+
+1、创建一个拦截器，用于增强目标方法。
+
+```
+public class ByteBuddyInterceptor {
+    
+    @RuntimeType
+    public static Object intercept(@This Object target,    // 当前拦截的目标对象{this}
+                                   @AllArguments Object[] allArguments,   // 方法入参
+                                   @SuperCall Callable<?> superCall,      // 代理对象
+                                   @Origin Method method                  // 当前拦截的目标方法
+    ) throws Throwable {
+        //目标方法前置逻辑
+        System.out.println("end");
+        //调用目标方法
+        Object result = superCall.call();
+        //目标方法后置处理
+        System.out.println("end");
+        return result;
+    }
+}
+```
 
 
+2、使用Byte Buddy API进行增强
+
+```
+public static void premain(String agentArgs, Instrumentation inst) {
+
+  new AgentBuilder.Default()
+      // 增强的类
+      .type(ElementMatchers.named("com.example.demo.config.AgentDemo"))
+      // 增强的类需 增强的方法实现
+      .transform(new AgentBuilder.Transformer() {
+          public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
+                                                  ClassLoader classLoader, JavaModule module, ProtectionDomain protectionDomain) {
+              // 增强方法demo
+              return builder.method(ElementMatchers.named("demo"))
+                      // 设置拦截器
+                      .intercept(MethodDelegation.to(ByteBuddyInterceptor.class));
+          }
+      })
+      // 监听类加载
+      .installOn(inst);
+}
+```
+
+执行arthas sc命令后，可以看到，生成了新的代理类；
+```
+[arthas@38800]$ sc *AgentDemo*
+com.example.demo.config.AgentDemo
+com.example.demo.config.AgentDemo$auxiliary$EaV0UxCt
+```
+
+AgentDemo的反编译代码如下，demo方法内部被修改为通过预定义的拦截器去调用代理类的call方法。
+
+![byte buddy 方法代理]()
+
+
+#### 字节码修改
 
