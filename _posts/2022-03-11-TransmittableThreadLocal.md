@@ -57,10 +57,24 @@ TTL的使用方式大致可分为两种：编码时直接使用TTL的API和javaa
 </dependency>
 ```
 
+* 直接使用TransmittableThreadLocal，若项目中有使用ThreadLocal,且需在父子线程间传递变量，可直接替换成 `new TransmittableThreadLocal<>()`;
+* 线程池时有两种方式：
+  * 修饰Runnable和Callable
+  
+    ```
+    Runnable task = new RunnableTask();
+    //即使是同一个Runnable任务多次提交到线程池时，每次提交时都需要通过修饰操作
+    Runnable ttlRunnable = TtlRunnable.get(task);
+    executorService.submit(ttlRunnable);
+    ```
+    
+  * 修饰线程池
 
-
-
-
+    ```
+    ExecutorService executorService = new ThreadPoolExecutor(...); 
+    // 额外的处理，生成修饰了的对象executorService,此种方式 无需再对任务进行修饰
+    executorService = TtlExecutors.getTtlExecutorService(executorService);
+    ```
 
 
 ### Java Agent
