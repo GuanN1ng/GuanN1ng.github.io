@@ -421,7 +421,7 @@ public class ByteBuddyInterceptor {
     ) throws Throwable {
         //目标方法前置逻辑
         System.out.println("end");
-        //调用目标方法
+        //调用目标业务方法
         Object result = superCall.call();
         //目标方法后置处理
         System.out.println("end");
@@ -445,7 +445,7 @@ public static void premain(String agentArgs, Instrumentation inst) {
                                                   ClassLoader classLoader, JavaModule module, ProtectionDomain protectionDomain) {
               // 增强方法demo
               return builder.method(ElementMatchers.named("demo"))
-                      // 设置拦截器
+                      // 设置方法代理拦截器 MethodDelegation
                       .intercept(MethodDelegation.to(ByteBuddyInterceptor.class));
           }
       })
@@ -454,7 +454,7 @@ public static void premain(String agentArgs, Instrumentation inst) {
 }
 ```
 
-执行arthas sc命令后，可以看到，生成了新的代理类；
+执行arthas sc命令后，可以看到，生成了新的代理类。
 ```
 [arthas@38800]$ sc *AgentDemo*
 com.example.demo.config.AgentDemo
@@ -467,4 +467,62 @@ AgentDemo的反编译代码如下，demo方法内部被修改为通过预定义�
 
 
 #### 字节码修改
+
+1、创建一个拦截器，用于增强目标方法。
+
+```
+public class ByteBuddyInterceptor {
+   
+    /**
+     * 方法运行前: 执行代码的片段, 必须是静态的方法
+     */
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter(@Advice.This Object that, // 当前实例
+                             @Advice.AllArguments Object[] args,   // 方法入参
+                             @Advice.Origin Method method    // 目标方法
+    ) {
+        System.out.println("start ");
+    }
+
+    /**
+     * 方法退出前, 代码执行片段, 必须是静态的方法
+     */
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.This Object that, // 当前实例
+                            @Advice.AllArguments Object[] args,   // 方法入参
+                            @Advice.Origin Method method,   // 目标方法
+                            @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object result,  // 返回值
+                            @Advice.Thrown Throwable t     // 异常, 如果没有异常, 则 = null
+    ) {
+        System.out.println("end");
+    }
+}
+```
+
+2、使用Byte Buddy API进行增强
+
+```
+public static void premain(String agentArgs, Instrumentation inst) {
+
+  new AgentBuilder.Default()
+      // 增强的类
+      .type(ElementMatchers.named("com.example.demo.config.AgentDemo"))
+      // 增强的类 增强的方法实现
+      .transform(
+          new AgentBuilder.Transformer.ForAdvice()
+              .advice(ElementMatchers.named("demo"), "com.example.demo.instrument.ByteBuddyInterceptor")
+      )
+      // 监听类加载
+      .installOn(inst);
+}
+```
+
+执行arthas sc命令后，可以看到，并没有为AgentDemo生成代理类。
+
+```
+[arthas@51260]$ sc *AgentDemo*
+com.example.demo.config.AgentDemo
+```
+
+AgentDemo的反编译代码如下：
 
