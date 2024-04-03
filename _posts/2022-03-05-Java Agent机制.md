@@ -463,7 +463,7 @@ com.example.demo.config.AgentDemo$auxiliary$EaV0UxCt
 
 AgentDemo的反编译代码如下，demo方法内部被修改为通过预定义的拦截器去调用代理类的call方法。
 
-![byte buddy 方法代理]()
+![byte buddy 方法代理](https://raw.githubusercontent.com/GuanN1ng/GuanN1ng.github.io/main/_posts/image/byte%20buddy%E6%96%B9%E6%B3%95%E4%BB%A3%E7%90%86.png)
 
 
 #### 字节码修改
